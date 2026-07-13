@@ -734,15 +734,25 @@ Notes: `%output` payload is octal-escaped (octal 033=ESC, 015=CR, 012=LF) — un
 bytes before `term.write()`. Layout string = `<checksum>,<WxH>,<X>,<Y>` with `[...]` =
 left/right split, `{...}` = top/bottom split, leaf ends in the pane id -> parse to a tree.
 
-### Architecture — `ControlModeBackend` + `WindowRegistry` + parser (additive)
-- Launch (direct, no shell): `ssh -tt -- host  <tmux> -CC -L <sock> new-session -A -s <name>`
-- `ControlModeParser` (pure, unit-tested): bytes -> structured events
-  (paneOutput, windowAdd/Close/Renamed, layoutChange, begin/end/error, exit).
-- **`WindowRegistry` (pure, unit-tested) is the single source of truth for topology.** It maps
-  `pane -> window`, tracks the active window, and `reconcile(rows)` against an authoritative
-  `list-panes -s` listing returns the exact diff (added/removed/renamed/activeChanged/
-  newlyMappedPanes). It holds no IO.
-- `ControlModeBackend` (per SESSION):
+### Architecture — a thin `ControlModeBackend` coordinator over focused units
+`ControlModeBackend` is deliberately small: it wires parser events to the registry and emits
+tagged data/window events. The mechanisms live in single-responsibility, individually
+unit-tested collaborators, so the coordinator holds little state and each rule is testable alone:
+- `ControlModeParser` (pure): bytes -> structured control events (paneOutput, window*, begin/end,
+  exit).
+- **`WindowRegistry` (pure): the single source of truth for topology.** Maps `pane -> window`,
+  tracks the active window; `reconcile(rows)` against an authoritative `list-panes -s` listing
+  returns the exact diff (added/removed/renamed/activeChanged/newlyMappedPanes). No IO.
+- **`ReplyChannel` (pure): the request/response protocol.** Owns the pty command writes and a FIFO
+  of one reply handler per command (+ a seeded handshake handler). `send(line, handler?)` /
+  `onReply(ev)` give positional correlation — see below.
+- **`tmuxKeys` (pure): shell input -> `send-keys` command lines** (line-splitting + literal
+  escaping). Verified gotchas encoded once, tested in isolation.
+- **`shared/tmuxSocket` (pure): the version-tagged socket name**, the one place the major-minor
+  rule lives (used by main, ssh backend, and control backend so it can't drift).
+- Launch argv (`buildControlModeSshArgs`): `ssh -tt -- host <tmux> -CC -L <sock> new-session -D -A
+  -s <name>` (built on `buildSshArgs`, which validates host/session/etc.).
+- `ControlModeBackend` (per SESSION) coordinates them:
   - **Topology by reconcile, not by ad-hoc signal handling.** ANY of `%window-add/close/renamed`,
     `%window-pane-changed`, `%session-window-changed`, `%layout-change` just triggers a
     (coalesced) `list-panes -s` refresh; its reply reconciles the registry and the backend emits
@@ -756,17 +766,24 @@ left/right split, `{...}` = top/bottom split, leaf ends in the pane id -> parse 
   - **Input & capture address a WINDOW, not a pane.** `send-keys -t @win` / `capture-pane -t @win`
     (tmux resolves the window's active pane). Verified on the host. This removed the async
     "query the pane id first" step whose gap let keystrokes land in the previously-active window.
-  - **Replies correlate to commands POSITIONALLY.** tmux emits exactly one `%begin..%end` block
-    per command, in submission order (verified: cmd# monotonic; one unsolicited handshake block
-    at connect, seeded with a leading no-op handler). Each `_send` registers one reply handler in
-    a FIFO; each reply block invokes the head. This replaced content-based routing, which desynced
-    when a *fresh* window's capture reply was **empty** (indistinguishable from a command ack), so
-    a later capture painted into the wrong tab — the "re-visited first tab becomes the old one"
-    bug. Positional correlation binds each capture reply to the exact window it was requested for,
-    empty or not.
+  - **Replies correlate to commands POSITIONALLY (`ReplyChannel`).** tmux emits exactly one
+    `%begin..%end` block per command, in submission order (verified: cmd# monotonic; one
+    unsolicited handshake block at connect, absorbed by the seeded handler). Each `send` enqueues
+    one reply handler; each reply block invokes the head. This replaced content-based routing,
+    which desynced when a *fresh* window's capture reply was **empty** (indistinguishable from a
+    command ack), so a later capture painted into the wrong tab — the "re-visited first tab becomes
+    the old one" bug. Positional correlation binds each capture reply to the exact window it was
+    requested for, empty or not.
   - resize -> `refresh-client -C <cols>x<rows>` (verified on 3.5a).
+  - **Input gating lives ONLY in the backend.** It buffers input until ready (attach settled, fast
+    path 500ms after `%session-changed`; spawn-time fallback guarantees ready even if that signal
+    never arrives), then replays in order. The renderer forwards keystrokes unconditionally and
+    keeps `inputReady` purely as a status-line flag — no second buffer/timer (that duplication was
+    removed).
   - **The renderer is a dumb view keyed by window** — it holds no pane/topology state; it just
     mirrors the backend's window events into tabs and routes `{window}`-tagged data to that tab.
+    All backend `data` is normalized to `{data, window?, pane?}` at the supervisor, so main/renderer
+    never type-sniff string-vs-object.
 - **Version-tagged socket** `dtcc<major>-<minor>` (e.g. `dtcc3-7`): tmux's control protocol drifts
   across minor releases, so a 3.5 server + 3.7 client on one socket silently produces no output.
   Distinct sockets per major.minor keep incompatible versions from ever sharing a server.

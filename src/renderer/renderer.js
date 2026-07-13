@@ -61,11 +61,9 @@ function ensureTab(v, winId) {
   if (v.tabs.has(winId)) return v.tabs.get(winId);
   const linkProvider = makeLinkProvider(() => tab.content.term, v.meta);
   const ctx = {
-    input: (data) => {
-      if (v.meta.mode === 'control' && !v.inputReady) { (v.inputBuf = v.inputBuf || []).push(data); return; }
-      // control mode: the backend addresses keystrokes to the active window (send-keys -t @win).
-      api.input(v.meta.id, data);
-    },
+    // Always forward: the backend owns input gating (buffers until ready, then replays in order)
+    // and addresses keystrokes to the active window. The renderer no longer buffers input itself.
+    input: (data) => api.input(v.meta.id, data),
     ack: (bytes) => api.ack(v.meta.id, bytes),
   };
   const content = registry.createTabContent('terminal', { id: v.meta.id, meta: v.meta, linkProvider }, ctx);
@@ -132,13 +130,9 @@ async function mount(id) {
   // Connect the project once (reattaches the SAME tmux session; tmux replays windows -> tabs).
   if (!v.started) {
     v.started = true;
-    if (v.meta.mode === 'control') {
-      v.inputReady = false;
-      clearTimeout(v._readyFallback);
-      v._readyFallback = setTimeout(() => {
-        if (!v.inputReady) { v.inputReady = true; const b = v.inputBuf; v.inputBuf = null; if (b) b.forEach((d) => api.input(v.meta.id, d)); }
-      }, 5000);
-    }
+    // control mode: 'ready' arrives from the backend once attach settles (it buffers input until
+    // then). inputReady here is a DISPLAY flag only — the backend owns the actual gating.
+    if (v.meta.mode === 'control') v.inputReady = false;
     setStatus(`connecting ${v.meta.title || v.meta.host || 'session'}…`);
     await api.createSession({
       id: v.meta.id, kind: v.meta.kind || 'remote', transport: v.meta.transport,
@@ -291,13 +285,8 @@ function deliver(v, tab, data) {
 }
 
 // --- test hooks (used by test/gui-live.js to drive/inspect the real xterm) ---
-// Route test input through the SAME gated path as real keystrokes (respects the control-mode
-// input gate) by feeding the active terminal's onData handler.
-window.__testType = (s) => {
-  const v = views.get(activeId);
-  if (v && v.meta.mode === 'control' && !v.inputReady) { (v.inputBuf = v.inputBuf || []).push(s); return; }
-  if (activeId != null) api.input(activeId, s);
-};
+// Forward like a real keystroke; the backend buffers until ready, so tests need no gate here.
+window.__testType = (s) => { if (activeId != null) api.input(activeId, s); };
 window.__testInputReady = () => { const v = views.get(activeId); return !!(v && v.inputReady); };
 window.__testMount = (id) => {
   if (!views.has(id)) makeView({ id, kind: 'remote', mode: 'control' });
@@ -414,9 +403,7 @@ api.onIntentionalExit(({ id }) => { setStatus('session closed (detached)'); });
 api.onReady(({ id }) => {
   const v = views.get(id);
   if (!v) return;
-  v.inputReady = true;
-  const buf = v.inputBuf; v.inputBuf = null;
-  if (buf) buf.forEach((d) => api.input(id, d));   // flush keystrokes typed during connect
+  v.inputReady = true;   // display flag only; the backend already flushed its buffered input
   if (id === activeId) setStatus(statusLine(v, v.state));
 });
 api.onInfo(({ id, info, tmuxVersion }) => {

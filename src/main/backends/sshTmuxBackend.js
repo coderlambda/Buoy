@@ -9,6 +9,7 @@
 // Verified end-to-end against a real Amazon Linux 2 host (tmux 1.8).
 const { EventEmitter } = require('events');
 const { buildSshArgs } = require('../../shared/validation');
+const { socketName } = require('../../shared/tmuxSocket');
 const { spawnEnv } = require('../env');
 
 // Non-interactive, resilient ssh defaults. BatchMode avoids password hangs; keepalives
@@ -28,14 +29,11 @@ class SshTmuxBackend extends EventEmitter {
   constructor({ host, session, baseArgs, tmuxPath, socket, tmuxVersion }) {
     super();
     const path = tmuxPath || '.local/bin/tmux';
-    // Version-tag the socket by MAJOR-MINOR (e.g. dtapp3-7) so different tmux versions never
-    // share a server — a 3.5 server + 3.7 client on one socket silently fails (protocol drift).
-    const ver = Array.isArray(tmuxVersion) ? `${tmuxVersion[0]}-${tmuxVersion[1]}` : '';
     this.built = buildSshArgs({
       host, session,
       baseArgs: [...DEFAULT_SSH_OPTS, ...(baseArgs || [])],
       tmuxPath: path,
-      socket: socket || `dtapp${ver}`,
+      socket: socket || socketName('plain', tmuxVersion),
     });
     this.pty = null;
   }

@@ -74,14 +74,14 @@ class Supervisor extends EventEmitter {
     this.backend = backend;
 
     backend.on('data', (d) => {
+      // Normalize to a uniform shape so downstream layers never type-sniff: plain backends emit a
+      // raw string; control mode emits { window, pane, data }. Wrap the string here.
       // NOTE: connect confirmation must NOT key off first data (that's the et banner, §5.4).
-      // MVP uses the optimistic timeout below; the OOB channel is deferred.
-      this.emit('data', d);
+      this.emit('data', typeof d === 'string' ? { data: d } : d);
     });
     backend.on('exit', (code) => this._onExit(code));
-    // Control-mode backends emit richer events (windows→tabs, layouts→splits); forward them.
+    // Control-mode backends emit richer events (windows→tabs); forward them.
     backend.on('window', (w) => this.emit('window', w));
-    backend.on('layout', (l) => this.emit('layout', l));
     backend.on('control', (c) => this.emit('control', c));
     backend.on('ready', () => this.emit('ready'));   // control mode: input-ready after attach settle
 

@@ -80,8 +80,7 @@ function spawnBackend() {
   const b = new ControlModeBackend({ host: 'me@h', session: 'dev', tmuxPath: '/t', tmuxVersion: [3,5] });
   const sent = [];
   b.pty = { write: (s) => sent.push(s.trim()), kill: () => {} };
-  b.spawn = function () { this._replyQueue.push(() => {}); };  // seed handshake, no real ssh
-  b.spawn();
+  b.reply.start();   // seed the handshake handler (no real ssh spawn)
   return { b, sent, reply: (body, ok = true) => b._onEvent({ type: 'reply', ok, body }) };
 }
 

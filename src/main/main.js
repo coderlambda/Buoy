@@ -15,6 +15,7 @@ const { probeTmux } = require('./probeTmux');
 const { SessionStore } = require('./sessionStore');
 const { Backpressure } = require('../shared/backpressure');
 const { ValidationError, buildKillArgs } = require('../shared/validation');
+const { socketName } = require('../shared/tmuxSocket');
 
 const sessions = new Map(); // id -> { supervisor, backpressure, meta }
 let win = null;
@@ -70,17 +71,10 @@ function makeBackendFor(meta, id) {
   });
 }
 
-// The tmux socket a session's backend uses (must match sshTmuxBackend / controlModeBackend):
-//   control mode -> dtcc<major>-<minor>, plain -> dtapp<major>-<minor>.
-// Tag by major.MINOR (not major alone): tmux's server/control protocol changes across minor
-// releases, so a 3.5 server and a 3.7 client on the SAME socket silently fail (no output).
-// Distinct sockets per major.minor keep incompatible versions from ever sharing a server.
+// The tmux socket a session's backend uses (must match sshTmuxBackend / controlModeBackend);
+// the naming rule lives in one place (shared/tmuxSocket) so it can't drift between them.
 function socketFor(meta) {
   return socketName(meta.mode, meta.tmuxVersion);
-}
-function socketName(mode, tmuxVersion) {
-  const v = Array.isArray(tmuxVersion) ? `${tmuxVersion[0]}-${tmuxVersion[1]}` : '';
-  return (mode === 'control' ? 'dtcc' : 'dtapp') + v;
 }
 
 // Kill the REMOTE tmux session for `meta`. Runs `tmux -L <sock> kill-session -t <name>` over
@@ -129,15 +123,10 @@ function startSession(meta) {
   });
 
   supervisor.on('state', (state) => send('session:state', { id, state }));
-  supervisor.on('data', (data) => {
-    // plain backend => string; control-mode backend => { window, pane, data }
-    if (typeof data === 'string') {
-      bp.onData(Buffer.byteLength(data));
-      send('session:data', { id, data });
-    } else {
-      bp.onData(Buffer.byteLength(data.data));
-      send('session:data', { id, window: data.window, pane: data.pane, data: data.data });
-    }
+  supervisor.on('data', ({ data, window, pane }) => {
+    // Uniform shape from the supervisor: { data, window?, pane? } (window/pane set in control mode).
+    bp.onData(Buffer.byteLength(data));
+    send('session:data', { id, window, pane, data });
   });
   supervisor.on('window', (w) => send('session:window', { id, ...w }));
   supervisor.on('ready', () => send('session:ready', { id }));

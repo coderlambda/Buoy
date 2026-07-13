@@ -4,28 +4,34 @@
 // session look like a NATIVE terminal (no tmux status bar / prefix); tmux windows become
 // tabs and panes become splits at the app layer.
 //
-// DESIGN (topology as one source of truth): tmux emits many overlapping, order-varying signals
-// about windows/panes (%window-add, %session-window-changed, %layout-change, ...), and reacting
-// to each ad hoc caused output/input to route to the wrong tab (e.g. a new tab showing the app
-// running in the previous tab). Instead this backend keeps a WindowRegistry and, on ANY topology
-// signal, RECONCILES it against the authoritative `list-panes -s` listing. The registry computes
-// the diff, so the backend emits exactly the window add/close/rename/active/pane events that
-// changed. It also owns pane->window resolution: every 'data' event is tagged with the WINDOW it
-// belongs to, so the renderer is a dumb view keyed by window and never guesses.
+// This class is a thin COORDINATOR. The mechanisms it orchestrates live in focused units:
+//   - ControlModeParser  : bytes            -> structured control events
+//   - ReplyChannel       : commands         <-> their reply blocks (positional correlation)
+//   - WindowRegistry     : list-panes rows  -> authoritative topology + diff
+//   - tmuxKeys           : shell input      -> send-keys command lines
+//   - tmuxSocket/validation : launch argv
+// Its own job: on ANY topology signal, refresh+reconcile the registry and emit exactly the
+// window add/close/rename/active events that changed; tag each 'data' chunk with the WINDOW its
+// pane belongs to (so the renderer is a dumb view keyed by window and never guesses).
 //
 // Input & capture address a WINDOW (send-keys -t @win / capture-pane -t @win); tmux resolves to
 // that window's active pane. This removes the async "query the pane id first" step whose gap let
 // keystrokes land in the previously-active window.
 //
 // Contract (ConnectionBackend + control-mode extras):
-//   'data'  ({window, pane, data})         pane output, tagged with its window
-//   'window'({action,window,name,active,order})  topology: add/close/rename/active
-//   'ready' ()                             input-ready after attach settle
+//   'data'  ({window, pane, data})               pane output, tagged with its window
+//   'window'({action,window,name,order})          topology: add/close/rename/active
+//   'ready' ()                                    input-ready after attach settle
 //   'exit'  (code)
 const { EventEmitter } = require('events');
+const fs = require('fs');
+const util = require('util');
 const { buildSshArgs } = require('../../shared/validation');
+const { socketName } = require('../../shared/tmuxSocket');
 const { ControlModeParser } = require('../../shared/controlModeParser');
 const { WindowRegistry } = require('../windowRegistry');
+const { ReplyChannel } = require('../replyChannel');
+const { encodeSendKeys } = require('../tmuxKeys');
 const { spawnEnv } = require('../env');
 
 // Debug logging: writes to BOTH the main-process stderr (visible in the `npm start` terminal)
@@ -34,10 +40,9 @@ const { spawnEnv } = require('../env');
 const DT_LOG = '/tmp/dt-debug.log';
 function dlog(...args) {
   if (process.env.DT_DEBUG === '0') return;
-  const util = require('util');
   const line = '[DT cc] ' + util.format(...args);
   process.stderr.write(line + '\n');
-  try { require('fs').appendFileSync(DT_LOG, new Date().toISOString() + ' ' + line + '\n'); } catch (_) {}
+  try { fs.appendFileSync(DT_LOG, new Date().toISOString() + ' ' + line + '\n'); } catch (_) {}
 }
 
 const DEFAULT_SSH_OPTS = [
@@ -48,63 +53,50 @@ const DEFAULT_SSH_OPTS = [
 const LIST_FMT = "#{window_id} #{pane_id} #{pane_active} #{window_active} #{window_name}";
 const LIST_RE = /^(@\d+) (%\d+) ([01]) ([01])(?: (.*))?$/;
 
-// Control-mode socket, tagged by tmux MAJOR-MINOR (e.g. dtcc3-7). Tagging by major alone let a
-// 3.5 server and a 3.7 client share one socket, which silently fails (control protocol changes
-// across minor releases) — the "connected but no output" bug after a tmux upgrade.
-function ccSocket(tmuxVersion) {
-  const v = Array.isArray(tmuxVersion) ? `${tmuxVersion[0]}-${tmuxVersion[1]}` : '';
-  return `dtcc${v}`;
+// Bound the "buffered until known" queues so a pane that never maps (or input before a ready
+// that never comes) can't grow without limit; drop-oldest keeps the most recent bytes.
+const MAX_BUFFER = 4096;
+function pushBounded(arr, item) {
+  arr.push(item);
+  if (arr.length > MAX_BUFFER) arr.shift();
 }
 
 class ControlModeBackend extends EventEmitter {
   constructor({ host, session, baseArgs, tmuxPath, socket, tmuxVersion }) {
     super();
     this.session = session;
-    // Reuse buildSshArgs but inject -CC before new-session, and a version-tagged socket.
-    const built = buildSshArgs({
-      host, session,
-      baseArgs: [...DEFAULT_SSH_OPTS, ...(baseArgs || [])],
-      tmuxPath: tmuxPath || '.local/bin/tmux',
-      socket: socket || ccSocket(tmuxVersion),
-    });
-    // built.args = [... '--', host, <tmux>, '-L', <sock>, 'new-session','-A','-s',<name>]
-    // Insert '-CC' right after the tmux binary token (index of first token after host).
-    const dd = built.args.indexOf('--');
-    const tmuxIdx = dd + 2;            // dd+1 = host, dd+2 = tmux binary
-    built.args.splice(tmuxIdx + 1, 0, '-CC');
-    // Add '-D' to new-session so attaching DETACHES any other client (e.g. a lingering
-    // control client from a dropped connection) — belt-and-suspenders against two control
-    // clients streaming output at once (the doubled-keystroke bug). Safe on tmux >= 3.2.
-    const ns = built.args.indexOf('new-session');
-    if (ns !== -1) built.args.splice(ns + 1, 0, '-D');
-    this.built = built;
     this.tmuxPath = tmuxPath || '.local/bin/tmux';
-    this.socket = socket || ccSocket(tmuxVersion);
+    this.socket = socket || socketName('control', tmuxVersion);
+    this.built = buildControlModeSshArgs({
+      host, session, baseArgs: [...DEFAULT_SSH_OPTS, ...(baseArgs || [])],
+      tmuxPath: this.tmuxPath, socket: this.socket,
+    });
+
     this.pty = null;
     this.parser = new ControlModeParser((ev) => this._onEvent(ev));
-
+    this.reply = new ReplyChannel((line) => { if (this.pty) this.pty.write(line); });
     this.reg = new WindowRegistry();  // THE source of truth for window/pane topology
     this.maxHistory = 2000;           // scrollback lines to back-fill (matches tmux default)
 
     this._ready = false;              // input un-gated after attach settles
-    this._pendingInput = [];          // input buffered until ready (keyed by active window)
+    this._pendingInput = [];          // input buffered until ready
     this._pendingOutput = new Map();  // pane -> [data] buffered until its window is known
-    this._replyQueue = [];            // FIFO of reply handlers, one per command sent (§12)
     this._refreshQueued = false;      // coalesce bursts of topology signals into one refresh
   }
 
   spawn({ cols = 80, rows = 24 } = {}) {
     const nodePty = require('@homebridge/node-pty-prebuilt-multiarch');
     this.cols = cols; this.rows = rows;
-    // tmux emits ONE unsolicited reply block at connect (the handshake) before we send anything.
-    // Seed a leading no-op handler so it consumes THAT block, keeping every later command aligned
-    // with its own reply (verified: exactly 1 unsolicited %begin before any command).
-    this._replyQueue.push(() => {});
+    this.reply.start();   // seed the handler for tmux's unsolicited connect handshake block
     this.pty = nodePty.spawn('ssh', this.built.args, {
       name: 'xterm-256color', cols, rows, env: spawnEnv(),
     });
     this.pty.onData((d) => this.parser.write(d));
     this.pty.onExit(({ exitCode }) => this.emit('exit', exitCode));
+    // Backend OWNS input gating: buffer input until ready, then replay. Attach normally un-gates
+    // (fast path, 500ms after %session-changed); this spawn-time fallback guarantees ready even
+    // if that signal never arrives, so buffered input can't be stranded (no renderer-side timer).
+    this._readyFallback = setTimeout(() => this._markReady(), 5000);
   }
 
   // --- control-protocol event handling ---------------------------------------------------
@@ -133,23 +125,11 @@ class ControlModeBackend extends EventEmitter {
         this.emit('exit', 0);
         break;
       case 'reply':
-        this._onReply(ev);
+        if (!this.reply.onReply(ev)) this.emit('control', ev);   // unexpected extra reply
         break;
       default:
         this.emit('control', ev);
     }
-  }
-
-  // Replies correlate to commands POSITIONALLY: tmux emits exactly one %begin..%end block per
-  // command, in submission order (§12, verified: cmd# monotonic). So the head of the reply queue
-  // is THIS reply's handler. This is the protocol's real contract — far more robust than the old
-  // content-guessing (which desynced when a fresh window's capture reply was empty, so a later
-  // capture painted into the wrong tab). One handler per _send; plus one for the unsolicited
-  // launch handshake block, absorbed by the leading no-op we seed at spawn.
-  _onReply(ev) {
-    const handler = this._replyQueue.shift();
-    if (handler) { handler(ev); return; }
-    this.emit('control', ev);   // unexpected extra reply — surface, don't crash
   }
 
   // --- topology: one reconcile path ------------------------------------------------------
@@ -164,7 +144,7 @@ class ControlModeBackend extends EventEmitter {
 
   _refreshWindows() {
     if (!this.pty) return;
-    this._send(`list-panes -s -t ${this.session} -F '${LIST_FMT}'`,
+    this.reply.send(`list-panes -s -t ${this.session} -F '${LIST_FMT}'`,
       (ev) => this._applyTopology((ev.body || []).filter((l) => l.trim() !== '')));
   }
 
@@ -182,8 +162,8 @@ class ControlModeBackend extends EventEmitter {
     diff.added.forEach((win) => this.emit('window', { action: 'add', window: win, order: this.reg.order }));
     diff.renamed.forEach((r) => this.emit('window', { action: 'rename', window: r.win, name: r.name }));
     diff.removed.forEach((win) => this.emit('window', { action: 'close', window: win, order: this.reg.order }));
-    if (diff.activeChanged && this.reg.activeWindow) {
-      this.emit('window', { action: 'active', window: this.reg.activeWindow, order: this.reg.order });
+    if (diff.activeChanged && diff.active) {
+      this.emit('window', { action: 'active', window: diff.active, order: this.reg.order });
     }
     // Newly-mapped panes may have had %output buffered before their window was known — flush it.
     diff.newlyMappedPanes.forEach((pane) => this._flushPaneBuffer(pane));
@@ -197,7 +177,7 @@ class ControlModeBackend extends EventEmitter {
     const win = this.reg.winForPane(pane);
     if (!win) {
       if (!this._pendingOutput.has(pane)) { this._pendingOutput.set(pane, []); this._queueRefresh(); }
-      this._pendingOutput.get(pane).push(data);
+      pushBounded(this._pendingOutput.get(pane), data);
       return;
     }
     this.emit('data', { window: win, pane, data });
@@ -220,7 +200,7 @@ class ControlModeBackend extends EventEmitter {
     // Back-fill the active window's screen (control mode doesn't replay it). Target the SESSION
     // (its active pane); the paint handler resolves the window (active) when the reply lands —
     // by then the topology reply above has arrived.
-    this._send(`capture-pane -p -e -q -J -N -S -${this.maxHistory} -t ${this.session}`,
+    this.reply.send(`capture-pane -p -e -q -J -N -S -${this.maxHistory} -t ${this.session}`,
       (ev) => this._paintCapture(null, ev.body || []));
     // Un-gate input shortly after attach (send-keys races shell readiness); the topology reply
     // has arrived by then, so the active window is known.
@@ -230,6 +210,7 @@ class ControlModeBackend extends EventEmitter {
   _markReady() {
     if (this._ready) return;
     this._ready = true;
+    clearTimeout(this._readyFallback);
     const q = this._pendingInput; this._pendingInput = [];
     q.forEach((d) => this.write(d));
     dlog('ready: input un-gated, active=%s', this.reg.activeWindow);
@@ -248,68 +229,33 @@ class ControlModeBackend extends EventEmitter {
   }
 
   // --- input -----------------------------------------------------------------------------
-  // Shell input goes through send-keys addressed to the ACTIVE WINDOW (send-keys -t @win; tmux
-  // resolves the window's active pane). Addressing the window — not a pane id — removes the async
+  // Shell input goes through send-keys addressed to the ACTIVE WINDOW (tmux resolves the
+  // window's active pane). Addressing the window — not a pane id — removes the async
   // pane-resolution step whose gap let keystrokes land in the previously-active window.
+  // Buffered until ready (attach settled + active window known), then replayed in order.
   write(data, win) {
     if (!this.pty) return;
-    if (!this._ready && !win) { this._pendingInput.push(data); return; }
     const target = win || this.reg.activeWindow;
-    if (!target) { this._pendingInput.push(data); return; }
-    // Enter/Return must be the KEY name "Enter", not a literal \n via -l (verified: `-l "x\n"`
-    // doesn't submit; `-l "x" Enter` does). Split on line breaks: text via -l, breaks as Enter.
-    const parts = data.split(/(\r\n|\r|\n)/);
-    for (const part of parts) {
-      if (part === '') continue;
-      if (part === '\r' || part === '\n' || part === '\r\n') {
-        this._send(`send-keys -t ${target} Enter`);
-      } else {
-        this._send(`send-keys -t ${target} -l "${this._escapeLiteral(part)}"`);
-      }
-    }
-  }
-
-  // Escape a chunk for tmux's double-quoted send-keys -l argument.
-  _escapeLiteral(part) {
-    let s = '';
-    for (let i = 0; i < part.length; i++) {
-      const c = part[i], code = part.charCodeAt(i);
-      if (c === '\\') s += '\\\\';
-      else if (c === '"') s += '\\"';
-      else if (c === '\t') s += '\\t';
-      else if (c === '\x1b') s += '\\e';
-      else if (code < 0x20) s += '\\' + code.toString(8).padStart(3, '0');
-      else s += c;
-    }
-    return s;
+    if (!target || (!this._ready && !win)) { pushBounded(this._pendingInput, data); return; }
+    encodeSendKeys(data, target).forEach((line) => this.reply.send(line));
   }
 
   // Resize the control client so panes aren't stuck at 80x24 (§12, verified on 3.5a).
   resize(cols, rows) {
     this.cols = cols; this.rows = rows;
-    this._send(`refresh-client -C ${cols}x${rows}`);
-  }
-
-  // Send a control command and register a handler for ITS reply block. tmux replies once per
-  // command in submission order, so pushing one handler per command keeps replies correlated
-  // positionally (see _onReply). `handler` defaults to a no-op for fire-and-forget commands
-  // whose (usually empty) ack we can ignore.
-  _send(line, handler) {
-    if (!this.pty) return;
-    this._replyQueue.push(handler || (() => {}));
-    this.pty.write(line + '\n');
+    this.reply.send(`refresh-client -C ${cols}x${rows}`);
   }
 
   // --- Window (tab) operations for PROJECTS (§14). Each drives a tmux command; the resulting
   // topology signals trigger a reconcile that emits the tab add/close/rename/active events. ---
 
-  newWindow() { this._send(`new-window -t ${this.session} -c "#{pane_current_path}"`); }
-  selectWindow(win) { if (/^@\d+$/.test(win)) this._send(`select-window -t ${win}`); }
-  killWindow(win) { if (/^@\d+$/.test(win)) this._send(`kill-window -t ${win}`); }
+  newWindow() { this.reply.send(`new-window -t ${this.session} -c "#{pane_current_path}"`); }
+  selectWindow(win) { if (/^@\d+$/.test(win)) this.reply.send(`select-window -t ${win}`); }
+  killWindow(win) { if (/^@\d+$/.test(win)) this.reply.send(`kill-window -t ${win}`); }
   renameWindow(win, name) {
     if (!/^@\d+$/.test(win)) return;
     const safe = String(name).replace(/[^\w .\-/]/g, '').slice(0, 60);
-    this._send(`rename-window -t ${win} "${safe}"`);
+    this.reply.send(`rename-window -t ${win} "${safe}"`);
   }
 
   // Back-fill a window's scrollback on demand (lazy load when a tab is first shown). Addressed
@@ -317,11 +263,25 @@ class ControlModeBackend extends EventEmitter {
   // each other's target regardless of whether any reply body is empty.
   captureWindow(win) {
     if (!/^@\d+$/.test(win)) return;
-    this._send(`capture-pane -p -e -q -J -N -S -${this.maxHistory} -t ${win}`,
+    this.reply.send(`capture-pane -p -e -q -J -N -S -${this.maxHistory} -t ${win}`,
       (ev) => this._paintCapture(win, ev.body || []));
   }
 
-  kill() { if (this.pty) { try { this.pty.kill(); } catch (_) {} } }
+  kill() { clearTimeout(this._readyFallback); if (this.pty) { try { this.pty.kill(); } catch (_) {} } }
+}
+
+// Build the ssh argv for a control-mode attach: `ssh ... -- host <tmux> -CC -L <sock>
+// new-session -D -A -s <name>`. Starts from buildSshArgs (which validates host/session/etc.)
+// and inserts the control-mode-only flags: `-CC` after the tmux binary, and `-D` on new-session
+// (detaches any lingering control client from a dropped connection — the doubled-output guard).
+function buildControlModeSshArgs({ host, session, baseArgs, tmuxPath, socket }) {
+  const built = buildSshArgs({ host, session, baseArgs, tmuxPath, socket });
+  // built.args = [... '--', host, <tmux>, '-L', <sock>, 'new-session','-A','-s',<name>]
+  const dd = built.args.indexOf('--');
+  built.args.splice(dd + 3, 0, '-CC');   // dd+1 host, dd+2 tmux binary -> insert after binary
+  const ns = built.args.indexOf('new-session');
+  if (ns !== -1) built.args.splice(ns + 1, 0, '-D');
+  return built;
 }
 
 module.exports = { ControlModeBackend };
