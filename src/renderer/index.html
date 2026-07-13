@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self';" />
+  <title>Durable Terminal</title>
+  <link rel="stylesheet" href="../../node_modules/@xterm/xterm/css/xterm.css" />
+  <style>
+    :root { --bg:#1e1e2e; --panel:#181825; --fg:#cdd6f4; --muted:#6c7086; --accent:#89b4fa; }
+    * { box-sizing: border-box; }
+    html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+      font: 13px -apple-system, system-ui, sans-serif; }
+    #app { display:flex; height:100vh; }
+    #sidebar { width:240px; min-width:240px; background:var(--panel); border-right:1px solid #313244;
+      display:flex; flex-direction:column; }
+    #sidebar h1 { font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted);
+      padding:12px 14px 6px; margin:0; }
+    #sessions { list-style:none; margin:0; padding:0 6px; overflow-y:auto; flex:1; }
+    .session { display:flex; align-items:flex-start; gap:8px; padding:8px 10px; border-radius:6px;
+      cursor:pointer; }
+    .session:hover { background:#252537; }
+    .session.active { background:#313244; }
+    .dot { width:8px; height:8px; border-radius:50%; background:var(--muted); flex:none; margin-top:4px; }
+    .dot.connected { background:#a6e3a1; } .dot.connecting { background:#f9e2af; }
+    .dot.reconnecting { background:#fab387; } .dot.dead { background:#f38ba8; }
+    .dot.closed { background:#6c7086; }
+    .session .body { flex:1; min-width:0; display:flex; flex-direction:column; }
+    .session .name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .session .sub { font-size:10px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .session .name .rename-input { width:100%; box-sizing:border-box; font:inherit; color:var(--fg);
+      background:var(--bg); border:1px solid var(--accent); border-radius:4px; padding:1px 4px; }
+    .session .retry { display:none; font-size:11px; color:var(--accent); margin-top:2px; }
+    .session.dead .retry { display:inline; }
+    .session .act { display:none; flex:none; font-size:13px; color:var(--muted); cursor:pointer;
+      padding:0 3px; margin-top:1px; }
+    .session:hover .act { display:inline; }
+    .session .act.detach:hover { color:var(--fg); }
+    .session .act.kill:hover { color:#f38ba8; }
+    #new { margin:10px; padding:8px; border:1px dashed #45475a; border-radius:6px; text-align:center;
+      color:var(--muted); cursor:pointer; }
+    #new:hover { color:var(--fg); border-color:var(--accent); }
+    #main { flex:1; display:flex; flex-direction:column; min-width:0; }
+    #tabs { display:none; gap:2px; padding:4px 6px 0; background:var(--panel); }
+    #tabs.on { display:flex; }
+    #tabs .tab { display:flex; align-items:center; gap:6px; padding:4px 10px; font-size:12px;
+      color:var(--muted); background:var(--bg); border:1px solid #313244; border-bottom:none;
+      border-radius:6px 6px 0 0; cursor:pointer; max-width:180px; }
+    #tabs .tab.active { color:var(--fg); background:#313244; }
+    #tabs .tab .tlabel { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    #tabs .tab .tclose { color:var(--muted); font-size:13px; visibility:hidden; }
+    #tabs .tab:hover .tclose { visibility:visible; }
+    #tabs .tab .tclose:hover { color:#f38ba8; }
+    #tabs .tab.plus { color:var(--muted); font-weight:bold; padding:4px 10px; }
+    #tabs .tab.plus:hover { color:var(--accent); }
+    #term { flex:1; padding:6px; min-height:0; }
+    #status { height:22px; line-height:22px; padding:0 10px; background:var(--panel);
+      color:var(--muted); font-size:11px; border-top:1px solid #313244; }
+    dialog { background:var(--panel); color:var(--fg); border:1px solid #45475a; border-radius:8px; }
+    dialog input, dialog select { width:100%; margin:4px 0 10px; padding:6px; background:var(--bg);
+      color:var(--fg); border:1px solid #45475a; border-radius:4px; }
+    dialog button { padding:6px 12px; margin-left:6px; }
+    dialog label { font-size:12px; color:var(--muted); }
+    .err { color:#f38ba8; font-size:11px; }
+    .hint { font-size:11px; color:var(--muted); margin:-6px 0 10px; }
+    .opt { color:var(--muted); font-weight:normal; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="sidebar">
+      <h1>Sessions</h1>
+      <ul id="sessions"></ul>
+      <div id="new">+ New session</div>
+    </div>
+    <div id="main">
+      <div id="tabs"></div>
+      <div id="term"></div>
+      <div id="status">ready</div>
+    </div>
+  </div>
+
+  <dialog id="dialog">
+    <form method="dialog" id="form">
+      <div><label>Type</label>
+        <select id="f-kind">
+          <option value="remote" selected>Remote host (ssh + tmux)</option>
+          <option value="local">Local shell</option>
+        </select></div>
+      <div id="remote-fields">
+        <label>Host</label><input id="f-host" placeholder="user@host  or  user@host:port" />
+        <div class="hint">Connects over ssh and keeps a persistent tmux session that
+          reattaches automatically on reconnect.</div>
+        <label style="display:flex; align-items:center; gap:6px; font-size:12px;">
+          <input type="checkbox" id="f-control" style="width:auto; margin:0;" />
+          Native tabs (tmux control mode — needs tmux ≥ 3.2 on the host)
+        </label>
+      </div>
+      <label>Name <span class="opt">(optional)</span></label><input id="f-title" placeholder="defaults to the host" />
+      <div class="err" id="f-err"></div>
+      <div style="text-align:right">
+        <button value="cancel">Cancel</button>
+        <button value="ok" id="f-ok">Create</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="../../node_modules/@xterm/xterm/lib/xterm.js"></script>
+  <script src="../../node_modules/@xterm/addon-fit/lib/addon-fit.js"></script>
+  <script src="../shared/plugins.js"></script>
+  <script src="builtinPlugins.js"></script>
+  <script src="terminalTab.js"></script>
+  <script src="renderer.js"></script>
+</body>
+</html>

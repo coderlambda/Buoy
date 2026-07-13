@@ -1,0 +1,23 @@
+{
+  "name": "durable-terminal",
+  "version": "0.1.0",
+  "description": "cmux-style durable remote terminal — MVP",
+  "main": "src/main/main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/validation.test.js test/backpressure.test.js test/supervisor.test.js test/sessionStore.test.js test/backend.test.js test/remoteBackend.test.js test/env.test.js test/probeTmux.test.js test/controlModeParser.test.js test/plugins.test.js",
+    "smoke": "electron test/smoke-headless.js",
+    "itest": "node test/integration-control-mode.js",
+    "gui-live": "electron test/gui-live.js"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^32.0.0"
+  },
+  "dependencies": {
+    "@homebridge/node-pty-prebuilt-multiarch": "^0.12.0",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/addon-webgl": "^0.18.0",
+    "@xterm/xterm": "^5.5.0"
+  }
+}
