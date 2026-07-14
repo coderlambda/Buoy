@@ -67,6 +67,7 @@ pub trait BackendHandle: Send {
     fn new_window(&self);
     fn select_window(&self, win: &str);
     fn kill_window(&self, win: &str);
+    fn rename_window(&self, win: &str, title: &str);
     fn capture_window(&self, win: &str);
     fn kill(&self);
 }
@@ -77,6 +78,7 @@ impl BackendHandle for ControlBackend {
     fn new_window(&self) { ControlBackend::new_window(self) }
     fn select_window(&self, win: &str) { ControlBackend::select_window(self, win) }
     fn kill_window(&self, win: &str) { ControlBackend::kill_window(self, win) }
+    fn rename_window(&self, win: &str, title: &str) { ControlBackend::rename_window(self, win, title) }
     fn capture_window(&self, win: &str) { ControlBackend::capture_window(self, win) }
     fn kill(&self) { ControlBackend::kill(self) }
 }
@@ -242,6 +244,7 @@ impl Supervisor {
     pub fn new_window(&self) { self.with_backend(|b| b.new_window()); }
     pub fn select_window(&self, win: &str) { self.with_backend(|b| b.select_window(win)); }
     pub fn kill_window(&self, win: &str) { self.with_backend(|b| b.kill_window(win)); }
+    pub fn rename_window(&self, win: &str, title: &str) { self.with_backend(|b| b.rename_window(win, title)); }
     pub fn capture_window(&self, win: &str) { self.with_backend(|b| b.capture_window(win)); }
 
     fn with_backend(&self, f: impl FnOnce(&dyn BackendHandle)) {
@@ -262,6 +265,7 @@ mod tests {
         fn new_window(&self) {}
         fn select_window(&self, _: &str) {}
         fn kill_window(&self, _: &str) {}
+        fn rename_window(&self, _: &str, _: &str) {}
         fn capture_window(&self, _: &str) {}
         fn kill(&self) { self.killed.store(true, Ordering::Relaxed); }
     }

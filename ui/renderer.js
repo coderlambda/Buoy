@@ -294,9 +294,11 @@ function renderSidebar() {
       <span class="body">
         <span class="name-row">
           <span class="name" title="double-click to rename">${escapeHtml(v.meta.title || v.meta.session || v.meta.kind)}</span>
-          <span class="retry">retry</span>
-          <span class="act detach" title="Detach (keeps running on the remote)">⤫</span>
-          <span class="act kill" title="Kill (ends the remote session)">⏻</span>
+          <span class="controls">
+            <span class="retry">retry</span>
+            <span class="act detach" title="Detach (keeps running on the remote)">⤫</span>
+            <span class="act kill" title="Kill (ends the remote session)">⏻</span>
+          </span>
         </span>
         <span class="sub">${sub}</span>
         ${tunnelRows ? `<span class="tunnels">${tunnelRows}</span>` : ''}
@@ -400,6 +402,39 @@ function startRename(id, nameEl) {
       }
     }
     renderSidebar();
+  };
+  input.onkeydown = (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); commit(true); }
+    else if (e.key === 'Escape') { e.preventDefault(); commit(false); }
+  };
+  input.onblur = () => commit(true);
+}
+
+// Inline-edit a tmux-window tab's title. Sends the new name to tmux (rename-window, which also
+// pins it by disabling automatic-rename); an empty value clears the manual name so it follows the
+// pane title again. tmux echoes %window-renamed, which updates tab.title authoritatively.
+function startTabRename(v, wid, labelEl) {
+  const tab = v.tabs.get(wid);
+  if (!tab) return;
+  const current = tab.title && tab.title !== wid ? tab.title : '';
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.value = current;
+  input.className = 'tab-rename-input';
+  labelEl.textContent = '';
+  labelEl.appendChild(input);
+  input.focus();
+  input.select();
+  input.onclick = (e) => e.stopPropagation();   // don't switch tabs while editing
+
+  let done = false;
+  const commit = (save) => {
+    if (done) return; done = true;
+    if (save) {
+      const next = input.value.trim();
+      if (next !== current) api.tabRename(v.meta.id, wid, next);
+    }
+    renderTabs(v);   // repaint; tmux's %window-renamed echo will settle the final label
   };
   input.onkeydown = (e) => {
     if (e.key === 'Enter') { e.preventDefault(); commit(true); }
@@ -515,8 +550,12 @@ function renderTabs(v) {
     const tab = v.tabs.get(wid);
     const el = document.createElement('div');
     el.className = 'tab' + (wid === v.activeWindow ? ' active' : '');
-    el.innerHTML = `<span class="tlabel">${escapeHtml(tab.title || wid)}</span><span class="tclose" title="close">×</span>`;
-    el.querySelector('.tlabel').onclick = () => switchTab(v, wid);
+    el.innerHTML = `<span class="tlabel" title="double-click to rename">${escapeHtml(tab.title || wid)}</span><span class="tclose" title="close">×</span>`;
+    const label = el.querySelector('.tlabel');
+    label.onclick = () => switchTab(v, wid);
+    // Double-click a real tmux-window tab to rename it. A manual rename sticks (tmux disables
+    // automatic-rename for that window); clearing it re-enables auto-rename.
+    if (isWindowTab(wid)) label.ondblclick = (e) => { e.stopPropagation(); startTabRename(v, wid, label); };
     el.querySelector('.tclose').onclick = (e) => { e.stopPropagation(); closeTab(v, wid); };
     tabsEl.appendChild(el);
   }

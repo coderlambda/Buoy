@@ -39,6 +39,7 @@ window.terminalAPI = {
   tabSelect: (id, win) => invoke('tab_select', { id, win }),
   tabClose: (id, win) => invoke('tab_close', { id, win }),
   tabCapture: (id, win) => invoke('tab_capture', { id, win }),
+  tabRename: (id, win, title) => invoke('tab_rename', { id, win, title }),   // manual tab rename (empty -> auto)
 
   // events main -> renderer
   onData: (cb) => on('session:data', cb),

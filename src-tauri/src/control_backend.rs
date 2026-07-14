@@ -250,6 +250,21 @@ impl ControlBackend {
         g.send(format!("kill-window -t {}", win), ReplyKind::Ignore);
     }
 
+    /// Manually rename a window. tmux's `rename-window` also disables automatic-rename for that
+    /// window, so a user-set title sticks (stops following the pane title). The title is sanitized
+    /// to a safe single-line subset since it is interpolated into a control-mode command.
+    pub fn rename_window(&self, win: &str, title: &str) {
+        if !is_win_id(win) { return; }
+        let clean = sanitize_window_name(title);
+        let mut g = self.inner.lock().unwrap();
+        if clean.is_empty() {
+            // empty title -> re-enable automatic-rename so it follows the pane title again
+            g.send(format!("set-window-option -t {} automatic-rename on", win), ReplyKind::Ignore);
+        } else {
+            g.send(format!("rename-window -t {} \"{}\"", win, clean), ReplyKind::Ignore);
+        }
+    }
+
     pub fn capture_window(&self, win: &str) {
         if !is_win_id(win) { return; }
         let mut g = self.inner.lock().unwrap();
@@ -368,7 +383,7 @@ impl Inner {
             g.emit(BackendEvent::WindowAdd { window: win.clone(), order: order.clone() });
         }
         for (win, name) in &diff.renamed {
-            g.emit(BackendEvent::WindowRename { window: win.clone(), name: name.clone() });
+            g.emit(BackendEvent::WindowRename { window: win.clone(), name: latin1_to_utf8(name) });
         }
         for win in &diff.removed {
             g.emit(BackendEvent::WindowClose { window: win.clone(), order: order.clone() });
@@ -441,6 +456,18 @@ impl Inner {
             if g.attached { crate::dlog!("on_attach: already attached, skip"); return; }
             g.attached = true;
             crate::dlog!("on_attach: refreshing topology + capturing scrollback");
+            // Tab titles follow the pane title (OSC 2 / `\e]2;…`), the standard, program-agnostic
+            // way any tool (Claude Code, vim, a shell PROMPT_COMMAND, …) names its tab. Fall back to
+            // the running command when the title is just tmux's default (== the host name), so an
+            // untitled shell shows "zsh" rather than the hostname. This drives %window-renamed,
+            // which the renderer already maps to the tab label. A manual rename turns automatic-
+            // rename off for that window (tmux does this itself when you set-option the name).
+            g.send("set-option -g automatic-rename on".into(), ReplyKind::Ignore);
+            g.send(
+                "set-option -g automatic-rename-format \
+                 '#{?#{==:#{pane_title},#{host}},#{pane_current_command},#{pane_title}}'".into(),
+                ReplyKind::Ignore,
+            );
             g.refresh_now();
             let session = g.session.clone();
             g.send(
@@ -518,6 +545,34 @@ fn is_win_id(s: &str) -> bool {
     s.starts_with('@') && s.len() > 1 && s[1..].chars().all(|c| c.is_ascii_digit())
 }
 
+/// Re-decode a latin1 string (as produced by the control-stream reader, one char per byte) back to
+/// UTF-8, so a window name / title with multibyte chars renders correctly. Lossy on invalid seqs.
+fn latin1_to_utf8(s: &str) -> String {
+    let bytes: Vec<u8> = s.chars().map(|c| c as u8).collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Sanitize a user-supplied window title for safe interpolation into a `rename-window "…"` command:
+/// strip control chars (incl. newlines) and the two chars that break the double-quoted argument
+/// (`"` and `\`), collapse whitespace, and cap the length. Keeps everything else (spaces, `*`,
+/// unicode) so titles like "* Building widget" survive intact.
+fn sanitize_window_name(s: &str) -> String {
+    let mut out = String::new();
+    let mut prev_space = false;
+    for c in s.chars() {
+        if c.is_control() || c == '"' || c == '\\' { continue; }
+        if c == ' ' {
+            if prev_space { continue; }
+            prev_space = true;
+        } else {
+            prev_space = false;
+        }
+        out.push(c);
+        if out.chars().count() >= 100 { break; }
+    }
+    out.trim().to_string()
+}
+
 /// Decode the longest valid UTF-8 prefix of `bytes`. Returns the decoded string and any trailing
 /// bytes that form an INCOMPLETE (but so-far-valid) multi-byte sequence, to be carried into the
 /// next read. Genuinely invalid bytes (not just truncated) are passed through lossily so we never
@@ -572,6 +627,21 @@ mod tests {
         assert!(!is_win_id("@"));
         assert!(!is_win_id("%3"));
         assert!(!is_win_id("@1;rm"));
+    }
+
+    #[test]
+    fn sanitize_window_name_cases() {
+        // keeps spaces, '*', unicode; caps handled elsewhere
+        assert_eq!(sanitize_window_name("* Building widget"), "* Building widget");
+        // strips the quote/backslash that would break the "…" arg, and control chars/newlines
+        assert_eq!(sanitize_window_name("a\"b\\c"), "abc");
+        assert_eq!(sanitize_window_name("line1\nline2\t!"), "line1line2!");
+        // collapses runs of spaces and trims
+        assert_eq!(sanitize_window_name("  a   b  "), "a b");
+        // empty stays empty (signals "re-enable auto-rename")
+        assert_eq!(sanitize_window_name("   "), "");
+        // length cap
+        assert!(sanitize_window_name(&"x".repeat(500)).chars().count() <= 100);
     }
 
     #[test]

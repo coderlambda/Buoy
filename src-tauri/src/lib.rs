@@ -74,6 +74,7 @@ impl Backend {
     fn new_window(&self) { if let Backend::Supervised(s) = self { s.new_window(); } }
     fn select_window(&self, win: &str) { if let Backend::Supervised(s) = self { s.select_window(win); } }
     fn kill_window(&self, win: &str) { if let Backend::Supervised(s) = self { s.kill_window(win); } }
+    fn rename_window(&self, win: &str, title: &str) { if let Backend::Supervised(s) = self { s.rename_window(win, title); } }
     fn capture_window(&self, win: &str) { if let Backend::Supervised(s) = self { s.capture_window(win); } }
     fn retry(&self) { if let Backend::Supervised(s) = self { s.retry(); } }
 }
@@ -381,6 +382,10 @@ fn tab_close(state: State<AppState>, id: String, win: String) {
 fn tab_capture(state: State<AppState>, id: String, win: String) {
     if let Some(s) = state.sessions.lock().unwrap().get(&id) { s.backend.capture_window(&win); }
 }
+#[tauri::command]
+fn tab_rename(state: State<AppState>, id: String, win: String, title: String) {
+    if let Some(s) = state.sessions.lock().unwrap().get(&id) { s.backend.rename_window(&win, &title); }
+}
 
 // User-initiated reconnect from a dead session (renderer 'retry').
 #[tauri::command]
@@ -566,7 +571,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_sessions, create_session, session_input, session_resize,
             session_close, session_kill, session_rename,
-            tab_new, tab_select, tab_close, tab_capture, open_external, ui_log,
+            tab_new, tab_select, tab_close, tab_capture, tab_rename, open_external, ui_log,
             read_remote_file, save_file, session_retry,
             open_forwarded_url, get_config, list_tunnels, close_tunnel, force_forward,
             list_hosts, remember_host

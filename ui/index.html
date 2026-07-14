@@ -24,20 +24,27 @@
     .dot.reconnecting { background:#fab387; } .dot.dead { background:#f38ba8; }
     .dot.closed { background:#6c7086; }
     .session .body { flex:1; min-width:0; display:flex; flex-direction:column; }
-    /* first row: name (flexes) + action icons. Icons appear on hover and shrink ONLY this row,
-       so the sub line and tunnel rows below keep full width. */
-    .session .name-row { display:flex; align-items:center; gap:4px; min-width:0; }
+    /* first row: name uses the FULL width; action icons + retry are absolutely positioned at the
+       right edge and only appear on hover / when dead, overlaying the title's (ellipsised) tail.
+       This way nothing reserves inline space, so the title is never pre-truncated by a placeholder. */
+    .session .name-row { position:relative; display:flex; align-items:center; min-width:0; }
     .session .name { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .session .sub { font-size:10px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .session .name .rename-input { width:100%; box-sizing:border-box; font:inherit; color:var(--fg);
       background:var(--bg); border:1px solid var(--accent); border-radius:4px; padding:1px 4px; }
-    .session .retry { visibility:hidden; font-size:11px; color:var(--accent); flex:none; }
-    .session.dead .retry { visibility:visible; }
-    /* Icons always occupy their space (visibility, not display) so showing them on hover does NOT
-       reflow the row. Fixed box + small line-height keeps the ⏻/⤫ glyphs from inflating row height. */
-    .session .act { visibility:hidden; flex:none; width:16px; text-align:center; font-size:11px;
+    /* controls: a right-anchored cluster, painted over the panel bg so they sit cleanly on top of
+       the title tail. Hidden (and non-interactive) until hover; retry shows whenever dead. */
+    .session .controls { position:absolute; right:0; top:50%; transform:translateY(-50%);
+      display:flex; align-items:center; gap:4px; padding-left:6px;
+      background:linear-gradient(to right, transparent, #252537 8px);
+      visibility:hidden; }
+    .session.active .controls { background:linear-gradient(to right, transparent, #313244 8px); }
+    .session:hover .controls { visibility:visible; }
+    .session .retry { font-size:11px; color:var(--accent); flex:none; cursor:pointer; display:none; }
+    .session.dead .retry { display:inline; }
+    .session.dead .controls { visibility:visible; }   /* keep retry visible even without hover */
+    .session .act { flex:none; width:16px; text-align:center; font-size:11px;
       line-height:16px; color:var(--muted); cursor:pointer; }
-    .session:hover .act { visibility:visible; }
     .session .act.detach:hover { color:var(--fg); }
     .session .act.kill:hover { color:#f38ba8; }
     /* §18: forwarded-port list under the project name */
@@ -68,7 +75,9 @@
       color:var(--muted); background:var(--bg); border:1px solid #313244; border-bottom:none;
       border-radius:6px 6px 0 0; cursor:pointer; max-width:180px; }
     #tabs .tab.active { color:var(--fg); background:#313244; }
-    #tabs .tab .tlabel { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    #tabs .tab .tlabel { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:160px; }
+    #tabs .tab .tab-rename-input { font:inherit; color:var(--fg); background:var(--bg);
+      border:1px solid var(--accent); border-radius:4px; padding:0 4px; width:140px; }
     #tabs .tab .tclose { color:var(--muted); font-size:13px; visibility:hidden; }
     #tabs .tab:hover .tclose { visibility:visible; }
     #tabs .tab .tclose:hover { color:#f38ba8; }
