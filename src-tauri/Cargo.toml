@@ -1,13 +1,13 @@
 [package]
-name = "durable-terminal"
+name = "buoy"
 version = "0.1.0"
-description = "Durable remote terminal (ssh + tmux control mode) — Tauri port"
+description = "Buoy — durable remote terminal (ssh + tmux control mode) whose sessions resurface after network drops"
 edition = "2021"
 rust-version = "1.77"
 
 # The Tauri app is a library + a thin binary, per Tauri v2 convention.
 [lib]
-name = "durable_terminal_lib"
+name = "buoy_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

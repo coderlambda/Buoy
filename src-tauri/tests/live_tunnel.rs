@@ -4,7 +4,7 @@
 //! Run: DT_LIVE_HOST=user@host DT_TMUX=/path cargo test --test live_tunnel -- --ignored --nocapture
 
 use std::time::Duration;
-use durable_terminal_lib::tunnel::{classify_loopback, TunnelRegistry};
+use buoy_lib::tunnel::{classify_loopback, TunnelRegistry};
 
 fn env(k: &str) -> Option<String> { std::env::var(k).ok().filter(|s| !s.is_empty()) }
 fn sleep_ms(ms: u64) { std::thread::sleep(Duration::from_millis(ms)); }

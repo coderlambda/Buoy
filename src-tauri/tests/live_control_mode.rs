@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use durable_terminal_lib::control_backend::{BackendConfig, BackendEvent, ControlBackend};
+use buoy_lib::control_backend::{BackendConfig, BackendEvent, ControlBackend};
 
 fn env(k: &str) -> Option<String> {
     std::env::var(k).ok().filter(|s| !s.is_empty())
@@ -27,7 +27,7 @@ struct Recorder {
     ready: bool,
 }
 
-fn sink(rec: Arc<Mutex<Recorder>>) -> durable_terminal_lib::control_backend::BackendSink {
+fn sink(rec: Arc<Mutex<Recorder>>) -> buoy_lib::control_backend::BackendSink {
     Arc::new(move |ev: BackendEvent| {
         let mut r = rec.lock().unwrap();
         match ev {
@@ -54,7 +54,7 @@ fn live_tab_isolation_and_revisit() {
     let session = "rusttest";
 
     // Clean any prior session on the versioned socket so we start fresh.
-    let socket = durable_terminal_lib::tmux_socket::socket_name("control", Some((3, 7)), session);
+    let socket = buoy_lib::tmux_socket::socket_name("control", Some((3, 7)), session);
     let _ = std::process::Command::new("ssh")
         .args(["-o", "BatchMode=yes", "--", &host,
                &format!("{} -L {} kill-session -t {} 2>/dev/null; true", tmux, socket, session)])
@@ -134,7 +134,7 @@ fn live_reattach_existing_session() {
     let host = match env("DT_LIVE_HOST") { Some(h) => h, None => { eprintln!("SKIP: set DT_LIVE_HOST"); return; } };
     let tmux = env("DT_TMUX").unwrap_or_else(|| "tmux".into());
     let session = "rustreattach";
-    let socket = durable_terminal_lib::tmux_socket::socket_name("control", Some((3, 7)), session);
+    let socket = buoy_lib::tmux_socket::socket_name("control", Some((3, 7)), session);
     let kill = |()| { let _ = std::process::Command::new("ssh")
         .args(["-o", "BatchMode=yes", "--", &host,
                &format!("{} -L {} kill-session -t {} 2>/dev/null; true", tmux, socket, session)]).status(); };
@@ -181,7 +181,7 @@ fn live_multibyte_utf8_not_corrupted() {
     let host = match env("DT_LIVE_HOST") { Some(h) => h, None => { eprintln!("SKIP: set DT_LIVE_HOST"); return; } };
     let tmux = env("DT_TMUX").unwrap_or_else(|| "tmux".into());
     let session = "rustutf8";
-    let socket = durable_terminal_lib::tmux_socket::socket_name("control", Some((3, 7)), session);
+    let socket = buoy_lib::tmux_socket::socket_name("control", Some((3, 7)), session);
     let kill = || { let _ = std::process::Command::new("ssh")
         .args(["-o", "BatchMode=yes", "--", &host,
                &format!("{} -L {} kill-session -t {} 2>/dev/null; true", tmux, socket, session)]).status(); };
@@ -224,7 +224,7 @@ fn live_sustained_output_survives() {
     let host = match env("DT_LIVE_HOST") { Some(h) => h, None => { eprintln!("SKIP: set DT_LIVE_HOST"); return; } };
     let tmux = env("DT_TMUX").unwrap_or_else(|| "tmux".into());
     let session = "rustload";
-    let socket = durable_terminal_lib::tmux_socket::socket_name("control", Some((3, 7)), session);
+    let socket = buoy_lib::tmux_socket::socket_name("control", Some((3, 7)), session);
     let kill = || { let _ = std::process::Command::new("ssh")
         .args(["-o", "BatchMode=yes", "--", &host,
                &format!("{} -L {} kill-session -t {} 2>/dev/null; true", tmux, socket, session)]).status(); };
@@ -236,7 +236,7 @@ fn live_sustained_output_survives() {
     let dc = data_count.clone(); let bc = bytes_count.clone(); let ex = exited.clone();
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let rd = ready.clone();
-    let sink: durable_terminal_lib::control_backend::BackendSink = Arc::new(move |ev: BackendEvent| {
+    let sink: buoy_lib::control_backend::BackendSink = Arc::new(move |ev: BackendEvent| {
         match ev {
             BackendEvent::Data { data, .. } => {
                 dc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -296,7 +296,7 @@ fn live_resize_reaches_tmux() {
     let host = match env("DT_LIVE_HOST") { Some(h) => h, None => { eprintln!("SKIP: set DT_LIVE_HOST"); return; } };
     let tmux = env("DT_TMUX").unwrap_or_else(|| "tmux".into());
     let session = "rustresize";
-    let socket = durable_terminal_lib::tmux_socket::socket_name("control", Some((3, 7)), session);
+    let socket = buoy_lib::tmux_socket::socket_name("control", Some((3, 7)), session);
     let sh = |cmd: &str| -> String {
         std::process::Command::new("ssh")
             .args(["-o", "BatchMode=yes", "--", &host, cmd])

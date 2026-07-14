@@ -4,7 +4,7 @@
 //! a non-file bare token errors (no tab).
 //! Run: DT_LIVE_HOST=user@host DT_TMUX=/path cargo test --test live_relative_path -- --ignored --nocapture
 
-use durable_terminal_lib::remote_file::{read_remote_file, TmuxCtx};
+use buoy_lib::remote_file::{read_remote_file, TmuxCtx};
 
 fn env(k: &str) -> Option<String> { std::env::var(k).ok().filter(|s| !s.is_empty()) }
 
@@ -14,7 +14,7 @@ fn live_relative_path_resolves_against_cwd() {
     let host = match env("DT_LIVE_HOST") { Some(h) => h, None => { eprintln!("SKIP: set DT_LIVE_HOST"); return; } };
     let tmux = env("DT_TMUX").unwrap_or_else(|| "tmux".into());
     let session = "rustrelpath";
-    let socket = durable_terminal_lib::tmux_socket::socket_name("control", Some((3, 7)), session);
+    let socket = buoy_lib::tmux_socket::socket_name("control", Some((3, 7)), session);
 
     let sh = |cmd: &str| { let _ = std::process::Command::new("ssh")
         .args(["-o", "BatchMode=yes", "--", &host, cmd]).status(); };

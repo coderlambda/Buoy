@@ -123,6 +123,8 @@ struct WindowPayload {
 // --- helpers -------------------------------------------------------------------------------
 
 fn user_data_dir() -> std::path::PathBuf {
+    // NOTE: kept as "durable-terminal" (the pre-rename name) so existing users' sessions.json /
+    // config.json are NOT orphaned by the rename to Buoy. This dir name isn't user-visible.
     let base = dirs::data_dir().unwrap_or_else(|| std::env::temp_dir());
     base.join("durable-terminal")
 }

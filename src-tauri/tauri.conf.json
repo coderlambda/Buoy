@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Durable Terminal",
+  "productName": "Buoy",
   "version": "0.1.0",
-  "identifier": "com.durableterminal.app",
+  "identifier": "com.buoy.app",
   "build": {
     "frontendDist": "../ui"
   },
@@ -11,7 +11,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Durable Terminal",
+        "title": "Buoy",
         "width": 1100,
         "height": 700
       }

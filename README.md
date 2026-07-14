@@ -1,8 +1,13 @@
-# Durable Terminal — MVP
+# Buoy
 
-A cmux-style terminal launcher: a session-management **sidebar** around remote sessions
-that persist server-side (tmux) and auto-reconnect (et). See `DESIGN.md` for the full,
-adversarially-reviewed design and `TEST_PLAN.md` for the test matrix.
+A durable remote terminal: a session-management **sidebar** around remote sessions that
+persist server-side (tmux) and **resurface after network drops** — like a buoy pushed under
+by a wave, the connection always pops back up. ssh + tmux control mode for native tabs,
+clickable paths/URLs, and localhost port-forwarding.
+
+The current app is the **Tauri + Rust** port (`src-tauri/` + `ui/`); the original Electron
+MVP lives under `src/`. See `DESIGN.md` for the full, adversarially-reviewed design,
+`TAURI_MIGRATION.md` for the port, and `TEST_PLAN.md` for the test matrix.
 
 ## Status: MVP
 

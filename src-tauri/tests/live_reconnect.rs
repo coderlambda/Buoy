@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use durable_terminal_lib::control_backend::{BackendConfig, BackendEvent};
-use durable_terminal_lib::supervisor::{real_backend_factory, State, StateSink, Supervisor, SupervisorOpts};
+use buoy_lib::control_backend::{BackendConfig, BackendEvent};
+use buoy_lib::supervisor::{real_backend_factory, State, StateSink, Supervisor, SupervisorOpts};
 
 fn env(k: &str) -> Option<String> { std::env::var(k).ok().filter(|s| !s.is_empty()) }
 fn sleep_ms(ms: u64) { thread::sleep(Duration::from_millis(ms)); }
@@ -22,7 +22,7 @@ fn live_reconnects_after_ssh_killed() {
     let host = match env("DT_LIVE_HOST") { Some(h) => h, None => { eprintln!("SKIP: set DT_LIVE_HOST"); return; } };
     let tmux = env("DT_TMUX").unwrap_or_else(|| "tmux".into());
     let session = "rustreconn";
-    let socket = durable_terminal_lib::tmux_socket::socket_name("control", Some((3, 7)), session);
+    let socket = buoy_lib::tmux_socket::socket_name("control", Some((3, 7)), session);
     let ssh_cleanup = || { let _ = std::process::Command::new("ssh")
         .args(["-o", "BatchMode=yes", "--", &host,
                &format!("{} -L {} kill-session -t {} 2>/dev/null; true", tmux, socket, session)]).status(); };
@@ -32,7 +32,7 @@ fn live_reconnects_after_ssh_killed() {
     let out = Arc::new(Mutex::new(String::new()));
     let ready_count = Arc::new(AtomicUsize::new(0));
     let oc = out.clone(); let rc = ready_count.clone();
-    let app_sink: durable_terminal_lib::control_backend::BackendSink = Arc::new(move |ev: BackendEvent| {
+    let app_sink: buoy_lib::control_backend::BackendSink = Arc::new(move |ev: BackendEvent| {
         match ev {
             BackendEvent::Data { data, .. } => oc.lock().unwrap().push_str(&data),
             BackendEvent::Ready => { rc.fetch_add(1, Ordering::Relaxed); }

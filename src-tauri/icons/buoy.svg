@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <!-- Buoy app icon: a channel buoy riding on waves — sessions that always resurface.
+       Solid fills only (no gradients) for reliable rasterization. -->
+  <defs>
+    <clipPath id="round"><rect x="0" y="0" width="1024" height="1024" rx="224" ry="224"/></clipPath>
+  </defs>
+
+  <g clip-path="url(#round)">
+    <!-- rounded-square background -->
+    <rect x="0" y="0" width="1024" height="1024" fill="#1e1e2e"/>
+
+    <!-- mooring line into the water -->
+    <path d="M512 690 q -26 90 8 210" fill="none" stroke="#45475a" stroke-width="12" stroke-linecap="round"/>
+
+    <!-- float body: rounded cylinder -->
+    <rect x="392" y="360" width="240" height="300" rx="120" fill="#f0603a"/>
+    <!-- left-side shading for volume (kept INSIDE the body outline) -->
+    <path d="M452 360 a120 120 0 0 0 0 300 h20 V360 Z" fill="#d24a2c"/>
+    <!-- white channel-marker band -->
+    <rect x="392" y="452" width="240" height="72" fill="#f6f6fb"/>
+
+    <!-- mast + beacon light on top -->
+    <rect x="502" y="300" width="20" height="66" rx="10" fill="#cdd6f4"/>
+    <circle cx="512" cy="286" r="46" fill="#f9e2af"/>
+    <circle cx="512" cy="286" r="46" fill="none" stroke="#ffffff" stroke-width="7" opacity="0.55"/>
+
+    <!-- waves: three layered crests; buoy sits in them -->
+    <path d="M-40 706 q 96 -60 192 0 t 192 0 t 192 0 t 192 0 t 192 0 t 192 0 L1064 1064 L-40 1064 Z" fill="#5b8bf0"/>
+    <path d="M-40 766 q 96 -60 192 0 t 192 0 t 192 0 t 192 0 t 192 0 t 192 0 L1064 1064 L-40 1064 Z" fill="#7aa2f7"/>
+    <path d="M-40 834 q 96 -56 192 0 t 192 0 t 192 0 t 192 0 t 192 0 t 192 0 L1064 1064 L-40 1064 Z" fill="#89b4fa"/>
+  </g>
+</svg>

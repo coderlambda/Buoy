@@ -1,7 +1,7 @@
 {
-  "name": "durable-terminal",
+  "name": "buoy",
   "version": "0.1.0",
-  "description": "cmux-style durable remote terminal — MVP",
+  "description": "Buoy — a durable remote terminal (ssh + tmux) whose sessions resurface after network drops",
   "main": "src/main/main.js",
   "scripts": {
     "start": "electron .",

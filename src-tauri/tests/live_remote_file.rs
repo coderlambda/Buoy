@@ -5,7 +5,7 @@
 //!   head -c 200000 /dev/urandom > /tmp/dt_view_big.bin
 //! Run: DT_LIVE_HOST=user@host cargo test --test live_remote_file -- --ignored --nocapture
 
-use durable_terminal_lib::remote_file::{read_remote_file, TmuxCtx};
+use buoy_lib::remote_file::{read_remote_file, TmuxCtx};
 
 fn env(k: &str) -> Option<String> { std::env::var(k).ok().filter(|s| !s.is_empty()) }
 
