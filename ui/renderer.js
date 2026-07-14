@@ -274,9 +274,10 @@ function renderSidebar() {
     const sub = v.meta.host ? escapeHtml(v.meta.host) + (v.tmuxVersion ? ` · tmux ${v.tmuxVersion.join('.')}` : '') : (v.meta.kind || 'local');
     // §18: forwarded ports under the project name. Active rows show the local port and open on
     // click; inactive (grey) rows are persisted-but-not-serving — click re-opens the tunnel.
+    // String is short: ":<remote> → :<local>" (local shows "—" when not currently mapped).
     const tunnelRows = (v.tunnels || []).map((t) => {
       const active = !!t.active;
-      const localTxt = t.local ? `localhost:${t.local}` : '—';
+      const localTxt = t.local ? `:${t.local}` : '—';
       const title = active ? `open http://localhost:${t.local}/` : `port ${t.remote} inactive — click to re-open`;
       // "same" marker when the local port matches the remote (forced same-port mapping).
       const same = t.local && t.local === t.remote;
@@ -287,15 +288,19 @@ function renderSidebar() {
          <span class="tclose" title="close tunnel">×</span>
        </span>`;
     }).join('');
+    // The action icons live INSIDE the first (name) row, so hovering shifts only that row — the
+    // sub line and tunnel rows below keep full width.
     li.innerHTML = `<span class="dot ${v.state}"></span>
       <span class="body">
-        <span class="name" title="double-click to rename">${escapeHtml(v.meta.title || v.meta.session || v.meta.kind)}</span>
+        <span class="name-row">
+          <span class="name" title="double-click to rename">${escapeHtml(v.meta.title || v.meta.session || v.meta.kind)}</span>
+          <span class="retry">retry</span>
+          <span class="act detach" title="Detach (keeps running on the remote)">⤫</span>
+          <span class="act kill" title="Kill (ends the remote session)">⏻</span>
+        </span>
         <span class="sub">${sub}</span>
         ${tunnelRows ? `<span class="tunnels">${tunnelRows}</span>` : ''}
-      </span>
-      <span class="retry">retry</span>
-      <span class="act detach" title="Detach (keeps running on the remote)">⤫</span>
-      <span class="act kill" title="Kill (ends the remote session)">⏻</span>`;
+      </span>`;
     const nameEl = li.querySelector('.name');
     // Double-click the name to rename (display title only; tmux session name unchanged).
     nameEl.ondblclick = (e) => { e.stopPropagation(); startRename(id, nameEl); };
