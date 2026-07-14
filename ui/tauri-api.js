@@ -19,7 +19,7 @@ window.terminalAPI = {
   ack: (_id, _bytes) => {},   // backpressure ACK is a no-op in the Tauri port (deferred)
   close: (id) => invoke('session_close', { id }),   // detach (remote keeps running)
   kill: (id) => invoke('session_kill', { id }),     // terminate remote tmux session
-  retry: (_id) => {},                                // supervisor retry deferred
+  retry: (id) => invoke('session_retry', { id }),   // manual reconnect from a dead session
   rename: (id, title) => invoke('session_rename', { id, title }),
   openExternal: (url) => invoke('open_external', { url }),
   copyText: (text) => { try { return navigator.clipboard.writeText(String(text == null ? '' : text)); } catch (_) { return Promise.resolve(); } },

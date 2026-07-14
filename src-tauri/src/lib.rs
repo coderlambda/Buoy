@@ -15,6 +15,7 @@ pub mod control_backend;
 pub mod plain_backend;
 pub mod probe;
 pub mod remote_file;
+pub mod supervisor;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -23,7 +24,7 @@ use serde::Serialize;
 use serde_json::json;
 use tauri::{AppHandle, Emitter, State};
 
-use control_backend::{BackendConfig, BackendEvent, ControlBackend};
+use control_backend::{BackendConfig, BackendEvent};
 use plain_backend::{PlainBackend, PlainConfig, PlainEvent};
 use session_store::{SessionMeta, SessionStore};
 
@@ -49,21 +50,30 @@ pub fn augmented_path() -> String {
     paths.join(":")
 }
 
+// Control-mode sessions run under a reconnect Supervisor (respawns ssh + reattaches tmux on a
+// network drop). Plain sessions keep the single-spawn backend (zero-install fallback).
 enum Backend {
-    Control(ControlBackend),
+    Supervised(Arc<supervisor::Supervisor>),
     Plain(PlainBackend),
 }
 
 impl Backend {
     fn write(&self, data: &str) {
-        match self { Backend::Control(b) => b.write(data), Backend::Plain(b) => b.write(data) }
+        match self { Backend::Supervised(s) => s.write(data), Backend::Plain(b) => b.write(data) }
     }
     fn resize(&self, cols: u16, rows: u16) {
-        match self { Backend::Control(b) => b.resize(cols, rows), Backend::Plain(b) => b.resize(cols, rows) }
+        match self { Backend::Supervised(s) => s.resize(cols, rows), Backend::Plain(b) => b.resize(cols, rows) }
     }
     fn kill(&self) {
-        match self { Backend::Control(b) => b.kill(), Backend::Plain(b) => b.kill() }
+        // Intentional teardown: the supervisor stops respawning (close), plain just kills.
+        match self { Backend::Supervised(s) => s.close(), Backend::Plain(b) => b.kill() }
     }
+    // Control-only window ops (no-op on plain).
+    fn new_window(&self) { if let Backend::Supervised(s) = self { s.new_window(); } }
+    fn select_window(&self, win: &str) { if let Backend::Supervised(s) = self { s.select_window(win); } }
+    fn kill_window(&self, win: &str) { if let Backend::Supervised(s) = self { s.kill_window(win); } }
+    fn capture_window(&self, win: &str) { if let Backend::Supervised(s) = self { s.capture_window(win); } }
+    fn retry(&self) { if let Backend::Supervised(s) = self { s.retry(); } }
 }
 
 struct Session {
@@ -210,18 +220,31 @@ fn create_session(app: AppHandle, state: State<AppState>, meta: CreateArgs) -> R
 
     // Spawn the backend.
     let backend = if mode == "control" {
+        // Control mode runs under the reconnect Supervisor: it respawns ssh and reattaches the
+        // SAME tmux session on a network drop, emitting session:state so the UI reflects
+        // connecting/reconnecting/dead instead of a dead "closed".
         let app_for_sink = app.clone();
         let id_for_sink = id.clone();
-        let sink: control_backend::BackendSink = Arc::new(move |ev| {
+        let app_sink: control_backend::BackendSink = Arc::new(move |ev| {
             emit_backend_event(&app_for_sink, &id_for_sink, ev);
         });
-        let b = ControlBackend::spawn(
+        let app_for_state = app.clone();
+        let id_for_state = id.clone();
+        let state_sink: supervisor::StateSink = Arc::new(move |st: supervisor::State| {
+            let _ = app_for_state.emit("session:state", json!({ "id": id_for_state, "state": st.as_str() }));
+        });
+        let sup = supervisor::Supervisor::new(
             BackendConfig {
                 host: meta.host.clone(), session: session.clone(),
                 tmux_path: tmux_path.clone(), tmux_version, base_args: vec![],
-            }, sink, 90, 30,
-        ).map_err(|e| e.to_string())?;
-        Backend::Control(b)
+            },
+            supervisor::SupervisorOpts::default(),
+            supervisor::real_backend_factory(),
+            app_sink, state_sink,
+            Arc::new(|d| std::thread::sleep(d)),
+        );
+        sup.start(90, 30);
+        Backend::Supervised(sup)
     } else {
         let app_for_sink = app.clone();
         let id_for_sink = id.clone();
@@ -313,22 +336,28 @@ fn session_rename(state: State<AppState>, id: String, title: String) -> serde_js
     json!({ "ok": true, "title": clean })
 }
 
-// Project tab ops (control mode only).
+// Project tab ops (control mode only; no-op on plain).
 #[tauri::command]
 fn tab_new(state: State<AppState>, id: String) {
-    if let Some(Session { backend: Backend::Control(b), .. }) = state.sessions.lock().unwrap().get(&id) { b.new_window(); }
+    if let Some(s) = state.sessions.lock().unwrap().get(&id) { s.backend.new_window(); }
 }
 #[tauri::command]
 fn tab_select(state: State<AppState>, id: String, win: String) {
-    if let Some(Session { backend: Backend::Control(b), .. }) = state.sessions.lock().unwrap().get(&id) { b.select_window(&win); }
+    if let Some(s) = state.sessions.lock().unwrap().get(&id) { s.backend.select_window(&win); }
 }
 #[tauri::command]
 fn tab_close(state: State<AppState>, id: String, win: String) {
-    if let Some(Session { backend: Backend::Control(b), .. }) = state.sessions.lock().unwrap().get(&id) { b.kill_window(&win); }
+    if let Some(s) = state.sessions.lock().unwrap().get(&id) { s.backend.kill_window(&win); }
 }
 #[tauri::command]
 fn tab_capture(state: State<AppState>, id: String, win: String) {
-    if let Some(Session { backend: Backend::Control(b), .. }) = state.sessions.lock().unwrap().get(&id) { b.capture_window(&win); }
+    if let Some(s) = state.sessions.lock().unwrap().get(&id) { s.backend.capture_window(&win); }
+}
+
+// User-initiated reconnect from a dead session (renderer 'retry').
+#[tauri::command]
+fn session_retry(state: State<AppState>, id: String) {
+    if let Some(s) = state.sessions.lock().unwrap().get(&id) { s.backend.retry(); }
 }
 
 // Largest file we'll transport for the viewer's Download-to-local path (DESIGN.md §16). Render
@@ -411,7 +440,7 @@ pub fn run() {
             list_sessions, create_session, session_input, session_resize,
             session_close, session_kill, session_rename,
             tab_new, tab_select, tab_close, tab_capture, open_external, ui_log,
-            read_remote_file, save_file
+            read_remote_file, save_file, session_retry
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

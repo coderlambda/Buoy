@@ -40,6 +40,7 @@ pub enum BackendEvent {
 
 pub type BackendSink = Arc<dyn Fn(BackendEvent) + Send + Sync>;
 
+#[derive(Clone)]
 pub struct BackendConfig {
     pub host: String,
     pub session: String,
@@ -163,6 +164,10 @@ impl ControlBackend {
                         Err(e) => { crate::dlog!("reader: read error: {}", e); break; }
                     }
                 }
+                // Reader ended (EOF / error / ssh died): stop the flush thread and flush any tail,
+                // then signal exit. Without setting `stopped` here the flush thread would leak for
+                // every backend the supervisor spawns over a session's lifetime.
+                { let mut g = inner.lock().unwrap(); g.stopped = true; g.flush_output(); }
                 sink(BackendEvent::Exit);
             });
         }
