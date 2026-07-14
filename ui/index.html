@@ -84,6 +84,17 @@
     .fv-md pre.mdcode { background:var(--panel); padding:10px; border-radius:6px; overflow:auto; }
     .fv-md pre.mdcode code { background:none; padding:0; }
     .fv-md a.mdlink { color:var(--accent); cursor:pointer; }
+    /* URL open chooser (§18) */
+    .chooser-back { position:fixed; inset:0; background:rgba(0,0,0,.35); display:flex;
+      align-items:center; justify-content:center; z-index:50; }
+    .chooser { background:var(--panel); border:1px solid #45475a; border-radius:8px; min-width:280px;
+      max-width:70vw; padding:6px; box-shadow:0 8px 30px rgba(0,0,0,.4); }
+    .chooser-title { font-size:11px; color:var(--muted); padding:6px 8px; overflow:hidden;
+      text-overflow:ellipsis; white-space:nowrap; }
+    .chooser-item { display:block; width:100%; text-align:left; padding:8px 10px; margin:2px 0;
+      background:var(--bg); color:var(--fg); border:1px solid #313244; border-radius:6px; cursor:pointer;
+      font:inherit; }
+    .chooser-item:hover { background:#313244; border-color:var(--accent); }
   </style>
 </head>
 <body>

@@ -14,7 +14,7 @@ fn live_relative_path_resolves_against_cwd() {
     let host = match env("DT_LIVE_HOST") { Some(h) => h, None => { eprintln!("SKIP: set DT_LIVE_HOST"); return; } };
     let tmux = env("DT_TMUX").unwrap_or_else(|| "tmux".into());
     let session = "rustrelpath";
-    let socket = durable_terminal_lib::tmux_socket::socket_name("control", Some((3, 7)));
+    let socket = durable_terminal_lib::tmux_socket::socket_name("control", Some((3, 7)), session);
 
     let sh = |cmd: &str| { let _ = std::process::Command::new("ssh")
         .args(["-o", "BatchMode=yes", "--", &host, cmd]).status(); };

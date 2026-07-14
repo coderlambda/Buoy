@@ -1054,3 +1054,65 @@ Today it copies + status. It becomes: call `ctx.openViewer(meta.id, text)`. For 
 ### Deferred (explicitly not in the first cut)
 Split-pane layout, syntax highlighting, rich/large markdown libs, **upload-to-override**
 (`write_remote_file`), diffing, and re-fetch/watch.
+
+---
+
+## 17. Clickable bare/relative paths — resolve against the pane cwd (Tauri branch)
+
+Makes `ls`-style output clickable and opens relatives correctly.
+
+- **Matcher (ui/builtinPlugins.js):** besides slash paths + `~//./..`, also match bare filenames
+  **with an extension** (`README.md`), relative paths with an interior slash + extension
+  (`src/main.rs`), and known extension-less names (`Makefile`, `Dockerfile`, `LICENSE`, `README`).
+  Plain words (no slash, no extension, not known) stay unmatched to avoid underlining noise.
+- **Resolution (backend, server-side):** the `read_remote_file` ssh exec resolves a relative path
+  against the session's ACTIVE-PANE cwd — it queries tmux `#{pane_current_path}` and joins, in the
+  same remote script. Absolute passes through; `~`/`~/` expand to `$HOME`. cwd never leaves the
+  backend. Non-file targets error to a status message (no tab).
+- Gotcha (verified): POSIX `${p#~/}` does NOT strip a leading `~/` (the `~` is literal in the
+  pattern) — must escape it as `${p#\~/}`.
+
+---
+
+## 18. Clickable URLs + localhost port-forwarding (Tauri branch)
+
+A URL in remote output that points at the remote's loopback (`localhost:3000`) can't be opened by
+the local browser as-is — it would hit the Mac's port 3000. Like cmux, we open an on-demand
+`ssh -L` tunnel to the remote loopback and point the browser at the LOCAL tunnel URL.
+
+### Click behavior (locked)
+- **Plain click = smart:**
+  - loopback URL (`localhost`/`127.0.0.1`, configurable) → open/reuse an `ssh -L` tunnel, then open
+    the LOCAL tunnel URL (`http://localhost:<localPort>/<path>`) in the default browser.
+  - any other URL → open in the default browser (unchanged).
+- **Shift+Cmd+click** → a small chooser: open-local-via-tunnel / copy URL / open-as-plain.
+
+### Tunnel model (Rust)
+- `open_forwarded_url(sessionId, url)`: parse remote host+port+path; pick a free local port; if a
+  tunnel for (session, remotePort) already exists, REUSE it, else spawn
+  `ssh [port/baseArgs] -o ExitOnForwardFailure=yes -N -L <local>:localhost:<remote> <host>`
+  (a SEPARATE ssh process — never the `-CC` channel or the supervisor's connection); then return
+  the local URL for the browser.
+- Tunnels are tracked per session in a `TunnelRegistry`; **torn down when the session is
+  closed/killed** (session_close/session_kill). Reused across clicks to the same remote port.
+- Connection params (host/port/baseArgs) come from the VALIDATED store, not the renderer. The
+  remote port is validated numeric; the path is percent-encoded/appended safely.
+
+### Config
+`loopbackHosts` (default `["localhost","127.0.0.1"]`) in a small `config.json` in the app data dir
+— no settings UI yet, but the seam exists (add `0.0.0.0` etc. there). Loaded at startup.
+
+### Security
+- Only opens `http`/`https` local tunnel URLs; scheme-validated like `open_external`.
+- ssh argv is built from validated store fields; the local port is app-chosen (not user text).
+- Tunnels bind to `127.0.0.1` locally (not `0.0.0.0`) so only this machine can use them.
+
+### Testing
+- Unit: URL classification (plain vs loopback + port/path parse); free-port pick; registry
+  reuse/teardown.
+- Live: start a server on the remote loopback, click its `localhost:PORT` URL, assert the tunnel
+  opens and the local URL serves the same content; second click reuses the tunnel; session close
+  tears it down.
+
+### Deferred
+Tunnels-list UI, idle timeout, `0.0.0.0` default, HTTPS-to-remote, and non-HTTP forwards.

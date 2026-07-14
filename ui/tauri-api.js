@@ -26,6 +26,9 @@ window.terminalAPI = {
   // file viewer (§16): fetch a clicked path's bytes; save bytes to a local file via native dialog
   readRemoteFile: (id, path) => invoke('read_remote_file', { id, path }),   // -> { data_b64, size, truncated }
   saveFile: (dataB64, suggestedName) => invoke('save_file', { dataB64, suggestedName }),
+  // §18: open a remote-loopback URL via an ssh -L tunnel -> { ok, localUrl }
+  openForwardedUrl: (id, url) => invoke('open_forwarded_url', { id, url }),
+  getConfig: () => invoke('get_config'),   // { loopbackHosts }
   // project tabs (§14) — native/control mode
   tabNew: (id) => invoke('tab_new', { id }),
   tabSelect: (id, win) => invoke('tab_select', { id, win }),

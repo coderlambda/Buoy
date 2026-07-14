@@ -22,7 +22,7 @@ fn live_reconnects_after_ssh_killed() {
     let host = match env("DT_LIVE_HOST") { Some(h) => h, None => { eprintln!("SKIP: set DT_LIVE_HOST"); return; } };
     let tmux = env("DT_TMUX").unwrap_or_else(|| "tmux".into());
     let session = "rustreconn";
-    let socket = durable_terminal_lib::tmux_socket::socket_name("control", Some((3, 7)));
+    let socket = durable_terminal_lib::tmux_socket::socket_name("control", Some((3, 7)), session);
     let ssh_cleanup = || { let _ = std::process::Command::new("ssh")
         .args(["-o", "BatchMode=yes", "--", &host,
                &format!("{} -L {} kill-session -t {} 2>/dev/null; true", tmux, socket, session)]).status(); };

@@ -85,7 +85,7 @@ impl ControlBackend {
     pub fn spawn(cfg: BackendConfig, sink: BackendSink, cols: u16, rows: u16)
         -> Result<Self, validation::ValidationError>
     {
-        let socket = socket_name("control", cfg.tmux_version);
+        let socket = socket_name("control", cfg.tmux_version, &cfg.session);
         let mut default_opts: Vec<String> = vec![
             "-o".into(), "ConnectTimeout=8".into(),
             "-o".into(), "ServerAliveInterval=15".into(),

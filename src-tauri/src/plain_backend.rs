@@ -38,7 +38,7 @@ impl PlainBackend {
     pub fn spawn(cfg: PlainConfig, sink: PlainSink, cols: u16, rows: u16)
         -> Result<Self, validation::ValidationError>
     {
-        let socket = socket_name("plain", cfg.tmux_version);
+        let socket = socket_name("plain", cfg.tmux_version, &cfg.session);
         let mut opts: Vec<String> = vec![
             "-o".into(), "ConnectTimeout=8".into(),
             "-o".into(), "ServerAliveInterval=15".into(),

@@ -4,8 +4,10 @@
 // features. Register them, then register your own for tickets/PRs/etc.
 /* global module */
 
-// URL: http(s)/ftp/file, and bare www. — trailing punctuation trimmed by the regex boundary.
-const URL_RE = /\b(?:https?|ftp|file):\/\/[^\s"'<>`)]+|(?:\bwww\.[^\s"'<>`)]+)/g;
+// URL: http(s)/ftp/file, bare www., AND bare loopback host:port (localhost:3000, 127.0.0.1:8080
+// — with optional scheme + path). The bare-loopback form makes dev-server output clickable so it
+// can be port-forwarded (§18). Trailing punctuation trimmed by the char classes.
+const URL_RE = /\b(?:https?|ftp|file):\/\/[^\s"'<>`)]+|(?:\bwww\.[^\s"'<>`)]+)|(?:\b(?:localhost|127\.0\.0\.1):\d{1,5}(?:\/[^\s"'<>`)]*)?)/g;
 
 // Path matcher. Four kinds, tried left-to-right in one alternation:
 //   1. slash paths: absolute (/a/b), home (~/a/b), or slash-containing relative (./x, ../x, src/a)
@@ -36,7 +38,18 @@ function builtinLinkPlugins() {
       name: 'url',
       priority: 10,   // URLs win over paths when they'd overlap (e.g. file:///a/b)
       regex: URL_RE,
-      onClick(text, ctx) {
+      // mods = { shift, meta, alt } (§18). Plain click = smart: loopback -> ssh -L tunnel + local
+      // browser; other -> default browser. Shift(+Cmd) click -> chooser (where to open).
+      onClick(text, ctx, mods) {
+        if (mods && mods.shift) { if (ctx.chooseOpen) { ctx.chooseOpen(text); return; } }
+
+        // Loopback URL (localhost:PORT / 127.0.0.1:PORT) -> forward through the session and open
+        // the LOCAL tunnel URL. The host reaches the remote's loopback; the browser can't directly.
+        if (ctx.isLoopback && ctx.isLoopback(text) && ctx.openForwardedUrl) {
+          ctx.openForwardedUrl(text);
+          return;
+        }
+
         let url = text;
         if (/^www\./i.test(url)) url = 'https://' + url;
         // Only open safe schemes (terminal text is untrusted).

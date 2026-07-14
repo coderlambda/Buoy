@@ -16,6 +16,7 @@ pub mod plain_backend;
 pub mod probe;
 pub mod remote_file;
 pub mod supervisor;
+pub mod tunnel;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -84,6 +85,25 @@ struct Session {
 struct AppState {
     sessions: Mutex<HashMap<String, Session>>,
     store: SessionStore,
+    tunnels: tunnel::TunnelRegistry,
+    config: AppConfig,
+}
+
+// Small app config loaded from config.json in the app data dir (§18). No settings UI yet.
+#[derive(Clone, serde::Deserialize)]
+struct AppConfig {
+    #[serde(default = "default_loopback_hosts")]
+    loopback_hosts: Vec<String>,
+}
+fn default_loopback_hosts() -> Vec<String> { vec!["localhost".into(), "127.0.0.1".into()] }
+impl Default for AppConfig {
+    fn default() -> Self { AppConfig { loopback_hosts: default_loopback_hosts() } }
+}
+fn load_config() -> AppConfig {
+    let path = user_data_dir().join("config.json");
+    std::fs::read_to_string(&path).ok()
+        .and_then(|s| serde_json::from_str::<AppConfig>(&s).ok())
+        .unwrap_or_default()
 }
 
 #[derive(Serialize, Clone)]
@@ -287,8 +307,10 @@ fn session_resize(state: State<AppState>, id: String, cols: u16, rows: u16) {
 
 #[tauri::command]
 fn session_close(state: State<AppState>, id: String) {
-    // Detach: stop the local client, leave the remote tmux running.
+    // Detach: stop the local client, leave the remote tmux running. Its port-forward tunnels die
+    // with the client (§18).
     if let Some(s) = state.sessions.lock().unwrap().remove(&id) { s.backend.kill(); }
+    state.tunnels.close_session(&id);
     let mut list = state.store.load();
     list.retain(|s| s.id != id);
     state.store.save(&list);
@@ -301,11 +323,12 @@ fn session_kill(state: State<AppState>, id: String) -> serde_json::Value {
         let mut sessions = state.sessions.lock().unwrap();
         sessions.remove(&id).map(|s| { s.backend.kill(); s.meta })
     }.or_else(|| state.store.load().into_iter().find(|s| s.id == id));
+    state.tunnels.close_session(&id);
 
     let mut killed_remote = false;
     if let Some(m) = meta {
         if m.transport == "ssh" {
-            let socket = tmux_socket::socket_name(&m.mode, m.tmux_version);
+            let socket = tmux_socket::socket_name(&m.mode, m.tmux_version, &m.session);
             let tmux_path = m.tmux_path.unwrap_or_else(|| "tmux".into());
             if let Ok(args) = validation::build_kill_args(&m.host, &m.session, &tmux_path, &socket, &[]) {
                 let ok = std::process::Command::new("ssh")
@@ -386,7 +409,7 @@ fn read_remote_file(state: State<AppState>, id: String, path: String) -> Result<
         // tmux socket/session so the remote script can query #{pane_current_path}.
         let ctx = remote_file::TmuxCtx {
             tmux_path: meta.tmux_path.clone().unwrap_or_default(),
-            socket: tmux_socket::socket_name(&meta.mode, meta.tmux_version),
+            socket: tmux_socket::socket_name(&meta.mode, meta.tmux_version, &meta.session),
             session: meta.session.clone(),
         };
         remote_file::read_remote_file(&meta.host, &path, DOWNLOAD_CAP, &ctx, &[])?
@@ -436,18 +459,57 @@ fn open_external(app: AppHandle, url: String) -> serde_json::Value {
     json!({ "ok": ok })
 }
 
+// Expose config to the renderer (loopback host set for URL classification, §18).
+#[tauri::command]
+fn get_config(state: State<AppState>) -> serde_json::Value {
+    json!({ "loopbackHosts": state.config.loopback_hosts })
+}
+
+// Open a remote-loopback URL (localhost:PORT) via an ssh -L tunnel, then open the LOCAL tunnel URL
+// in the browser (§18). Reuses a live tunnel for the same (session, remote port). If the URL isn't
+// a configured loopback URL, this is a no-op error (the renderer opens plain URLs directly).
+#[tauri::command]
+fn open_forwarded_url(app: AppHandle, state: State<AppState>, id: String, url: String)
+    -> Result<serde_json::Value, String>
+{
+    let (_, lb) = tunnel::classify_loopback(&url, &state.config.loopback_hosts)
+        .ok_or_else(|| "not a loopback URL".to_string())?;
+    // Connection params from the VALIDATED store (never the renderer).
+    let meta = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(&id).map(|s| s.meta.clone())
+    }.or_else(|| state.store.load().into_iter().find(|s| s.id == id))
+     .ok_or_else(|| "unknown session".to_string())?;
+    if meta.host.is_empty() {
+        return Err("local session has no remote to forward".into());
+    }
+    let local_port = state.tunnels.ensure(&id, &meta.host, lb.port, &[])?;
+    let local_url = format!("http://localhost:{}{}", local_port, lb.path);
+    dlog!("open_forwarded_url: {} -> {}", url, local_url);
+    // Give ssh a beat to establish the forward before the browser hits it.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    use tauri_plugin_opener::OpenerExt;
+    let _ = app.opener().open_url(&local_url, None::<&str>);
+    Ok(json!({ "ok": true, "localUrl": local_url }))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let store = SessionStore::new(user_data_dir().join("sessions.json"));
+    let config = load_config();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .manage(AppState { sessions: Mutex::new(HashMap::new()), store })
+        .manage(AppState {
+            sessions: Mutex::new(HashMap::new()), store,
+            tunnels: tunnel::TunnelRegistry::new(), config,
+        })
         .invoke_handler(tauri::generate_handler![
             list_sessions, create_session, session_input, session_resize,
             session_close, session_kill, session_rename,
             tab_new, tab_select, tab_close, tab_capture, open_external, ui_log,
-            read_remote_file, save_file, session_retry
+            read_remote_file, save_file, session_retry,
+            open_forwarded_url, get_config
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

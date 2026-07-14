@@ -59,6 +59,47 @@ test('TC-PL4 url wins over path on overlap', () => {
   assert.equal(m[0].text, 'file:///var/log/x');
 });
 
+// TC-PL4b loopback URLs are detected (localhost/127.0.0.1 with a port), §18
+test('TC-PL4b detects loopback urls', () => {
+  const r = reg();
+  const m = r.findMatches('vite at http://localhost:5173/ and 127.0.0.1:8080 up');
+  const urls = m.filter((x) => x.plugin.name === 'url').map((x) => x.text);
+  assert.deepEqual(urls, ['http://localhost:5173/', '127.0.0.1:8080']);
+});
+
+// TC-PL4c plain click on a loopback URL routes to openForwardedUrl (tunnel), not openExternal
+test('TC-PL4c loopback click forwards; plain url opens external', () => {
+  const url = builtinLinkPlugins().find((p) => p.name === 'url');
+  let forwarded = null, external = null;
+  const ctx = {
+    isLoopback: (u) => /^(?:https?:\/\/)?(localhost|127\.0\.0\.1):\d+/.test(u),
+    openForwardedUrl: (u) => { forwarded = u; },
+    openExternal: (u) => { external = u; },
+    setStatus() {},
+  };
+  url.onClick('http://localhost:3000/app', ctx, { shift: false, meta: true });
+  assert.equal(forwarded, 'http://localhost:3000/app', 'loopback -> forwarded');
+  assert.equal(external, null, 'loopback not opened externally');
+
+  forwarded = null;
+  url.onClick('https://github.com/x', ctx, { shift: false, meta: true });
+  assert.equal(external, 'https://github.com/x', 'plain -> external');
+  assert.equal(forwarded, null);
+});
+
+// TC-PL4d Shift+Cmd click routes to the chooser
+test('TC-PL4d shift-click opens the chooser', () => {
+  const url = builtinLinkPlugins().find((p) => p.name === 'url');
+  let chosen = null, forwarded = null;
+  const ctx = {
+    isLoopback: () => true, openForwardedUrl: (u) => { forwarded = u; },
+    chooseOpen: (u) => { chosen = u; }, openExternal() {}, setStatus() {},
+  };
+  url.onClick('localhost:3000', ctx, { shift: true, meta: true });
+  assert.equal(chosen, 'localhost:3000', 'shift -> chooser');
+  assert.equal(forwarded, null, 'shift does not auto-forward');
+});
+
 // TC-PL5 custom plugin registers and matches; unregister works
 test('TC-PL5 custom plugin + unregister', () => {
   const r = new PluginRegistry();

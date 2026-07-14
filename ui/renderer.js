@@ -39,6 +39,14 @@ function dbg(...a) {
 function setStatus(t) { setStatusRaw(t); }
 function setStatusRaw(t) { statusEl.textContent = t; }
 
+// §18: loopback host set (from the host config; default localhost/127.0.0.1). Loaded at startup.
+let loopbackHosts = ['localhost', '127.0.0.1'];
+// Does this URL point at a configured remote-loopback host (so it needs an ssh -L tunnel)?
+function isLoopbackUrl(url) {
+  const m = /^(?:https?:\/\/)?([^\s/:]+):(\d{1,5})(?:[/?]|$)/.exec(url);
+  return !!(m && loopbackHosts.includes(m[1]) && +m[2] >= 1 && +m[2] <= 65535);
+}
+
 // A VIEW is a project: one connection, potentially many tabs (tmux windows, §14). Each tab is
 // a polymorphic TabContent (§15) — today always a 'terminal'. A single-window project behaves
 // exactly like the old single-session view.
@@ -99,6 +107,34 @@ function openViewer(sessionId, path) {
 
 function baseName(p) { return (String(p).split('/').pop() || 'file'); }
 
+// §18: Shift+Cmd chooser — a small popup letting the user pick where to open a URL. Loopback URLs
+// offer tunnel-open; all URLs offer copy and open-plain.
+function chooseOpen(sessionId, url) {
+  const loop = isLoopbackUrl(url);
+  const items = [];
+  if (loop) items.push(['Open in local browser (tunnel)', () => api.openForwardedUrl(sessionId, url)]);
+  items.push(['Open in browser', () => api.openExternal(loop && !/^https?:\/\//.test(url) ? 'http://' + url : url)]);
+  items.push(['Copy URL', () => api.copyText(url)]);
+
+  const back = document.createElement('div');
+  back.className = 'chooser-back';
+  const box = document.createElement('div');
+  box.className = 'chooser';
+  const title = document.createElement('div'); title.className = 'chooser-title'; title.textContent = url;
+  box.appendChild(title);
+  const close = () => { if (back.parentNode) back.parentNode.removeChild(back); };
+  items.forEach(([label, fn]) => {
+    const b = document.createElement('button');
+    b.className = 'chooser-item'; b.textContent = label;
+    b.onclick = () => { close(); try { fn(); } catch (_) {} };
+    box.appendChild(b);
+  });
+  back.appendChild(box);
+  back.onclick = (e) => { if (e.target === back) close(); };
+  document.addEventListener('keydown', function esc(e) { if (e.key === 'Escape') { close(); document.removeEventListener('keydown', esc); } });
+  document.body.appendChild(back);
+}
+
 // The active tab (or the sole tab for single-window/plain views).
 function activeTab(v) {
   if (v.activeWindow && v.tabs.has(v.activeWindow)) return v.tabs.get(v.activeWindow);
@@ -116,6 +152,18 @@ function makeLinkProvider(getTerm, meta) {
     setStatus: (msg) => setStatus(msg),
     // §16: open a clicked path in an in-app file-viewer tab of this session.
     openViewer: (path) => openViewer(meta.id, path),
+    // §18: is this URL a remote-loopback URL (needs an ssh -L tunnel to reach)?
+    isLoopback: (url) => isLoopbackUrl(url),
+    // §18: open a loopback URL via a tunnel (host forwards + opens the local URL).
+    openForwardedUrl: async (url) => {
+      setStatus('forwarding ' + url + '…');
+      try {
+        const res = await api.openForwardedUrl(meta.id, url);
+        setStatus(res && res.localUrl ? ('opened ' + res.localUrl) : ('could not forward ' + url));
+      } catch (e) { setStatus('forward failed: ' + (e && e.message || e)); }
+    },
+    // §18: Shift+Cmd chooser — where to open a URL.
+    chooseOpen: (url) => chooseOpen(meta.id, url),
   };
   return {
     provideLinks(lineNumber, callback) {
@@ -134,7 +182,9 @@ function makeLinkProvider(getTerm, meta) {
         text: m.text,
         decorations: { underline: true, pointerCursor: true },
         activate: (event) => {
-          try { m.plugin.onClick(m.text, ctx); }
+          // Pass modifier state so handlers can offer a chooser (Shift+Cmd) vs the smart default.
+          const mods = { shift: !!(event && event.shiftKey), meta: !!(event && (event.metaKey || event.ctrlKey)), alt: !!(event && event.altKey) };
+          try { m.plugin.onClick(m.text, ctx, mods); }
           catch (e) { setStatus('link handler error: ' + (e && e.message)); }
         },
       }));
@@ -527,6 +577,8 @@ document.getElementById('form').addEventListener('submit', async (e) => {
 
 // --- restore persisted sessions on launch (lazy: create views, connect on click) ---
 (async function init() {
+  // §18: load the loopback host set (for URL classification) before wiring links.
+  try { const cfg = await api.getConfig(); if (cfg && Array.isArray(cfg.loopbackHosts)) loopbackHosts = cfg.loopbackHosts; } catch (_) {}
   const persisted = await api.listSessions();
   dbg('init: ' + persisted.length + ' persisted; first=' + JSON.stringify(persisted[0] || null));
   for (const meta of persisted) {
