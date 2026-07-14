@@ -123,3 +123,52 @@ fn live_tab_isolation_and_revisit() {
         .status();
     eprintln!("LIVE OK: tab isolation + revisit verified against {}", host);
 }
+
+// Reproduces "cannot connect to existing sessions": create a session with a marker, drop the
+// client (like closing the app), then RE-CONNECT with the persisted tmux path/version and verify
+// we reattach the SAME tmux session (its marker is replayed via capture) rather than failing or
+// spawning a fresh one. This is the flow the camelCase store fix restores.
+#[test]
+#[ignore]
+fn live_reattach_existing_session() {
+    let host = match env("DT_LIVE_HOST") { Some(h) => h, None => { eprintln!("SKIP: set DT_LIVE_HOST"); return; } };
+    let tmux = env("DT_TMUX").unwrap_or_else(|| "tmux".into());
+    let session = "rustreattach";
+    let socket = durable_terminal_lib::tmux_socket::socket_name("control", Some((3, 7)));
+    let kill = |()| { let _ = std::process::Command::new("ssh")
+        .args(["-o", "BatchMode=yes", "--", &host,
+               &format!("{} -L {} kill-session -t {} 2>/dev/null; true", tmux, socket, session)]).status(); };
+    kill(());
+
+    let cfg = || BackendConfig {
+        host: host.clone(), session: session.into(),
+        tmux_path: tmux.clone(), tmux_version: Some((3, 7)), base_args: vec![],
+    };
+
+    // First connection: create + write a durable marker.
+    let rec1 = Arc::new(Mutex::new(Recorder::default()));
+    let b1 = ControlBackend::spawn(cfg(), sink(rec1.clone()), 90, 30).expect("spawn 1");
+    for _ in 0..40 { if rec1.lock().unwrap().ready { break; } sleep_ms(250); }
+    assert!(rec1.lock().unwrap().ready, "first connect ready");
+    b1.write("echo REATTACH_MARK\n");
+    sleep_ms(1500);
+    b1.kill();               // drop the client; tmux session stays alive server-side
+    sleep_ms(1000);
+
+    // Second connection with the SAME persisted config: must reattach and replay the marker.
+    let rec2 = Arc::new(Mutex::new(Recorder::default()));
+    let b2 = ControlBackend::spawn(cfg(), sink(rec2.clone()), 90, 30).expect("spawn 2");
+    for _ in 0..40 { if rec2.lock().unwrap().ready { break; } sleep_ms(250); }
+    assert!(rec2.lock().unwrap().ready, "reconnect ready");
+    sleep_ms(2000);          // let attach capture back-fill the active window
+    {
+        let r = rec2.lock().unwrap();
+        let all: String = r.by_window.values().cloned().collect::<Vec<_>>().join("\n");
+        assert!(all.contains("REATTACH_MARK"),
+            "reattached session replays its prior content (not a fresh session)");
+    }
+
+    b2.kill();
+    kill(());
+    eprintln!("LIVE OK: reattach to existing session verified against {}", host);
+}

@@ -135,9 +135,9 @@ struct CreateArgs {
     session: Option<String>,
     title: Option<String>,
     mode: Option<String>,
-    #[serde(rename = "tmuxPath")]
+    #[serde(default, rename = "tmuxPath")]
     tmux_path: Option<String>,
-    #[serde(rename = "tmuxVersion")]
+    #[serde(default, rename = "tmuxVersion")]
     tmux_version: Option<(u32, u32)>,
     transport: Option<String>,
 }

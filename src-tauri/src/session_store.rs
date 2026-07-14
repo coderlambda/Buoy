@@ -6,7 +6,12 @@ use std::path::PathBuf;
 
 use crate::validation::{parse_host, validate_session};
 
+// Serialized to/from the renderer AND disk in camelCase, so the JS side reads meta.tmuxPath /
+// meta.tmuxVersion directly (a snake/camel mismatch here silently dropped the persisted tmux
+// path -> re-probe on every reconnect -> wrong socket -> couldn't reattach existing sessions).
+// `alias` keeps older snake_case store files loadable (migrated to camelCase on next save).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionMeta {
     pub id: String,
     pub host: String,
@@ -15,9 +20,9 @@ pub struct SessionMeta {
     pub transport: String,
     #[serde(default = "default_mode")]
     pub mode: String,
-    #[serde(default)]
+    #[serde(default, alias = "tmux_path")]
     pub tmux_path: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "tmux_version")]
     pub tmux_version: Option<(u32, u32)>,
     #[serde(default)]
     pub title: Option<String>,
@@ -90,5 +95,45 @@ impl SessionStore {
                 let _ = std::fs::rename(&tmp, &self.path);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The persisted tmux path/version must survive load with BOTH camelCase (new) and snake_case
+    // (legacy) keys — the mismatch that dropped them caused a re-probe -> wrong socket -> couldn't
+    // reattach existing sessions.
+    #[test]
+    fn loads_camel_and_legacy_snake_case() {
+        let camel: SessionMeta = serde_json::from_str(
+            r#"{"id":"1","host":"me@h","session":"dt-1","mode":"control",
+                "tmuxPath":"/home/u/.local/bin/tmux","tmuxVersion":[3,7]}"#,
+        ).unwrap();
+        assert_eq!(camel.tmux_path.as_deref(), Some("/home/u/.local/bin/tmux"));
+        assert_eq!(camel.tmux_version, Some((3, 7)));
+
+        let legacy: SessionMeta = serde_json::from_str(
+            r#"{"id":"1","host":"me@h","session":"dt-1","mode":"control",
+                "tmux_path":"/home/u/.local/bin/tmux","tmux_version":[3,7]}"#,
+        ).unwrap();
+        assert_eq!(legacy.tmux_path.as_deref(), Some("/home/u/.local/bin/tmux"));
+        assert_eq!(legacy.tmux_version, Some((3, 7)));
+    }
+
+    // We serialize camelCase so the renderer reads meta.tmuxPath / meta.tmuxVersion directly.
+    #[test]
+    fn serializes_camel_case() {
+        let m = SessionMeta {
+            id: "1".into(), host: "me@h".into(), session: "dt-1".into(),
+            transport: "ssh".into(), mode: "control".into(),
+            tmux_path: Some("/t".into()), tmux_version: Some((3, 7)),
+            title: Some("x".into()), order: 0,
+        };
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(json.contains("\"tmuxPath\""), "must serialize camelCase tmuxPath");
+        assert!(json.contains("\"tmuxVersion\""));
+        assert!(!json.contains("tmux_path"), "must NOT emit snake_case");
     }
 }
