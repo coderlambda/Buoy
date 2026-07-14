@@ -2,6 +2,8 @@
 //! forwards backend events to the webview as Tauri events. This replaces the Electron main
 //! process + preload IPC (DESIGN.md §4, §6.3).
 
+#[macro_use]
+pub mod dlog;
 pub mod control_parser;
 pub mod window_registry;
 pub mod reply_channel;
@@ -144,6 +146,8 @@ struct CreateArgs {
 
 #[tauri::command]
 fn create_session(app: AppHandle, state: State<AppState>, meta: CreateArgs) -> Result<serde_json::Value, String> {
+    dlog!("create_session: host={:?} session={:?} mode={:?} tmuxPath={:?} tmuxVersion={:?}",
+        meta.host, meta.session, meta.mode, meta.tmux_path, meta.tmux_version);
     let id = meta.id.clone().unwrap_or_else(|| {
         // millis-since-epoch id
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
@@ -164,9 +168,13 @@ fn create_session(app: AppHandle, state: State<AppState>, meta: CreateArgs) -> R
         (meta.tmux_path.clone().unwrap_or_else(|| "tmux".into()), meta.tmux_version);
     let want_control = meta.mode.as_deref() == Some("control");
     if meta.tmux_path.is_none() {
+        dlog!("create_session: no tmuxPath supplied -> probing {}", meta.host);
         let res = probe::probe_tmux(&meta.host, &[]);
+        dlog!("create_session: probe -> path={} version={:?} probed={}", res.tmux_path, res.version, res.probed);
         tmux_path = res.tmux_path;
         tmux_version = res.version;
+    } else {
+        dlog!("create_session: reusing persisted tmuxPath={} version={:?} (no probe)", tmux_path, tmux_version);
     }
 
     // Control mode needs tmux >= 3.2; downgrade to plain if older/unknown.
@@ -233,8 +241,14 @@ fn create_session(app: AppHandle, state: State<AppState>, meta: CreateArgs) -> R
         Backend::Plain(b)
     };
 
+    dlog!("create_session: spawned backend id={} session={} mode={}", id, session, mode);
     state.sessions.lock().unwrap().insert(id.clone(), Session { backend, meta: session_meta });
     Ok(json!({ "id": id, "session": session, "mode": mode }))
+}
+
+#[tauri::command]
+fn ui_log(msg: String) {
+    dlog::log(&format!("[ui] {}", msg));
 }
 
 #[tauri::command]
@@ -339,7 +353,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_sessions, create_session, session_input, session_resize,
             session_close, session_kill, session_rename,
-            tab_new, tab_select, tab_close, tab_capture, open_external
+            tab_new, tab_select, tab_close, tab_capture, open_external, ui_log
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

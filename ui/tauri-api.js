@@ -37,5 +37,14 @@ window.terminalAPI = {
   onIntentionalExit: (cb) => on('session:exit', cb),
   onWindow: (cb) => on('session:window', cb),
   onReady: (cb) => on('session:ready', cb),
-  log: (msg) => { try { console.log('[DT ui]', msg); } catch (_) {} },
+  log: (msg) => { try { console.log('[DT ui]', msg); } catch (_) {} try { invoke('ui_log', { msg: String(msg) }); } catch (_) {} },
 };
+
+// Surface uncaught renderer errors to the log file too (a thrown handler would otherwise be
+// invisible and look like "stuck connecting").
+window.addEventListener('error', (e) => {
+  try { invoke('ui_log', { msg: 'window.error: ' + (e && e.message) + ' @ ' + (e && e.filename) + ':' + (e && e.lineno) }); } catch (_) {}
+});
+window.addEventListener('unhandledrejection', (e) => {
+  try { invoke('ui_log', { msg: 'unhandledrejection: ' + (e && e.reason && (e.reason.message || e.reason)) }); } catch (_) {}
+});

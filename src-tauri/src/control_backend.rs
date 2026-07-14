@@ -84,6 +84,7 @@ impl ControlBackend {
         let ssh_args = build_control_mode_ssh_args(
             &cfg.host, &cfg.session, &default_opts, &cfg.tmux_path, &socket,
         )?;
+        crate::dlog!("ControlBackend.spawn: socket={} ssh {}", socket, ssh_args.join(" "));
 
         let pty = native_pty_system();
         let pair = pty.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
@@ -122,11 +123,14 @@ impl ControlBackend {
             let inner = inner.clone();
             let sink = sink.clone();
             thread::spawn(move || {
+                crate::dlog!("reader: thread started");
                 let mut buf = [0u8; 8192];
+                let mut total = 0usize;
                 loop {
                     match reader.read(&mut buf) {
-                        Ok(0) => break,
+                        Ok(0) => { crate::dlog!("reader: EOF after {} bytes", total); break; }
                         Ok(n) => {
+                            total += n;
                             let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
                             let events = {
                                 let mut g = inner.lock().unwrap();
@@ -136,7 +140,7 @@ impl ControlBackend {
                                 Inner::handle_event(&inner, ev);
                             }
                         }
-                        Err(_) => break,
+                        Err(e) => { crate::dlog!("reader: read error: {}", e); break; }
                     }
                 }
                 sink(BackendEvent::Exit);
@@ -243,23 +247,29 @@ impl Inner {
             | ControlEvent::WindowPaneChanged { .. }
             | ControlEvent::SessionWindowChanged { .. }
             | ControlEvent::LayoutChange { .. } => {
+                crate::dlog!("event: {:?} -> queue refresh", ev);
                 Inner::queue_refresh(inner);
             }
             ControlEvent::SessionChanged { .. } => {
+                crate::dlog!("event: {:?} -> on_attach", ev);
                 Inner::on_attach(inner);
             }
             ControlEvent::Exit { .. } => {
+                crate::dlog!("event: {:?} -> emit Exit", ev);
                 inner.lock().unwrap().emit(BackendEvent::Exit);
             }
-            ControlEvent::Reply { body, .. } => {
+            ControlEvent::Reply { ok, body, .. } => {
+                crate::dlog!("event: Reply ok={} bodyLines={}", ok, body.len());
                 Inner::on_reply(inner, body);
             }
-            _ => {}
+            ControlEvent::Begin { .. } => {}
+            other => { crate::dlog!("event: unhandled {:?}", other); }
         }
     }
 
     fn on_reply(inner: &Arc<Mutex<Inner>>, body: Vec<String>) {
         let kind = { inner.lock().unwrap().reply.take() };
+        crate::dlog!("on_reply: kind={:?} bodyLines={}", kind, body.len());
         match kind {
             Some(ReplyKind::Topology) => {
                 let lines: Vec<String> = body.into_iter().filter(|l| !l.trim().is_empty()).collect();
@@ -302,9 +312,11 @@ impl Inner {
                 rows.push(r);
             }
         }
+        crate::dlog!("apply_topology: {} rows parsed from {} lines", rows.len(), lines.len());
         if rows.is_empty() { return; }
         let diff = g.reg.reconcile(&rows);
         let order = g.reg.order();
+        crate::dlog!("apply_topology: added={:?} removed={:?} active={:?}", diff.added, diff.removed, diff.active);
 
         for win in &diff.added {
             g.emit(BackendEvent::WindowAdd { window: win.clone(), order: order.clone() });
@@ -356,8 +368,9 @@ impl Inner {
     fn on_attach(inner: &Arc<Mutex<Inner>>) {
         {
             let mut g = inner.lock().unwrap();
-            if g.attached { return; }
+            if g.attached { crate::dlog!("on_attach: already attached, skip"); return; }
             g.attached = true;
+            crate::dlog!("on_attach: refreshing topology + capturing scrollback");
             g.refresh_now();
             let session = g.session.clone();
             g.send(
@@ -377,6 +390,7 @@ impl Inner {
         let mut g = inner.lock().unwrap();
         if g.ready { return; }
         g.ready = true;
+        crate::dlog!("mark_ready: active={:?} pending_input={}", g.reg.active_window, g.pending_input.len());
         let queued: Vec<String> = std::mem::take(&mut g.pending_input);
         if let Some(target) = g.reg.active_window.clone() {
             for d in queued {

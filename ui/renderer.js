@@ -134,11 +134,13 @@ async function mount(id) {
     // then). inputReady here is a DISPLAY flag only — the backend owns the actual gating.
     if (v.meta.mode === 'control') v.inputReady = false;
     setStatus(`connecting ${v.meta.title || v.meta.host || 'session'}…`);
-    await api.createSession({
+    dbg('mount->createSession id=' + v.meta.id + ' host=' + v.meta.host + ' session=' + v.meta.session + ' mode=' + v.meta.mode + ' tmuxPath=' + v.meta.tmuxPath + ' tmuxVersion=' + JSON.stringify(v.meta.tmuxVersion));
+    const res = await api.createSession({
       id: v.meta.id, kind: v.meta.kind || 'remote', transport: v.meta.transport,
       host: v.meta.host, session: v.meta.session, title: v.meta.title, mode: v.meta.mode,
       tmuxPath: v.meta.tmuxPath, tmuxVersion: v.meta.tmuxVersion,
     });
+    dbg('mount->createSession returned ' + JSON.stringify(res));
   }
 
   activeId = id;
@@ -267,7 +269,7 @@ function startRename(id, nameEl) {
 // resolution). Plain/local data has no window -> the single tab. The renderer never maps panes.
 api.onData(({ id, data, window }) => {
   const v = views.get(id);
-  if (!v) { (pendingData[id] = pendingData[id] || []).push(data); return; }
+  if (!v) { dbg('onData: NO VIEW id=' + id + ' (buffering)'); (pendingData[id] = pendingData[id] || []).push(data); return; }
   const tab = (v.meta.mode === 'control') ? (window ? ensureTab(v, window) : activeTab(v)) : activeTab(v);
   deliver(v, tab, data);
 });
@@ -325,8 +327,9 @@ function statusLine(v, state) {
 // holds no pane/topology state of its own.
 const tabsEl = document.getElementById('tabs');
 api.onWindow(({ id, action, window, name, order }) => {
+  dbg('onWindow id=' + id + ' action=' + action + ' window=' + window + ' order=' + JSON.stringify(order));
   const v = views.get(id);
-  if (!v) return;
+  if (!v) { dbg('onWindow: NO VIEW for id=' + id); return; }
   if (action === 'add') {
     ensureTab(v, window);
     if (!v.activeWindow) v.activeWindow = window;   // first window = active until told otherwise
@@ -401,8 +404,9 @@ api.onError(({ id, error }) => {
 });
 api.onIntentionalExit(({ id }) => { setStatus('session closed (detached)'); });
 api.onReady(({ id }) => {
+  dbg('onReady id=' + id + ' activeId=' + activeId);
   const v = views.get(id);
-  if (!v) return;
+  if (!v) { dbg('onReady: NO VIEW for id=' + id); return; }
   v.inputReady = true;   // display flag only; the backend already flushed its buffered input
   if (id === activeId) setStatus(statusLine(v, v.state));
 });
@@ -465,6 +469,7 @@ document.getElementById('form').addEventListener('submit', async (e) => {
 // --- restore persisted sessions on launch (lazy: create views, connect on click) ---
 (async function init() {
   const persisted = await api.listSessions();
+  dbg('init: ' + persisted.length + ' persisted; first=' + JSON.stringify(persisted[0] || null));
   for (const meta of persisted) {
     // meta already has {id, host, session, transport, title} from the store.
     const v = makeView({ ...meta, kind: 'remote' });
