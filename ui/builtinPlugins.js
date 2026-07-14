@@ -33,9 +33,10 @@ function builtinLinkPlugins() {
       priority: 0,
       regex: PATH_RE,
       onClick(text, ctx) {
-        // A path in the terminal is usually REMOTE (session is ssh+tmux), so the app can't
-        // open it locally in general — hence a callback. Default: copy + inform. A plugin
-        // can override this behavior by registering a higher-priority path matcher.
+        // Open the path in an in-app file-viewer tab (§16): the host fetches the file's bytes
+        // (remote over ssh, or local) and previews text/markdown/image with a Download button.
+        // Falls back to copy+status if the host can't provide a viewer (older/plain builds).
+        if (ctx.openViewer) { ctx.openViewer(text); return; }
         ctx.copyText(text);
         const where = ctx.meta && ctx.meta.host ? `remote (${ctx.meta.host})` : 'local';
         ctx.setStatus(`copied ${where} path: ${text}`);

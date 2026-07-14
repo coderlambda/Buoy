@@ -287,6 +287,36 @@ pub fn base64_encode(input: &[u8]) -> String {
     out
 }
 
+/// Minimal standard base64 decoder. Ignores ASCII whitespace (so wrapped base64 from `base64`
+/// on the remote decodes fine). Returns None on invalid input.
+pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::new();
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    for &c in input.as_bytes() {
+        if c == b'=' { break; }
+        if c.is_ascii_whitespace() { continue; }
+        let v = val(c)?;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,5 +387,16 @@ mod tests {
     fn tc_v_base64() {
         assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
         assert_eq!(base64_encode(b"tmux -L s"), "dG11eCAtTCBz");
+    }
+
+    #[test]
+    fn tc_v_base64_decode_roundtrip() {
+        for s in [&b""[..], b"h", b"he", b"hel", b"hello", b"\x00\xff\x94\x80", b"/a/b/c.md"] {
+            assert_eq!(base64_decode(&base64_encode(s)).unwrap(), s, "roundtrip {:?}", s);
+        }
+        // tolerate whitespace-wrapped base64 (as `base64` emits with line breaks)
+        assert_eq!(base64_decode("aGVs\nbG8=").unwrap(), b"hello");
+        // invalid char -> None
+        assert!(base64_decode("!!!!").is_none());
     }
 }

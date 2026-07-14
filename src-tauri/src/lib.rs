@@ -14,6 +14,7 @@ pub mod session_store;
 pub mod control_backend;
 pub mod plain_backend;
 pub mod probe;
+pub mod remote_file;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -330,17 +331,71 @@ fn tab_capture(state: State<AppState>, id: String, win: String) {
     if let Some(Session { backend: Backend::Control(b), .. }) = state.sessions.lock().unwrap().get(&id) { b.capture_window(&win); }
 }
 
-// Link-plugin actions (scheme-validated open + clipboard). Tauri opener/clipboard are done
-// renderer-side via plugins in a fuller build; keep a validated open here for parity.
+// Largest file we'll transport for the viewer's Download-to-local path (DESIGN.md §16). Render
+// caps (text 1MB / image 5MB) are enforced renderer-side; this bounds the fetch itself.
+const DOWNLOAD_CAP: usize = 50 * 1024 * 1024;
+
+#[derive(Serialize, Clone)]
+struct FilePayload { data_b64: String, size: usize, truncated: bool }
+
+// Fetch a clicked path's bytes for the file viewer (§16). Connection params come from the
+// VALIDATED store (never the renderer). Remote sessions read over a separate ssh exec; local
+// sessions read the local file. base64 in/out keeps it injection- and binary-safe.
 #[tauri::command]
-fn open_external(url: String) -> serde_json::Value {
+fn read_remote_file(state: State<AppState>, id: String, path: String) -> Result<FilePayload, String> {
+    // Resolve the session's host/transport from a running session or the persisted store.
+    let meta = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(&id).map(|s| s.meta.clone())
+    }.or_else(|| state.store.load().into_iter().find(|s| s.id == id))
+     .ok_or_else(|| "unknown session".to_string())?;
+
+    let rf = if meta.host.is_empty() {
+        remote_file::read_local_file(&path, DOWNLOAD_CAP)?
+    } else {
+        remote_file::read_remote_file(&meta.host, &path, DOWNLOAD_CAP, &[])?
+    };
+    dlog!("read_remote_file: id={} path={:?} size={} truncated={}", id, path, rf.data.len(), rf.truncated);
+    Ok(FilePayload {
+        data_b64: validation::base64_encode(&rf.data),
+        size: rf.data.len(),
+        truncated: rf.truncated,
+    })
+}
+
+// Download-to-local (§16): show a native save dialog seeded with `suggested_name`, then write the
+// decoded bytes. Returns { ok, path?, canceled? }. Runs the dialog on a worker thread (the
+// blocking picker must not run on the main/UI thread).
+#[tauri::command]
+fn save_file(app: AppHandle, data_b64: String, suggested_name: String) -> Result<serde_json::Value, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let bytes = validation::base64_decode(&data_b64).ok_or_else(|| "bad base64".to_string())?;
+    let name = if suggested_name.trim().is_empty() { "download".to_string() } else { suggested_name };
+
+    // blocking_save_file blocks until the user picks; run it off the main thread.
+    let path = std::thread::scope(|s| {
+        s.spawn(|| app.dialog().file().set_file_name(&name).blocking_save_file()).join().ok().flatten()
+    });
+    match path {
+        Some(fp) => {
+            let p = fp.into_path().map_err(|e| e.to_string())?;
+            std::fs::write(&p, &bytes).map_err(|e| e.to_string())?;
+            dlog!("save_file: wrote {} bytes to {:?}", bytes.len(), p);
+            Ok(json!({ "ok": true, "path": p.to_string_lossy() }))
+        }
+        None => Ok(json!({ "ok": false, "canceled": true })),
+    }
+}
+
+// Open a URL in the OS default browser via the opener plugin (scheme-validated — terminal text
+// is untrusted, so only safe schemes reach the OS handler).
+#[tauri::command]
+fn open_external(app: AppHandle, url: String) -> serde_json::Value {
     let ok = url.starts_with("http://") || url.starts_with("https://")
         || url.starts_with("ftp://") || url.starts_with("file:") || url.starts_with("mailto:");
     if ok {
-        #[cfg(target_os = "macos")]
-        let _ = std::process::Command::new("open").arg(&url).spawn();
-        #[cfg(target_os = "linux")]
-        let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+        use tauri_plugin_opener::OpenerExt;
+        let _ = app.opener().open_url(&url, None::<&str>);
     }
     json!({ "ok": ok })
 }
@@ -349,11 +404,14 @@ fn open_external(url: String) -> serde_json::Value {
 pub fn run() {
     let store = SessionStore::new(user_data_dir().join("sessions.json"));
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .manage(AppState { sessions: Mutex::new(HashMap::new()), store })
         .invoke_handler(tauri::generate_handler![
             list_sessions, create_session, session_input, session_resize,
             session_close, session_kill, session_rename,
-            tab_new, tab_select, tab_close, tab_capture, open_external, ui_log
+            tab_new, tab_select, tab_close, tab_capture, open_external, ui_log,
+            read_remote_file, save_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

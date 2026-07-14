@@ -2,7 +2,7 @@
 // Renderer: sidebar + one xterm view, wired to the main process over window.terminalAPI.
 // The terminal engine (xterm.js) is deliberately kept behind a thin usage so the transport
 // contract (data/input/resize/ack/state) is what the rest of the UI depends on (DESIGN §7).
-/* global Terminal, FitAddon, DTPlugins, DTBuiltinPlugins, DTTerminalTab */
+/* global Terminal, FitAddon, DTPlugins, DTBuiltinPlugins, DTTerminalTab, DTFileViewerTab */
 
 const api = window.terminalAPI;
 const sessionsEl = document.getElementById('sessions');
@@ -21,6 +21,8 @@ DTBuiltinPlugins.builtinLinkPlugins().forEach((p) => registry.registerLink(p));
 // Built-in 'terminal' tab-kind (§14/§15): tabs are polymorphic content providers, so future
 // kinds (markdown, browser, ...) register the same way with no renderer changes.
 registry.registerTabKind({ kind: 'terminal', create: (spec, ctx) => DTTerminalTab.createTerminalTab(spec, ctx) });
+// 'fileviewer' tab-kind (§16): app-local tab (no tmux window) that previews a clicked path.
+registry.registerTabKind({ kind: 'fileviewer', create: (spec, ctx) => DTFileViewerTab.createFileViewerTab(spec, ctx) });
 // Public extension API (stable surface for user/third-party plugins).
 window.dtPlugins = {
   registerLink: (p) => registry.registerLink(p),   // returns an unregister() fn
@@ -73,6 +75,30 @@ function ensureTab(v, winId) {
   return tab;
 }
 
+// A real tmux window id ('@N'). Viewer tabs use synthetic 'view:N' ids and must NOT drive tmux
+// window commands (select-window/kill-window) — gate every such call on this.
+function isWindowTab(winId) { return /^@\d+$/.test(winId); }
+
+let _viewerSeq = 0;
+
+// Open a file-viewer tab for a clicked path (§16). App-local tab (no tmux window): synthetic id,
+// tmux commands are gated off it. Fetches its own content on mount.
+function openViewer(sessionId, path) {
+  const v = views.get(sessionId) || views.get(activeId);
+  if (!v) return;
+  const winId = 'view:' + (++_viewerSeq);
+  const ctx = { setStatus: (m) => setStatus(m) };
+  const content = registry.createTabContent('fileviewer',
+    { id: v.meta.id, path, api }, ctx);
+  const tab = { winId, title: baseName(path), content, mounted: false, viewer: true };
+  v.tabs.set(winId, tab);
+  v.activeWindow = winId;
+  if (v.meta.id === activeId) { showActiveTab(v); renderTabs(v); }
+  setStatus('opening ' + baseName(path) + '…');
+}
+
+function baseName(p) { return (String(p).split('/').pop() || 'file'); }
+
 // The active tab (or the sole tab for single-window/plain views).
 function activeTab(v) {
   if (v.activeWindow && v.tabs.has(v.activeWindow)) return v.tabs.get(v.activeWindow);
@@ -88,6 +114,8 @@ function makeLinkProvider(getTerm, meta) {
     openExternal: (url) => api.openExternal(url),
     copyText: (text) => api.copyText(text),
     setStatus: (msg) => setStatus(msg),
+    // §16: open a clicked path in an in-app file-viewer tab of this session.
+    openViewer: (path) => openViewer(meta.id, path),
   };
   return {
     provideLinks(lineNumber, callback) {
@@ -376,7 +404,7 @@ function renderTabs(v) {
     el.className = 'tab' + (wid === v.activeWindow ? ' active' : '');
     el.innerHTML = `<span class="tlabel">${escapeHtml(tab.title || wid)}</span><span class="tclose" title="close">×</span>`;
     el.querySelector('.tlabel').onclick = () => switchTab(v, wid);
-    el.querySelector('.tclose').onclick = (e) => { e.stopPropagation(); api.tabClose(v.meta.id, wid); };
+    el.querySelector('.tclose').onclick = (e) => { e.stopPropagation(); closeTab(v, wid); };
     tabsEl.appendChild(el);
   }
   // '+' new session in this project
@@ -386,15 +414,29 @@ function renderTabs(v) {
   tabsEl.appendChild(plus);
 }
 
-// Switch the active tab: tell tmux to select the window. The backend's reconcile will emit an
-// 'active' event; we optimistically reveal now for responsiveness (idempotent with the event).
+// Switch the active tab. For a tmux window, tell tmux to select it (its reconcile echoes an
+// 'active' event; we reveal now for responsiveness). A viewer tab is app-local — reveal it WITHOUT
+// any tmux command.
 function switchTab(v, winId) {
   if (v.activeWindow === winId) return;
   v.activeWindow = winId;
-  api.tabSelect(v.meta.id, winId);
+  if (isWindowTab(winId)) { api.tabSelect(v.meta.id, winId); lazyCapture(v, winId); }
   showActiveTab(v);
-  lazyCapture(v, winId);
   renderTabs(v);
+}
+
+// Close a tab. Terminal tabs -> tmux kill-window (backend removes it, emits close). Viewer tabs
+// are app-local -> dispose locally, no tmux command, and re-focus a remaining tab.
+function closeTab(v, winId) {
+  if (isWindowTab(winId)) { api.tabClose(v.meta.id, winId); return; }
+  const t = v.tabs.get(winId);
+  if (t) { try { t.content.dispose(); } catch (_) {} v.tabs.delete(winId); }
+  if (v.activeWindow === winId) {
+    const first = v.tabs.keys().next();
+    v.activeWindow = first.done ? null : first.value;
+    if (v.meta.id === activeId) showActiveTab(v);
+  }
+  if (v.meta.id === activeId) renderTabs(v);
 }
 api.onError(({ id, error }) => {
   setStatus(`⚠ ${error}`);

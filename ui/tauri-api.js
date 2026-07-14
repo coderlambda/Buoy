@@ -23,6 +23,9 @@ window.terminalAPI = {
   rename: (id, title) => invoke('session_rename', { id, title }),
   openExternal: (url) => invoke('open_external', { url }),
   copyText: (text) => { try { return navigator.clipboard.writeText(String(text == null ? '' : text)); } catch (_) { return Promise.resolve(); } },
+  // file viewer (§16): fetch a clicked path's bytes; save bytes to a local file via native dialog
+  readRemoteFile: (id, path) => invoke('read_remote_file', { id, path }),   // -> { data_b64, size, truncated }
+  saveFile: (dataB64, suggestedName) => invoke('save_file', { dataB64, suggestedName }),
   // project tabs (§14) — native/control mode
   tabNew: (id) => invoke('tab_new', { id }),
   tabSelect: (id, win) => invoke('tab_select', { id, win }),

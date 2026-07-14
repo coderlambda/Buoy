@@ -962,4 +962,95 @@ window.dtPlugins.registerTabKind({
   pty/window.
 
 NOTE: markdown/browser kinds are NOT designed here — only the seam exists so they can be
-added later as plugins.
+added later as plugins. §16 is the first concrete non-terminal kind (`fileviewer`).
+
+---
+
+## 16. File viewer — click a remote path → in-app preview + download (Tauri branch)
+
+### Goal
+Clicking a filesystem path in the terminal opens the file in an **in-app viewer tab** (text,
+markdown, or image), with a **Download to local** button. The session is ssh+tmux, so the file
+is almost always REMOTE; we fetch its bytes over a separate ssh exec and render locally. No
+remote editing (deliberately out of scope); **Upload to override** is a future symmetric feature.
+URLs are handled separately (§13 url plugin → browser); this section is about PATHS.
+
+### Decisions (locked)
+- **Presentation:** a **new tab** (reuses the §15 polymorphic tab machinery), not a split. Split
+  view is a possible follow-up.
+- **Day-one types:** **text**, **markdown** (rendered), **image**. Others → download-only panel.
+- **Type detection:** by **extension** first (`.md`/`.markdown` → markdown; image exts → image;
+  else text), with a **binary sniff** fallback (invalid-UTF-8 / NUL bytes → not text → treated as
+  a downloadable blob, not rendered).
+- **Size caps are TIERED by what happens to the bytes** (a single cap is wrong — the bottleneck
+  is webview rendering, not the network):
+  | Path | Cap | Why |
+  |---|---|---|
+  | text / markdown **render** | **1 MB** | DOM + markdown cost; larger stalls WKWebView |
+  | image **decode** | **5 MB** | one decode to a `data:` URL |
+  | **download-to-local** | **50 MB** | bytes → disk, no rendering |
+  Over the render cap → **don't render**; show "file is N MB, too large to preview" with the
+  Download button still enabled. The remote fetch is bounded with `head -c <downloadCap>`.
+
+### Flow
+```
+click path (path plugin) → ctx.openViewer(sessionId, path)
+  → invoke('read_remote_file', {id, path})            [Rust: separate ssh exec, NOT the -CC channel]
+  → { bytes(b64), size, truncated }                    [content base64 so images/binaries survive]
+  → renderer: detect type, size-gate, open a 'fileviewer' tab
+  → [Download to local] → invoke('save_file', {bytes, suggestedName})  [native dialog + write]
+```
+
+### Rust commands (main)
+- **`read_remote_file(id, path) -> { data_b64, size, truncated }`**
+  - Look up the session's validated `host`/`port`/`baseArgs` from the store (never trust the
+    renderer for connection params).
+  - **Injection-safe:** base64-encode the PATH itself so it never appears as unescaped shell text;
+    the remote decodes it into a var and reads that. Content is base64-encoded on the wire so
+    binary/UTF-8 both survive:
+    ```
+    ssh [opts] -- <host> 'p=$(echo <b64path>|base64 -d); head -c <cap+1> -- "$p" | base64'
+    ```
+    `cap+1` lets us detect truncation (got more than cap ⇒ `truncated=true`, capped to cap).
+  - Runs off the terminal's `-CC` control channel entirely (a fresh ssh, like probeTmux) — the
+    control stream is a command protocol and must not be polluted with `cat`.
+- **`save_file(data_b64, suggested_name) -> { ok, path }`** — `tauri-plugin-dialog` save dialog,
+  then write the decoded bytes. (Future **`write_remote_file`** = "upload to override".)
+
+### `fileviewer` tab kind (renderer)
+- Registered via the existing `registry.registerTabKind({ kind: 'fileviewer', create })`.
+- `create(spec, ctx)` returns a `TabContent` whose `mount()` renders per detected type:
+  - **text/code:** into `textContent` (NEVER `innerHTML`) inside a `<pre>` — untrusted content.
+  - **markdown:** a **minimal, safe** renderer (headings/lists/code/links/emphasis) that emits
+    escaped HTML only — no raw-HTML passthrough. (Keep it small; no heavy MD lib day one.)
+  - **image:** `<img src="data:<mime>;base64,…">`.
+  - **over cap / binary:** a panel with the size + a Download button, no content render.
+- It has **no tmux window** — this is the key difference from terminal tabs. Tab bookkeeping must
+  distinguish app-local tabs from window-backed ones: **switch/close of a fileviewer tab must NOT
+  emit tmux `select-window`/`kill-window`.** (Give viewer tabs a synthetic id like `view:<n>` and
+  gate the tmux calls on the id being a real `@N` window.)
+
+### The `path` plugin change
+Today it copies + status. It becomes: call `ctx.openViewer(meta.id, text)`. For a **local** session
+(no remote host) the same command path still works (ssh not needed → read the file directly; a
+`kind:'local'` branch). Falls back to copy+status if the fetch fails (unreachable, not a file).
+
+### Security
+- Path is base64-wrapped end-to-end → no shell injection via the clicked text.
+- Rendered text is inserted as `textContent`; markdown renderer escapes and never passes raw HTML;
+  images are `data:` URLs — so hostile file *contents* can't script the webview (CSP stays
+  `script-src 'self'`).
+- Connection params come from the validated store, not the renderer.
+- Size caps bound memory/DOM blowups from huge or hostile files.
+
+### Testing
+- Rust unit: base64 path/content round-trip; truncation detection at the cap boundary; type
+  detection (ext + binary sniff).
+- Live: fetch a known remote text file, a markdown file, and a small image; assert content/round-
+  trip and that truncation triggers past the cap. Save-file writes correct bytes locally.
+- Renderer: fileviewer tab open/switch/close does NOT emit tmux window commands (isolation from
+  the terminal tabs).
+
+### Deferred (explicitly not in the first cut)
+Split-pane layout, syntax highlighting, rich/large markdown libs, **upload-to-override**
+(`write_remote_file`), diffing, and re-fetch/watch.
