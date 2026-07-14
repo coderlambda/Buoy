@@ -63,7 +63,13 @@ struct Inner {
     // two %output events for the SAME pane; carrying the partial tail here (keyed by pane, since
     // interleaved panes must not corrupt each other) reassembles it on the next event.
     utf8_carry: std::collections::BTreeMap<String, Vec<u8>>,
+    // Coalescing output buffer: window -> accumulated text awaiting the next flush. A redrawing
+    // TUI produces ~750 %output events/sec; emitting one Tauri IPC message each floods and crashes
+    // the webview. We batch here and a flush thread emits ONE message per window at ~60fps, which
+    // the webview (and xterm) can absorb. Ordering is preserved (append in arrival order).
+    out_buf: std::collections::BTreeMap<String, String>,
     refresh_queued: bool,
+    stopped: bool,   // set on kill() so the flush thread exits
 }
 
 pub struct ControlBackend {
@@ -120,7 +126,9 @@ impl ControlBackend {
             pending_input: Vec::new(),
             pending_output: std::collections::BTreeMap::new(),
             utf8_carry: std::collections::BTreeMap::new(),
+            out_buf: std::collections::BTreeMap::new(),
             refresh_queued: false,
+            stopped: false,
         }));
 
         // Reader thread: pump pty bytes -> parser -> event handling.
@@ -156,6 +164,24 @@ impl ControlBackend {
                     }
                 }
                 sink(BackendEvent::Exit);
+            });
+        }
+
+        // Output flush thread: coalesce buffered %output into one Tauri message per window at
+        // ~60fps. This is what keeps a redrawing TUI (~750 events/sec) from flooding and crashing
+        // the webview. Exits when the pty is gone (reader set an exit flag by dropping — we detect
+        // via a weak count check: once the only Arc left is ours, stop).
+        {
+            let inner = inner.clone();
+            thread::spawn(move || {
+                loop {
+                    thread::sleep(Duration::from_millis(16));
+                    // Stop when the backend has been dropped (no external owners besides this loop
+                    // and the other worker threads' clones would keep it alive; use a killed flag).
+                    let mut g = inner.lock().unwrap();
+                    if g.stopped { break; }
+                    g.flush_output();
+                }
             });
         }
 
@@ -229,6 +255,7 @@ impl ControlBackend {
     }
 
     pub fn kill(&self) {
+        { let mut g = self.inner.lock().unwrap(); g.stopped = true; g.flush_output(); }
         if let Ok(mut c) = self.child.lock() {
             let _ = c.kill();
         }
@@ -330,6 +357,8 @@ impl Inner {
         let order = g.reg.order();
         crate::dlog!("apply_topology: added={:?} removed={:?} active={:?}", diff.added, diff.removed, diff.active);
 
+        // Emit any buffered output first so window add/active can't be reordered ahead of it.
+        g.flush_output();
         for win in &diff.added {
             g.emit(BackendEvent::WindowAdd { window: win.clone(), order: order.clone() });
         }
@@ -363,7 +392,8 @@ impl Inner {
         if text.is_empty() { return; }
 
         match self.reg.win_for_pane(&pane) {
-            Some(win) => self.emit(BackendEvent::Data { window: win, data: text }),
+            // Buffer into out_buf; the flush thread emits one coalesced message per window ~60fps.
+            Some(win) => { self.out_buf.entry(win).or_default().push_str(&text); }
             None => {
                 let buf = self.pending_output.entry(pane).or_default();
                 if buf.len() >= MAX_BUFFER { buf.remove(0); }
@@ -378,12 +408,24 @@ impl Inner {
         }
     }
 
+    // Emit all buffered per-window output as one message each, then clear. Called on the flush
+    // timer (coalescing the %output firehose) and before any ordered event (window/capture) so
+    // buffered output can't jump ahead of a window add/active/scrollback paint.
+    fn flush_output(&mut self) {
+        if self.out_buf.is_empty() { return; }
+        let batch = std::mem::take(&mut self.out_buf);
+        for (window, data) in batch {
+            if !data.is_empty() {
+                (self.sink)(BackendEvent::Data { window, data });
+            }
+        }
+    }
+
     fn flush_pane_buffer(&mut self, pane: &str) {
         if let Some(buf) = self.pending_output.remove(pane) {
             if let Some(win) = self.reg.win_for_pane(pane) {
-                for data in buf {
-                    self.emit(BackendEvent::Data { window: win.clone(), data });
-                }
+                // Route through the coalescing buffer (same ordering guarantees as live output).
+                self.out_buf.entry(win).or_default().push_str(&buf.concat());
             }
         }
     }
@@ -430,7 +472,8 @@ impl Inner {
         while b.last().map(|l| l.is_empty()).unwrap_or(false) {
             b.pop();
         }
-        let g = inner.lock().unwrap();
+        let mut g = inner.lock().unwrap();
+        g.flush_output();   // paint scrollback AFTER any buffered live output, never before
         let target = window.or_else(|| g.reg.active_window.clone());
         if let Some(t) = target {
             if !b.is_empty() {
