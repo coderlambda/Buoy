@@ -73,7 +73,27 @@ pub fn free_local_port() -> std::io::Result<u16> {
 struct Tunnel {
     local_port: u16,
     remote_port: u16,
-    child: Child,
+    pid: u32,
+    // Some when WE spawned it this run (lets us reap the whole process group via Child); None when
+    // ADOPTED from a previous run's orphan (we only know its pid, killed via `kill <pid>`).
+    child: Option<Child>,
+}
+
+impl Tunnel {
+    fn kill(&mut self) {
+        match self.child.as_mut() {
+            Some(c) => { let _ = c.kill(); }
+            None if self.pid != 0 => { let _ = Command::new("kill").arg(self.pid.to_string()).status(); }
+            None => {}
+        }
+    }
+    // Alive if our Child hasn't exited, or (adopted) the pid is still one of our ssh -L procs.
+    fn alive(&mut self) -> bool {
+        match self.child.as_mut() {
+            Some(c) => matches!(c.try_wait(), Ok(None)),
+            None => is_our_ssh_pid(self.pid),
+        }
+    }
 }
 
 /// Probe a local forwarded port: connect + send a minimal HTTP HEAD and see if we get ANY bytes
@@ -96,11 +116,21 @@ pub fn probe_local_port(local_port: u16) -> bool {
 /// Per-session set of live tunnels, keyed by remote port (so repeat clicks reuse one). Also
 /// persists the set of remote ports per session to disk, so after an app restart the sidebar can
 /// show the (inactive) rows and the user can re-open them.
+// Persisted per-port record: the remote port, the LOCAL port it was forwarded on, and the PID of
+// the ssh -L that forwarded it (0 if not currently open). On the next launch we ADOPT a still-alive
+// orphan (same pid still forwarding our local->remote) instead of leaking it — so ports are reused,
+// not duplicated. We only kill on explicit close or app exit.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct PortRec { remote: u16, #[serde(default)] local: u16, #[serde(default)] pid: u32 }
+
+type Persisted = BTreeMap<String, Vec<PortRec>>;
+
 pub struct TunnelRegistry {
     // session id -> (remote_port -> Tunnel)
     by_session: Mutex<HashMap<String, HashMap<u16, Tunnel>>>,
-    // session id -> set of remote ports ever forwarded (persisted); source of truth for the list.
-    persisted: Mutex<BTreeMap<String, Vec<u16>>>,
+    // session id -> persisted port records (remote port + last ssh -L pid); source of truth for
+    // the sidebar list AND for reaping orphaned tunnels on the next launch.
+    persisted: Mutex<Persisted>,
     store_path: Option<PathBuf>,
 }
 
@@ -117,19 +147,39 @@ impl TunnelRegistry {
         }
     }
 
-    /// Registry backed by a JSON file at `path` (tunnels.json); loads any existing persisted ports.
+    /// Registry backed by a JSON file at `path` (tunnels.json); loads persisted ports and ADOPTS
+    /// any still-alive orphaned ssh -L from a previous run (same pid still forwarding its local
+    /// port) so those tunnels are REUSED, not leaked/duplicated. A recorded pid that's no longer
+    /// one of our ssh -L procs is just cleared (its row shows inactive, re-openable). We never kill
+    /// on startup — only on explicit close or app exit.
     pub fn with_store(path: PathBuf) -> Self {
-        let persisted = std::fs::read_to_string(&path).ok()
-            .and_then(|s| serde_json::from_str::<BTreeMap<String, Vec<u16>>>(&s).ok())
+        let mut persisted: Persisted = std::fs::read_to_string(&path).ok()
+            .and_then(|s| serde_json::from_str::<Persisted>(&s).ok())
             .unwrap_or_default();
-        TunnelRegistry {
-            by_session: Mutex::new(HashMap::new()),
+        let mut adopted: HashMap<String, HashMap<u16, Tunnel>> = HashMap::new();
+        for (sid, recs) in persisted.iter_mut() {
+            for r in recs.iter_mut() {
+                if r.pid != 0 && r.local != 0 && is_our_ssh_pid(r.pid) {
+                    // Orphan is still alive and forwarding — adopt it (reuse across restarts).
+                    crate::dlog!("tunnel: adopting orphan pid={} local {} -> remote {} for {}", r.pid, r.local, r.remote, sid);
+                    adopted.entry(sid.clone()).or_default()
+                        .insert(r.remote, Tunnel { local_port: r.local, remote_port: r.remote, pid: r.pid, child: None });
+                } else {
+                    r.pid = 0;   // gone -> row shows inactive, user can re-open
+                }
+            }
+        }
+        let reg = TunnelRegistry {
+            by_session: Mutex::new(adopted),
             persisted: Mutex::new(persisted),
             store_path: Some(path),
-        }
+        };
+        let snapshot = reg.persisted.lock().unwrap().clone();
+        reg.save_persisted(&snapshot);
+        reg
     }
 
-    fn save_persisted(&self, map: &BTreeMap<String, Vec<u16>>) {
+    fn save_persisted(&self, map: &Persisted) {
         if let Some(path) = &self.store_path {
             if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
             if let Ok(json) = serde_json::to_string_pretty(map) {
@@ -139,10 +189,15 @@ impl TunnelRegistry {
         }
     }
 
-    fn remember(&self, session_id: &str, remote_port: u16) {
+    /// Record (or update) a forwarded port's local port + pid; persist (so a later run can adopt it).
+    fn remember(&self, session_id: &str, remote_port: u16, local_port: u16, pid: u32) {
         let mut p = self.persisted.lock().unwrap();
-        let ports = p.entry(session_id.to_string()).or_default();
-        if !ports.contains(&remote_port) { ports.push(remote_port); ports.sort(); }
+        let recs = p.entry(session_id.to_string()).or_default();
+        match recs.iter_mut().find(|r| r.remote == remote_port) {
+            Some(r) => { r.local = local_port; r.pid = pid; }
+            None => recs.push(PortRec { remote: remote_port, local: local_port, pid }),
+        }
+        recs.sort_by_key(|r| r.remote);
         let snapshot = p.clone();
         drop(p);
         self.save_persisted(&snapshot);
@@ -150,9 +205,9 @@ impl TunnelRegistry {
 
     fn forget(&self, session_id: &str, remote_port: u16) {
         let mut p = self.persisted.lock().unwrap();
-        if let Some(ports) = p.get_mut(session_id) {
-            ports.retain(|&x| x != remote_port);
-            if ports.is_empty() { p.remove(session_id); }
+        if let Some(recs) = p.get_mut(session_id) {
+            recs.retain(|r| r.remote != remote_port);
+            if recs.is_empty() { p.remove(session_id); }
         }
         let snapshot = p.clone();
         drop(p);
@@ -164,7 +219,8 @@ impl TunnelRegistry {
     /// Reuses a live tunnel's local port; a persisted-but-not-open port has `local: None, active:false`.
     pub fn status(&self, session_id: &str) -> Vec<TunnelStatus> {
         // union of persisted ports and currently-live ones
-        let persisted = self.persisted.lock().unwrap().get(session_id).cloned().unwrap_or_default();
+        let persisted: Vec<u16> = self.persisted.lock().unwrap()
+            .get(session_id).map(|recs| recs.iter().map(|r| r.remote).collect()).unwrap_or_default();
         let live: Vec<(u16, u16)> = self.list(session_id); // prunes dead ssh
         let live_map: HashMap<u16, u16> = live.iter().cloned().collect();
 
@@ -189,10 +245,8 @@ impl TunnelRegistry {
             let mut map = self.by_session.lock().unwrap();
             if let Some(per) = map.get_mut(session_id) {
                 if let Some(t) = per.get_mut(&remote_port) {
-                    match t.child.try_wait() {
-                        Ok(None) => return Ok(t.local_port),
-                        _ => { let _ = t.child.kill(); per.remove(&remote_port); }
-                    }
+                    if t.alive() { return Ok(t.local_port); }   // reuse (incl. adopted orphan)
+                    let mut dead = per.remove(&remote_port).unwrap(); dead.kill();
                 }
             }
         }
@@ -215,7 +269,7 @@ impl TunnelRegistry {
         {
             let mut map = self.by_session.lock().unwrap();
             if let Some(per) = map.get_mut(session_id) {
-                if let Some(mut t) = per.remove(&remote_port) { let _ = t.child.kill(); }
+                if let Some(mut t) = per.remove(&remote_port) { t.kill(); }
             }
         }
         self.spawn_tunnel(session_id, host, remote_port, remote_port, base_args)
@@ -255,11 +309,12 @@ impl TunnelRegistry {
             .spawn()
             .map_err(|e| format!("ssh -L failed to start: {}", e))?;
 
-        crate::dlog!("tunnel: session={} local {} -> remote localhost:{}", session_id, local_port, remote_port);
+        let pid = child.id();
+        crate::dlog!("tunnel: session={} local {} -> remote localhost:{} pid={}", session_id, local_port, remote_port, pid);
         self.by_session.lock().unwrap()
             .entry(session_id.to_string()).or_default()
-            .insert(remote_port, Tunnel { local_port, remote_port, child });
-        self.remember(session_id, remote_port);   // persist so it survives restart
+            .insert(remote_port, Tunnel { local_port, remote_port, pid, child: Some(child) });
+        self.remember(session_id, remote_port, local_port, pid);   // persist local+pid so a later run can adopt it
         Ok(local_port)
     }
 
@@ -272,10 +327,10 @@ impl TunnelRegistry {
         let mut dead: Vec<u16> = Vec::new();
         let mut out: Vec<(u16, u16)> = Vec::new();
         for (rp, t) in per.iter_mut() {
-            if matches!(t.child.try_wait(), Ok(None)) { out.push((*rp, t.local_port)); }
+            if t.alive() { out.push((*rp, t.local_port)); }
             else { dead.push(*rp); }
         }
-        for rp in dead { if let Some(mut t) = per.remove(&rp) { let _ = t.child.kill(); } }
+        for rp in dead { if let Some(mut t) = per.remove(&rp) { t.kill(); } }
         out.sort_by_key(|(rp, _)| *rp);
         out
     }
@@ -287,7 +342,7 @@ impl TunnelRegistry {
         let killed = {
             let mut map = self.by_session.lock().unwrap();
             match map.get_mut(session_id).and_then(|per| per.remove(&remote_port)) {
-                Some(mut t) => { let _ = t.child.kill();
+                Some(mut t) => { t.kill();
                     crate::dlog!("tunnel: closed local {} (remote {}) for {}", t.local_port, remote_port, session_id);
                     true }
                 None => false,
@@ -299,13 +354,19 @@ impl TunnelRegistry {
 
     /// Tear down all LIVE tunnels for a session but KEEP the persisted port list (detach: the
     /// session survives, so its ports should still show — inactive — on next launch/reconnect).
+    /// Clears the persisted pids (the children are dead now).
     pub fn close_session(&self, session_id: &str) {
         if let Some(mut per) = self.by_session.lock().unwrap().remove(session_id) {
             for (_, mut t) in per.drain() {
-                let _ = t.child.kill();
+                t.kill();
                 crate::dlog!("tunnel: closed local {} (remote {})", t.local_port, t.remote_port);
             }
         }
+        let mut p = self.persisted.lock().unwrap();
+        if let Some(recs) = p.get_mut(session_id) { for r in recs.iter_mut() { r.pid = 0; } }
+        let snapshot = p.clone();
+        drop(p);
+        self.save_persisted(&snapshot);
     }
 
     /// Kill a session for good: tear down tunnels AND forget its persisted ports.
@@ -317,6 +378,17 @@ impl TunnelRegistry {
         drop(p);
         self.save_persisted(&snapshot);
     }
+
+}
+
+/// Is `pid` still one of OUR ssh -L forward processes? Checks the live process's command line
+/// (via `ps`) so a dead pid — or a pid recycled by an unrelated process — is not mistaken for our
+/// tunnel (used both to adopt live orphans and to decide an adopted tunnel is still alive).
+fn is_our_ssh_pid(pid: u32) -> bool {
+    if pid == 0 { return false; }
+    let cmd = Command::new("ps").args(["-o", "command=", "-p", &pid.to_string()])
+        .output().ok().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+    cmd.contains("ssh") && cmd.contains("-L") && cmd.contains("127.0.0.1:") && cmd.contains(":localhost:")
 }
 
 #[cfg(test)]
@@ -412,10 +484,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let reg = TunnelRegistry::with_store(path.clone());
-        reg.remember("sess", 3000);
-        reg.remember("sess", 5173);
+        reg.remember("sess", 3000, 40000, 0);   // pid 0 = persisted-only (not live)
+        reg.remember("sess", 5173, 40001, 0);
 
-        // a fresh registry from the same file sees the persisted ports as inactive rows
+        // a fresh registry from the same file sees the persisted ports as inactive rows (pid 0 =>
+        // nothing to adopt)
         let reg2 = TunnelRegistry::with_store(path.clone());
         let st = reg2.status("sess");
         assert_eq!(st.iter().map(|s| s.remote).collect::<Vec<_>>(), vec![3000, 5173]);
@@ -427,6 +500,25 @@ mod tests {
         assert_eq!(reg3.status("sess").iter().map(|s| s.remote).collect::<Vec<_>>(), vec![5173]);
         reg3.forget_session("sess");
         assert!(TunnelRegistry::with_store(path.clone()).status("sess").is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // A persisted pid that is NOT one of our ssh -L procs (e.g. pid 1) must be cleared on load,
+    // not adopted — so a recycled/dead pid never gets treated as a live tunnel.
+    #[test]
+    fn stale_pid_not_adopted() {
+        let path = std::env::temp_dir().join(format!("dt_tun_stale_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        // hand-write a record with a bogus-but-live pid (1 = init/launchd, not our ssh)
+        std::fs::write(&path, r#"{"sess":[{"remote":3000,"local":40000,"pid":1}]}"#).unwrap();
+
+        let reg = TunnelRegistry::with_store(path.clone());
+        let st = reg.status("sess");
+        assert_eq!(st.len(), 1);
+        assert_eq!(st[0].remote, 3000);
+        assert!(st[0].local.is_none() && !st[0].active, "non-ssh pid not adopted -> inactive");
+        assert!(!is_our_ssh_pid(1), "pid 1 is not our ssh -L");
 
         let _ = std::fs::remove_file(&path);
     }

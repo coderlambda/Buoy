@@ -571,6 +571,9 @@ pub fn run() {
             open_forwarded_url, get_config, list_tunnels, close_tunnel, force_forward,
             list_hosts, remember_host
         ])
+        // Tunnels are deliberately NOT killed on exit — they keep forwarding, and the next launch
+        // ADOPTS the still-alive ones (reuse across restarts). Dead orphans are cleared on load;
+        // explicit close/kill/force is the only teardown.
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

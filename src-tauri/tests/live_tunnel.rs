@@ -93,3 +93,54 @@ fn live_tunnel_forwards_remote_loopback() {
     sh(&format!("{t} -L tunhttp kill-server 2>/dev/null; rm -rf /tmp/dt_tun", t = tmux));
     eprintln!("LIVE OK: ssh -L forward serves remote loopback, reuses, and tears down ({} host)", host);
 }
+
+// Reuse across "restart": open a tunnel, then build a NEW registry from the same store file
+// (simulating an app relaunch). The still-alive orphan is ADOPTED and reused on the SAME local
+// port — not duplicated. Closing then kills the adopted orphan (no leak).
+#[test]
+#[ignore]
+fn live_tunnel_reused_across_restart() {
+    let host = match env("DT_LIVE_HOST") { Some(h) => h, None => { eprintln!("SKIP: set DT_LIVE_HOST"); return; } };
+    let tmux = env("DT_TMUX").unwrap_or_else(|| "tmux".into());
+    let rport = 18066u16;
+    let store = std::env::temp_dir().join(format!("dt_tun_reuse_{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&store);
+    let sh = |cmd: &str| { let _ = std::process::Command::new("ssh")
+        .args(["-o", "BatchMode=yes", "--", &host, cmd]).status(); };
+
+    // remote server on rport
+    sh(&format!("{t} -L tunreuse kill-server 2>/dev/null; mkdir -p /tmp/dt_reuse && printf 'REUSE_OK' > /tmp/dt_reuse/index.html && {t} -L tunreuse new-session -d -s h 'cd /tmp/dt_reuse && python3 -m http.server {p} --bind 127.0.0.1'", t = tmux, p = rport));
+    for _ in 0..20 { sleep_ms(500);
+        let ok = std::process::Command::new("ssh").args(["-o","BatchMode=yes","--",&host,
+            &format!("curl -s -o /dev/null -w '%{{http_code}}' --max-time 2 http://127.0.0.1:{}/", rport)])
+            .output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim()=="200").unwrap_or(false);
+        if ok { break; } }
+
+    // "run 1": open a tunnel, note the local port. Poll until the local forward establishes.
+    let reg1 = TunnelRegistry::with_store(store.clone());
+    let local = reg1.ensure("s", &host, rport, &[]).expect("ensure");
+    let mut served = false;
+    for _ in 0..16 { sleep_ms(500); if curl(&format!("http://localhost:{}/", local)).contains("REUSE_OK") { served = true; break; } }
+    assert!(served, "run1 serves on local {}", local);
+    // IMPORTANT: don't close — leave the tunnel running (simulates app quit without teardown).
+    std::mem::forget(reg1);   // drop without running Drop (there is none, but be explicit about intent)
+
+    // "run 2": fresh registry from the same store -> adopts the live orphan, reuses SAME local port.
+    let reg2 = TunnelRegistry::with_store(store.clone());
+    let st = reg2.status("s");
+    assert_eq!(st.len(), 1, "one port after restart");
+    assert_eq!(st[0].remote, rport);
+    assert_eq!(st[0].local, Some(local), "adopted the SAME local port (reused, not duplicated)");
+    assert!(st[0].active, "adopted orphan still serves -> active");
+    // ensure() returns the adopted local port (no new ssh spawned)
+    assert_eq!(reg2.ensure("s", &host, rport, &[]).expect("reuse"), local, "reuse returns same port");
+
+    // close -> kills the adopted orphan (no leftover on that port)
+    reg2.close("s", rport);
+    sleep_ms(800);
+    assert!(!curl(&format!("http://localhost:{}/", local)).contains("REUSE_OK"), "closed orphan stops forwarding");
+
+    sh(&format!("{t} -L tunreuse kill-server 2>/dev/null; rm -rf /tmp/dt_reuse", t = tmux));
+    let _ = std::fs::remove_file(&store);
+    eprintln!("LIVE OK: tunnel adopted + reused across restart, then cleanly closed ({} host)", host);
+}
