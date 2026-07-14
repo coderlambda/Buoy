@@ -2,7 +2,8 @@
 const { test } = require('node:test');
 const assert = require('node:assert');
 const { PluginRegistry } = require('../src/shared/plugins');
-const { builtinLinkPlugins, URL_RE, PATH_RE } = require('../src/renderer/builtinPlugins');
+// The Tauri app serves ui/ ; that's the live copy of the link plugins.
+const { builtinLinkPlugins, URL_RE, PATH_RE } = require('../ui/builtinPlugins');
 
 function reg() {
   const r = new PluginRegistry();
@@ -26,11 +27,27 @@ test('TC-PL2 detects paths', () => {
   assert.deepEqual(paths, ['/etc/hosts', '~/notes/todo.md', './src/a.js']);
 });
 
-// TC-PL3 bare words are NOT paths (require a slash)
-test('TC-PL3 bare words are not paths', () => {
+// TC-PL3 plain words (no slash, no extension, not a known name) are NOT paths
+test('TC-PL3 plain words are not paths', () => {
   const r = reg();
-  const m = r.findMatches('just some words here');
+  const m = r.findMatches('just some words here and the src dir');
   assert.equal(m.length, 0);
+});
+
+// TC-PL3b bare filenames WITH an extension ARE paths (§17 — makes `ls` output clickable)
+test('TC-PL3b bare filenames with extensions are paths', () => {
+  const r = reg();
+  const m = r.findMatches('README.md  notes.txt  pic.png');
+  const paths = m.filter((x) => x.plugin.name === 'path').map((x) => x.text);
+  assert.deepEqual(paths, ['README.md', 'notes.txt', 'pic.png']);
+});
+
+// TC-PL3c relative slash paths and known extension-less names
+test('TC-PL3c relative slash paths and known names', () => {
+  const r = reg();
+  const m = r.findMatches('build src/main.rs then Makefile and Dockerfile');
+  const paths = m.filter((x) => x.plugin.name === 'path').map((x) => x.text);
+  assert.deepEqual(paths, ['src/main.rs', 'Makefile', 'Dockerfile']);
 });
 
 // TC-PL4 priority: url wins over path on overlap (file:///a/b)

@@ -382,7 +382,14 @@ fn read_remote_file(state: State<AppState>, id: String, path: String) -> Result<
     let rf = if meta.host.is_empty() {
         remote_file::read_local_file(&path, DOWNLOAD_CAP)?
     } else {
-        remote_file::read_remote_file(&meta.host, &path, DOWNLOAD_CAP, &[])?
+        // Resolve a relative clicked path against the session's active-pane cwd (§17): pass the
+        // tmux socket/session so the remote script can query #{pane_current_path}.
+        let ctx = remote_file::TmuxCtx {
+            tmux_path: meta.tmux_path.clone().unwrap_or_default(),
+            socket: tmux_socket::socket_name(&meta.mode, meta.tmux_version),
+            session: meta.session.clone(),
+        };
+        remote_file::read_remote_file(&meta.host, &path, DOWNLOAD_CAP, &ctx, &[])?
     };
     dlog!("read_remote_file: id={} path={:?} size={} truncated={}", id, path, rf.data.len(), rf.truncated);
     Ok(FilePayload {

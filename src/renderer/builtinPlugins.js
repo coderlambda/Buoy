@@ -7,9 +7,26 @@
 // URL: http(s)/ftp/file, and bare www. — trailing punctuation trimmed by the regex boundary.
 const URL_RE = /\b(?:https?|ftp|file):\/\/[^\s"'<>`)]+|(?:\bwww\.[^\s"'<>`)]+)/g;
 
-// Path: absolute (/a/b), home (~/a/b), or relative with a slash (./x, ../x, src/a). Avoids
-// matching lone words; requires at least one slash so it doesn't flag every bare token.
-const PATH_RE = /(?:~\/|\.{1,2}\/|\/)[^\s"'<>`:]+/g;
+// Path matcher. Four kinds, tried left-to-right in one alternation:
+//   1. slash paths: absolute (/a/b), home (~/a/b), or slash-containing relative (./x, ../x, src/a)
+//   2. bare filename WITH an extension: README.md, notes.txt, pic.png (>=1 non-space, a dot, then
+//      1-8 ext chars) — this makes `ls` output clickable (§17). Relatives are resolved against the
+//      pane cwd in the backend.
+//   3. known extension-less names: Makefile, Dockerfile, LICENSE, README (word-bounded).
+// A plain word with no slash, no extension, and not on the known list stays unmatched (avoids
+// underlining every token). Trailing shell punctuation is excluded from the char classes.
+const KNOWN_NAMES = ['Makefile', 'Dockerfile', 'LICENSE', 'README', 'Gemfile', 'Rakefile'];
+// 1. leading-anchored slash paths: absolute, home, or ./ ../ relative.
+const SLASH_PATH = String.raw`(?:~\/|\.{1,2}\/|\/)[^\s"'<>\`:]+`;
+// 2. relative path with an interior slash and a filename WITH an extension: src/main.rs, a/b/c.txt.
+//    (requires an extension on the last segment so bare dir words like "src/foo" without a dot
+//    still match here only when the final segment has an ext — keeps noise down.)
+const REL_SLASH = String.raw`[\w.\-]+(?:\/[\w.\-]+)*\/[\w.\-]*\w\.[A-Za-z0-9]{1,8}`;
+// 3. bare filename WITH an extension: README.md, notes.txt.
+const BARE_WITH_EXT = String.raw`[\w.\-]*\w\.[A-Za-z0-9]{1,8}`;
+// 4. known extension-less names.
+const KNOWN_RE = String.raw`\b(?:${KNOWN_NAMES.join('|')})\b`;
+const PATH_RE = new RegExp(`${SLASH_PATH}|${REL_SLASH}|${BARE_WITH_EXT}|${KNOWN_RE}`, 'g');
 
 // Build the two default plugins. Handlers are thin — they call into ctx, which the host
 // (renderer) supplies with openExternal / copyText / setStatus / meta.
@@ -33,9 +50,10 @@ function builtinLinkPlugins() {
       priority: 0,
       regex: PATH_RE,
       onClick(text, ctx) {
-        // A path in the terminal is usually REMOTE (session is ssh+tmux), so the app can't
-        // open it locally in general — hence a callback. Default: copy + inform. A plugin
-        // can override this behavior by registering a higher-priority path matcher.
+        // Open the path in an in-app file-viewer tab (§16): the host fetches the file's bytes
+        // (remote over ssh, or local) and previews text/markdown/image with a Download button.
+        // Falls back to copy+status if the host can't provide a viewer (older/plain builds).
+        if (ctx.openViewer) { ctx.openViewer(text); return; }
         ctx.copyText(text);
         const where = ctx.meta && ctx.meta.host ? `remote (${ctx.meta.host})` : 'local';
         ctx.setStatus(`copied ${where} path: ${text}`);
@@ -45,5 +63,5 @@ function builtinLinkPlugins() {
 }
 
 // UMD-lite: CommonJS for tests, global for the sandboxed renderer (<script> tag).
-if (typeof module !== 'undefined' && module.exports) module.exports = { builtinLinkPlugins, URL_RE, PATH_RE };
-if (typeof window !== 'undefined') window.DTBuiltinPlugins = { builtinLinkPlugins, URL_RE, PATH_RE };
+if (typeof module !== 'undefined' && module.exports) module.exports = { builtinLinkPlugins, URL_RE, PATH_RE, KNOWN_NAMES };
+if (typeof window !== 'undefined') window.DTBuiltinPlugins = { builtinLinkPlugins, URL_RE, PATH_RE, KNOWN_NAMES };
