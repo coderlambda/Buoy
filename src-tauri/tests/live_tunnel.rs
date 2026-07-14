@@ -52,10 +52,23 @@ fn live_tunnel_forwards_remote_loopback() {
     let local2 = reg.ensure("sessX", &host, rport, &[]).expect("ensure reuse");
     assert_eq!(local, local2, "tunnel reused for the same remote port");
 
-    // teardown: after close_session, the local port stops forwarding
+    // list(): the sidebar's port list — one live tunnel (remote, local).
+    let listed = reg.list("sessX");
+    assert_eq!(listed, vec![(rport, local)], "list() reports the live tunnel");
+
+    // close() ONE tunnel by remote port -> gone from the list and stops forwarding.
+    assert!(reg.close("sessX", rport), "close() returns true for a live tunnel");
+    assert!(reg.list("sessX").is_empty(), "list() empty after closing the only tunnel");
+    sleep_ms(800);
+    let after_one = curl(&format!("http://localhost:{}/", local));
+    assert!(!after_one.contains("TUNNEL_OK"), "single-tunnel close stops forwarding");
+
+    // teardown: close_session on a fresh tunnel also stops forwarding
+    let local3 = reg.ensure("sessX", &host, rport, &[]).expect("re-ensure");
+    sleep_ms(1200);
     reg.close_session("sessX");
     sleep_ms(800);
-    let after = curl(&format!("http://localhost:{}/", local));
+    let after = curl(&format!("http://localhost:{}/", local3));
     assert!(!after.contains("TUNNEL_OK"), "tunnel torn down on session close (got {:?})", after);
 
     // cleanup remote

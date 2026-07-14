@@ -58,6 +58,7 @@ function makeView(meta) {
     activeWindow: null,                     // '@N' (authoritative: set by backend 'active' event)
     el: null,                               // container in #term holding tab elements
     tmuxVersion: meta.tmuxVersion,
+    tunnels: [],                            // §18: [{remote, local}] forwarded ports (sidebar list)
   };
   views.set(meta.id, v);
   // For non-control (plain/local) there are no tmux window events; use a single implicit tab.
@@ -226,6 +227,8 @@ async function mount(id) {
   showActiveTab(v);        // mount + reveal the active tab's content
   renderTabs(v);
   renderSidebar();
+  // §18: pull any live forwarded ports for this session (persist across mount/reconnect).
+  api.listTunnels(id).then((t) => { v.tunnels = Array.isArray(t) ? t : []; renderSidebar(); }).catch(() => {});
 }
 
 // Mount (if needed) and reveal the active tab's content; hide the project's other tabs.
@@ -256,10 +259,17 @@ function renderSidebar() {
     const li = document.createElement('li');
     li.className = 'session' + (id === activeId ? ' active' : '') + (v.state === 'dead' ? ' dead' : '');
     const sub = v.meta.host ? escapeHtml(v.meta.host) + (v.tmuxVersion ? ` · tmux ${v.tmuxVersion.join('.')}` : '') : (v.meta.kind || 'local');
+    // §18: forwarded ports, listed under the project name. Each row: "remote → local" + close.
+    const tunnelRows = (v.tunnels || []).map((t) =>
+      `<span class="tunnel" data-remote="${t.remote}" title="click to open http://localhost:${t.local}/">
+         <span class="tport">:${t.remote}</span><span class="tarrow">→</span><span class="tlocal">localhost:${t.local}</span>
+         <span class="tclose" title="close tunnel">×</span>
+       </span>`).join('');
     li.innerHTML = `<span class="dot ${v.state}"></span>
       <span class="body">
         <span class="name" title="double-click to rename">${escapeHtml(v.meta.title || v.meta.session || v.meta.kind)}</span>
         <span class="sub">${sub}</span>
+        ${tunnelRows ? `<span class="tunnels">${tunnelRows}</span>` : ''}
       </span>
       <span class="retry">retry</span>
       <span class="act detach" title="Detach (keeps running on the remote)">⤫</span>
@@ -269,6 +279,17 @@ function renderSidebar() {
     nameEl.ondblclick = (e) => { e.stopPropagation(); startRename(id, nameEl); };
     li.querySelector('.detach').onclick = (e) => { e.stopPropagation(); detachSession(id); };
     li.querySelector('.kill').onclick = (e) => { e.stopPropagation(); killSession(id); };
+    // tunnel rows: click opens the local URL; the × closes just that tunnel.
+    li.querySelectorAll('.tunnel').forEach((el) => {
+      const remote = Number(el.getAttribute('data-remote'));
+      el.querySelector('.tclose').onclick = (e) => { e.stopPropagation(); api.closeTunnel(id, remote); };
+      el.onclick = (e) => {
+        if (e.target.classList.contains('tclose')) return;
+        e.stopPropagation();
+        const t = (v.tunnels || []).find((x) => x.remote === remote);
+        if (t) api.openExternal('http://localhost:' + t.local + '/');
+      };
+    });
     li.onclick = (e) => {
       if (e.target.classList.contains('retry')) { api.retry(id); return; }
       if (nameEl.querySelector('input')) return;   // ignore clicks while editing
@@ -504,6 +525,13 @@ api.onReady(({ id }) => {
   if (!v) { dbg('onReady: NO VIEW for id=' + id); return; }
   v.inputReady = true;   // display flag only; the backend already flushed its buffered input
   if (id === activeId) setStatus(statusLine(v, v.state));
+});
+// §18: the backend pushes the updated forwarded-port list; mirror it into the view + sidebar.
+api.onTunnels(({ id, tunnels }) => {
+  const v = views.get(id);
+  if (!v) return;
+  v.tunnels = Array.isArray(tunnels) ? tunnels : [];
+  renderSidebar();
 });
 api.onInfo(({ id, info, tmuxVersion }) => {
   const v = views.get(id);

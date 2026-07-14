@@ -129,6 +129,36 @@ impl TunnelRegistry {
         Ok(local_port)
     }
 
+    /// List a session's live tunnels as (remote_port, local_port), pruning any whose ssh died.
+    /// Sorted by remote port for stable display.
+    pub fn list(&self, session_id: &str) -> Vec<(u16, u16)> {
+        let mut map = self.by_session.lock().unwrap();
+        let per = match map.get_mut(session_id) { Some(p) => p, None => return Vec::new() };
+        // prune dead ones (ssh exited) in one mutable pass, collecting the live ones.
+        let mut dead: Vec<u16> = Vec::new();
+        let mut out: Vec<(u16, u16)> = Vec::new();
+        for (rp, t) in per.iter_mut() {
+            if matches!(t.child.try_wait(), Ok(None)) { out.push((*rp, t.local_port)); }
+            else { dead.push(*rp); }
+        }
+        for rp in dead { if let Some(mut t) = per.remove(&rp) { let _ = t.child.kill(); } }
+        out.sort_by_key(|(rp, _)| *rp);
+        out
+    }
+
+    /// Close ONE tunnel (by remote port) for a session. Returns true if one was closed.
+    pub fn close(&self, session_id: &str, remote_port: u16) -> bool {
+        let mut map = self.by_session.lock().unwrap();
+        if let Some(per) = map.get_mut(session_id) {
+            if let Some(mut t) = per.remove(&remote_port) {
+                let _ = t.child.kill();
+                crate::dlog!("tunnel: closed local {} (remote {}) for {}", t.local_port, remote_port, session_id);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Tear down all tunnels for a session (called on session close/kill).
     pub fn close_session(&self, session_id: &str) {
         if let Some(mut per) = self.by_session.lock().unwrap().remove(session_id) {

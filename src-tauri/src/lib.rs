@@ -488,11 +488,36 @@ fn open_forwarded_url(app: AppHandle, state: State<AppState>, id: String, url: S
     let local_port = state.tunnels.ensure(&id, &meta.host, lb.port, &[])?;
     let local_url = format!("http://localhost:{}{}", local_port, lb.path);
     dlog!("open_forwarded_url: {} -> {}", url, local_url);
+    emit_tunnels(&app, &state, &id);   // refresh the sidebar's port list
     // Give ssh a beat to establish the forward before the browser hits it.
     std::thread::sleep(std::time::Duration::from_millis(300));
     use tauri_plugin_opener::OpenerExt;
     let _ = app.opener().open_url(&local_url, None::<&str>);
     Ok(json!({ "ok": true, "localUrl": local_url }))
+}
+
+// A session's live tunnels as [{ remote, local }], for the sidebar port list (§18).
+fn tunnels_json(state: &AppState, id: &str) -> serde_json::Value {
+    let list: Vec<serde_json::Value> = state.tunnels.list(id).into_iter()
+        .map(|(remote, local)| json!({ "remote": remote, "local": local }))
+        .collect();
+    json!(list)
+}
+fn emit_tunnels(app: &AppHandle, state: &AppState, id: &str) {
+    let _ = app.emit("session:tunnels", json!({ "id": id, "tunnels": tunnels_json(state, id) }));
+}
+
+// List a session's live tunnels (renderer pulls this on demand, e.g. after mount/reconnect).
+#[tauri::command]
+fn list_tunnels(state: State<AppState>, id: String) -> serde_json::Value {
+    tunnels_json(&state, &id)
+}
+
+// Close ONE tunnel (by remote port) for a session; re-emit the updated list.
+#[tauri::command]
+fn close_tunnel(app: AppHandle, state: State<AppState>, id: String, remote: u16) {
+    state.tunnels.close(&id, remote);
+    emit_tunnels(&app, &state, &id);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -511,7 +536,7 @@ pub fn run() {
             session_close, session_kill, session_rename,
             tab_new, tab_select, tab_close, tab_capture, open_external, ui_log,
             read_remote_file, save_file, session_retry,
-            open_forwarded_url, get_config
+            open_forwarded_url, get_config, list_tunnels, close_tunnel
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -29,6 +29,8 @@ window.terminalAPI = {
   // §18: open a remote-loopback URL via an ssh -L tunnel -> { ok, localUrl }
   openForwardedUrl: (id, url) => invoke('open_forwarded_url', { id, url }),
   getConfig: () => invoke('get_config'),   // { loopbackHosts }
+  listTunnels: (id) => invoke('list_tunnels', { id }),        // -> [{ remote, local }]
+  closeTunnel: (id, remote) => invoke('close_tunnel', { id, remote }),
   // project tabs (§14) — native/control mode
   tabNew: (id) => invoke('tab_new', { id }),
   tabSelect: (id, win) => invoke('tab_select', { id, win }),
@@ -43,6 +45,7 @@ window.terminalAPI = {
   onIntentionalExit: (cb) => on('session:exit', cb),
   onWindow: (cb) => on('session:window', cb),
   onReady: (cb) => on('session:ready', cb),
+  onTunnels: (cb) => on('session:tunnels', cb),   // §18: { id, tunnels:[{remote,local}] }
   log: (msg) => { try { console.log('[DT ui]', msg); } catch (_) {} try { invoke('ui_log', { msg: String(msg) }); } catch (_) {} },
 };
 
