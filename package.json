@@ -9,10 +9,10 @@
     "smoke": "electron test/smoke-headless.js",
     "itest": "node test/integration-control-mode.js",
     "gui-live": "electron test/gui-live.js",
-    "tauri": "cargo tauri",
-    "tauri:dev": "cargo tauri dev",
-    "tauri:build": "cargo tauri build",
-    "tauri:test": "cd src-tauri && cargo test --lib"
+    "tauri": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo tauri",
+    "tauri:dev": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo tauri dev",
+    "tauri:build": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo tauri build",
+    "tauri:test": "cd src-tauri && PATH=\"$HOME/.cargo/bin:$PATH\" cargo test --lib"
   },
   "license": "MIT",
   "devDependencies": {
