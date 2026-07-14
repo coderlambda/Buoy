@@ -157,11 +157,13 @@ function makeLinkProvider(getTerm, meta) {
     isLoopback: (url) => isLoopbackUrl(url),
     // §18: open a loopback URL via a tunnel (host forwards + opens the local URL).
     openForwardedUrl: async (url) => {
+      dbg('openForwardedUrl click id=' + meta.id + ' url=' + url);
       setStatus('forwarding ' + url + '…');
       try {
         const res = await api.openForwardedUrl(meta.id, url);
+        dbg('openForwardedUrl result=' + JSON.stringify(res));
         setStatus(res && res.localUrl ? ('opened ' + res.localUrl) : ('could not forward ' + url));
-      } catch (e) { setStatus('forward failed: ' + (e && e.message || e)); }
+      } catch (e) { dbg('openForwardedUrl error=' + (e && e.message || e)); setStatus('forward failed: ' + (e && e.message || e)); }
     },
     // §18: Shift+Cmd chooser — where to open a URL.
     chooseOpen: (url) => chooseOpen(meta.id, url),
@@ -528,6 +530,7 @@ api.onReady(({ id }) => {
 });
 // §18: the backend pushes the updated forwarded-port list; mirror it into the view + sidebar.
 api.onTunnels(({ id, tunnels }) => {
+  dbg('onTunnels id=' + id + ' tunnels=' + JSON.stringify(tunnels) + ' hasView=' + views.has(id));
   const v = views.get(id);
   if (!v) return;
   v.tunnels = Array.isArray(tunnels) ? tunnels : [];
