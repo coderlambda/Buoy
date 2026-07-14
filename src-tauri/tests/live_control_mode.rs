@@ -172,3 +172,45 @@ fn live_reattach_existing_session() {
     kill(());
     eprintln!("LIVE OK: reattach to existing session verified against {}", host);
 }
+
+// Multi-byte UTF-8 (box-drawing chars, as in claude/TUIs) must survive read-boundary splits with
+// no U+FFFD corruption. Emit a large block of '─' so it spans multiple 8KB pty reads.
+#[test]
+#[ignore]
+fn live_multibyte_utf8_not_corrupted() {
+    let host = match env("DT_LIVE_HOST") { Some(h) => h, None => { eprintln!("SKIP: set DT_LIVE_HOST"); return; } };
+    let tmux = env("DT_TMUX").unwrap_or_else(|| "tmux".into());
+    let session = "rustutf8";
+    let socket = durable_terminal_lib::tmux_socket::socket_name("control", Some((3, 7)));
+    let kill = || { let _ = std::process::Command::new("ssh")
+        .args(["-o", "BatchMode=yes", "--", &host,
+               &format!("{} -L {} kill-session -t {} 2>/dev/null; true", tmux, socket, session)]).status(); };
+    kill();
+
+    let rec = Arc::new(Mutex::new(Recorder::default()));
+    let backend = ControlBackend::spawn(
+        BackendConfig { host: host.clone(), session: session.into(),
+            tmux_path: tmux.clone(), tmux_version: Some((3, 7)), base_args: vec![] },
+        sink(rec.clone()), 200, 50,
+    ).expect("spawn");
+    for _ in 0..40 { if rec.lock().unwrap().ready { break; } sleep_ms(250); }
+    assert!(rec.lock().unwrap().ready, "ready");
+
+    // Print ~40k box-drawing chars (3 bytes each -> ~120KB, many 8KB reads) then a sentinel.
+    backend.write("python3 -c \"print('\\u2500'*40000)\"; echo UTF8_DONE\n");
+    for _ in 0..40 {
+        sleep_ms(300);
+        if rec.lock().unwrap().by_window.values().any(|v| v.contains("UTF8_DONE")) { break; }
+    }
+    {
+        let r = rec.lock().unwrap();
+        let all: String = r.by_window.values().cloned().collect::<Vec<_>>().join("");
+        let boxes = all.matches('\u{2500}').count();
+        let bad = all.matches('\u{FFFD}').count();
+        assert!(boxes > 30000, "most box-drawing chars survived (got {})", boxes);
+        assert_eq!(bad, 0, "no U+FFFD replacement chars (found {})", bad);
+    }
+    backend.kill();
+    kill();
+    eprintln!("LIVE OK: multi-byte UTF-8 intact across read boundaries ({} host)", host);
+}

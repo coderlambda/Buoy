@@ -59,6 +59,10 @@ struct Inner {
     attached: bool,
     pending_input: Vec<String>,
     pending_output: std::collections::BTreeMap<String, Vec<String>>,
+    // Per-pane carry of trailing incomplete UTF-8 bytes. tmux can split a multi-byte char across
+    // two %output events for the SAME pane; carrying the partial tail here (keyed by pane, since
+    // interleaved panes must not corrupt each other) reassembles it on the next event.
+    utf8_carry: std::collections::BTreeMap<String, Vec<u8>>,
     refresh_queued: bool,
 }
 
@@ -115,6 +119,7 @@ impl ControlBackend {
             attached: false,
             pending_input: Vec::new(),
             pending_output: std::collections::BTreeMap::new(),
+            utf8_carry: std::collections::BTreeMap::new(),
             refresh_queued: false,
         }));
 
@@ -126,12 +131,19 @@ impl ControlBackend {
                 crate::dlog!("reader: thread started");
                 let mut buf = [0u8; 8192];
                 let mut total = 0usize;
+                // Decode the control stream as LATIN1 (each byte -> char 0x00..0xFF, lossless and
+                // never split). We MUST NOT UTF-8-decode here: tmux can split a multi-byte char
+                // (e.g. box-drawing '─' = E2 94 80) ACROSS two %output events — its bytes are not
+                // adjacent in the raw stream (there's "\r\n%output %P " between them), so no
+                // byte-level carry can rejoin them. Real UTF-8 reassembly happens per-pane at the
+                // emit point (route_output), which is the only place a char's bytes are contiguous.
+                // '\n'/'\r' are never UTF-8 continuation bytes, so latin1 line-splitting is safe.
                 loop {
                     match reader.read(&mut buf) {
                         Ok(0) => { crate::dlog!("reader: EOF after {} bytes", total); break; }
                         Ok(n) => {
                             total += n;
-                            let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
+                            let chunk: String = buf[..n].iter().map(|&b| b as char).collect();
                             let events = {
                                 let mut g = inner.lock().unwrap();
                                 g.parser.write(&chunk)
@@ -339,12 +351,23 @@ impl Inner {
     }
 
     fn route_output(&mut self, pane: String, data: String) {
+        // `data` is LATIN1 (one char per raw byte, from the reader + octal unescape). Convert back
+        // to bytes, prepend this pane's carried incomplete UTF-8 tail, decode the valid prefix, and
+        // stash any new incomplete tail. This is where a char split across two %output events for
+        // the same pane is reassembled.
+        let mut bytes: Vec<u8> = Vec::new();
+        if let Some(carry) = self.utf8_carry.remove(&pane) { bytes.extend_from_slice(&carry); }
+        bytes.extend(data.chars().map(|c| c as u8));
+        let (text, tail) = decode_utf8_prefix(&bytes);
+        if !tail.is_empty() { self.utf8_carry.insert(pane.clone(), tail); }
+        if text.is_empty() { return; }
+
         match self.reg.win_for_pane(&pane) {
-            Some(win) => self.emit(BackendEvent::Data { window: win, data }),
+            Some(win) => self.emit(BackendEvent::Data { window: win, data: text }),
             None => {
                 let buf = self.pending_output.entry(pane).or_default();
                 if buf.len() >= MAX_BUFFER { buf.remove(0); }
-                buf.push(data);
+                buf.push(text);
                 // trigger a refresh so the mapping is learned (inline, avoids nested lock)
                 if !self.refresh_queued {
                     self.refresh_queued = true;
@@ -411,7 +434,12 @@ impl Inner {
         let target = window.or_else(|| g.reg.active_window.clone());
         if let Some(t) = target {
             if !b.is_empty() {
-                let data = format!("\x1b[H\x1b[2J{}\r\n", b.join("\r\n"));
+                // Capture body lines are LATIN1 (like %output); a whole capture line's bytes are
+                // contiguous, so decode each line latin1 -> UTF-8 (no cross-line carry needed).
+                let joined = b.join("\r\n");
+                let bytes: Vec<u8> = joined.chars().map(|c| c as u8).collect();
+                let (text, _tail) = decode_utf8_prefix(&bytes);
+                let data = format!("\x1b[H\x1b[2J{}\r\n", text);
                 g.emit(BackendEvent::Data { window: t, data });
             }
         }
@@ -442,6 +470,35 @@ fn is_win_id(s: &str) -> bool {
     s.starts_with('@') && s.len() > 1 && s[1..].chars().all(|c| c.is_ascii_digit())
 }
 
+/// Decode the longest valid UTF-8 prefix of `bytes`. Returns the decoded string and any trailing
+/// bytes that form an INCOMPLETE (but so-far-valid) multi-byte sequence, to be carried into the
+/// next read. Genuinely invalid bytes (not just truncated) are passed through lossily so we never
+/// stall. This is what stops box-drawing/other multi-byte chars from being corrupted to U+FFFD
+/// when they straddle a read boundary.
+fn decode_utf8_prefix(bytes: &[u8]) -> (String, Vec<u8>) {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => (s.to_string(), Vec::new()),
+        Err(e) => {
+            let valid = e.valid_up_to();
+            // SAFETY: bytes[..valid] is valid UTF-8 by definition of valid_up_to().
+            let good = unsafe { std::str::from_utf8_unchecked(&bytes[..valid]) }.to_string();
+            match e.error_len() {
+                // None => the tail is a truncated-but-valid sequence: carry it for the next read.
+                None => (good, bytes[valid..].to_vec()),
+                // Some(len) => genuinely invalid bytes: emit the replacement char and skip them,
+                // then keep decoding the remainder (so one bad byte can't wedge the stream).
+                Some(len) => {
+                    let mut out = good;
+                    out.push('\u{FFFD}');
+                    let (rest_str, rest_carry) = decode_utf8_prefix(&bytes[valid + len..]);
+                    out.push_str(&rest_str);
+                    (out, rest_carry)
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,5 +524,45 @@ mod tests {
         assert!(!is_win_id("@"));
         assert!(!is_win_id("%3"));
         assert!(!is_win_id("@1;rm"));
+    }
+
+    #[test]
+    fn utf8_complete_input_has_no_carry() {
+        let (s, carry) = decode_utf8_prefix("a─b".as_bytes());
+        assert_eq!(s, "a─b");
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn utf8_split_multibyte_is_carried_not_corrupted() {
+        // '─' (box drawing) = E2 94 80. Split it across two reads at every interior boundary and
+        // verify we reassemble the exact char with NO U+FFFD.
+        let full = "x─y".as_bytes().to_vec(); // 78 E2 94 80 79
+        for cut in 1..full.len() {
+            let (s1, carry) = decode_utf8_prefix(&full[..cut]);
+            let mut combined = carry;
+            combined.extend_from_slice(&full[cut..]);
+            let (s2, tail) = decode_utf8_prefix(&combined);
+            let joined = format!("{}{}", s1, s2);
+            assert_eq!(joined, "x─y", "cut at {} must reassemble cleanly", cut);
+            assert!(tail.is_empty(), "no leftover carry at cut {}", cut);
+            assert!(!joined.contains('\u{FFFD}'), "no replacement char at cut {}", cut);
+        }
+    }
+
+    #[test]
+    fn utf8_truncated_tail_becomes_carry() {
+        // Just the first 2 bytes of '─' (E2 94): incomplete -> empty decode + 2-byte carry.
+        let (s, carry) = decode_utf8_prefix(&[0xE2, 0x94]);
+        assert_eq!(s, "");
+        assert_eq!(carry, vec![0xE2, 0x94]);
+    }
+
+    #[test]
+    fn utf8_genuinely_invalid_byte_is_replaced_not_stalled() {
+        // A lone 0xFF is invalid (not truncated) -> replacement char, decoding continues.
+        let (s, carry) = decode_utf8_prefix(&[b'a', 0xFF, b'b']);
+        assert_eq!(s, "a\u{FFFD}b");
+        assert!(carry.is_empty());
     }
 }
