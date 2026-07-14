@@ -40,7 +40,10 @@
     .session .tunnel { display:flex; align-items:center; gap:4px; font-size:10px; color:var(--muted);
       background:#252537; border-radius:4px; padding:1px 5px; cursor:pointer; }
     .session .tunnel:hover { background:#2e2e44; color:var(--fg); }
-    .session .tunnel .tport { color:#a6e3a1; font-weight:600; }   /* remote port */
+    .session .tunnel .tport { color:#a6e3a1; font-weight:600; }   /* remote port (active) */
+    /* inactive: persisted-but-not-serving — greyed, still closable/clickable to re-open */
+    .session .tunnel.inactive { opacity:.5; }
+    .session .tunnel.inactive .tport { color:var(--muted); }
     .session .tunnel .tarrow { opacity:.6; }
     .session .tunnel .tlocal { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .session .tunnel .tclose { margin-left:auto; color:var(--muted); font-size:12px; visibility:hidden; }

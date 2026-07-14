@@ -325,7 +325,7 @@ fn session_kill(state: State<AppState>, id: String) -> serde_json::Value {
         let mut sessions = state.sessions.lock().unwrap();
         sessions.remove(&id).map(|s| { s.backend.kill(); s.meta })
     }.or_else(|| state.store.load().into_iter().find(|s| s.id == id));
-    state.tunnels.close_session(&id);
+    state.tunnels.forget_session(&id);   // kill removes the session -> forget its persisted ports
 
     let mut killed_remote = false;
     if let Some(m) = meta {
@@ -496,10 +496,12 @@ fn open_forwarded_url(app: AppHandle, state: State<AppState>, id: String, url: S
     Ok(json!({ "ok": true, "localUrl": local_url }))
 }
 
-// A session's live tunnels as [{ remote, local }], for the sidebar port list (§18).
+// A session's forwarded ports as [{ remote, local, active }] — persisted + live, each probed
+// (§18). Inactive/persisted-only ports appear too (local:null, active:false) so the sidebar can
+// show them greyed after a restart and let the user re-open or close them.
 fn tunnels_json(state: &AppState, id: &str) -> serde_json::Value {
-    let list: Vec<serde_json::Value> = state.tunnels.list(id).into_iter()
-        .map(|(remote, local)| json!({ "remote": remote, "local": local }))
+    let list: Vec<serde_json::Value> = state.tunnels.status(id).into_iter()
+        .map(|s| json!({ "remote": s.remote, "local": s.local, "active": s.active }))
         .collect();
     json!(list)
 }
@@ -529,7 +531,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
             sessions: Mutex::new(HashMap::new()), store,
-            tunnels: tunnel::TunnelRegistry::new(), config,
+            tunnels: tunnel::TunnelRegistry::with_store(user_data_dir().join("tunnels.json")), config,
         })
         .invoke_handler(tauri::generate_handler![
             list_sessions, create_session, session_input, session_resize,

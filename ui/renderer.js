@@ -108,6 +108,17 @@ function openViewer(sessionId, path) {
 
 function baseName(p) { return (String(p).split('/').pop() || 'file'); }
 
+// §18: pull the authoritative forwarded-port status (persisted + live, each probed) into the view
+// and re-render the sidebar. Safe to call on mount, reconnect, or a periodic tick.
+function refreshTunnels(id) {
+  api.listTunnels(id).then((t) => {
+    const v = views.get(id);
+    if (!v) return;
+    v.tunnels = Array.isArray(t) ? t : [];
+    renderSidebar();
+  }).catch(() => {});
+}
+
 // §18: Shift+Cmd chooser — a small popup letting the user pick where to open a URL. Loopback URLs
 // offer tunnel-open; all URLs offer copy and open-plain.
 function chooseOpen(sessionId, url) {
@@ -229,16 +240,8 @@ async function mount(id) {
   showActiveTab(v);        // mount + reveal the active tab's content
   renderTabs(v);
   renderSidebar();
-  // §18: pull any live forwarded ports for this session. The backend registry is the source of
-  // truth, so ALWAYS apply its snapshot — but guard against clobbering a fresher onTunnels event:
-  // only overwrite if the fetched list differs, and never replace a non-empty list with []
-  // (an in-flight open_forwarded_url may not be in the snapshot yet).
-  api.listTunnels(id).then((t) => {
-    const next = Array.isArray(t) ? t : [];
-    if (next.length === 0 && (v.tunnels || []).length > 0) return;   // don't wipe a live list
-    v.tunnels = next;
-    renderSidebar();
-  }).catch(() => {});
+  // §18: pull the forwarded-port status (persisted + live, probed) for this session.
+  refreshTunnels(id);
 }
 
 // Mount (if needed) and reveal the active tab's content; hide the project's other tabs.
@@ -269,12 +272,17 @@ function renderSidebar() {
     const li = document.createElement('li');
     li.className = 'session' + (id === activeId ? ' active' : '') + (v.state === 'dead' ? ' dead' : '');
     const sub = v.meta.host ? escapeHtml(v.meta.host) + (v.tmuxVersion ? ` · tmux ${v.tmuxVersion.join('.')}` : '') : (v.meta.kind || 'local');
-    // §18: forwarded ports, listed under the project name. Each row: "remote → local" + close.
-    const tunnelRows = (v.tunnels || []).map((t) =>
-      `<span class="tunnel" data-remote="${t.remote}" title="click to open http://localhost:${t.local}/">
-         <span class="tport">:${t.remote}</span><span class="tarrow">→</span><span class="tlocal">localhost:${t.local}</span>
+    // §18: forwarded ports under the project name. Active rows show the local port and open on
+    // click; inactive (grey) rows are persisted-but-not-serving — click re-opens the tunnel.
+    const tunnelRows = (v.tunnels || []).map((t) => {
+      const active = !!t.active;
+      const localTxt = t.local ? `localhost:${t.local}` : '—';
+      const title = active ? `open http://localhost:${t.local}/` : `port ${t.remote} inactive — click to re-open`;
+      return `<span class="tunnel${active ? '' : ' inactive'}" data-remote="${t.remote}" title="${title}">
+         <span class="tport">:${t.remote}</span><span class="tarrow">→</span><span class="tlocal">${localTxt}</span>
          <span class="tclose" title="close tunnel">×</span>
-       </span>`).join('');
+       </span>`;
+    }).join('');
     li.innerHTML = `<span class="dot ${v.state}"></span>
       <span class="body">
         <span class="name" title="double-click to rename">${escapeHtml(v.meta.title || v.meta.session || v.meta.kind)}</span>
@@ -289,7 +297,7 @@ function renderSidebar() {
     nameEl.ondblclick = (e) => { e.stopPropagation(); startRename(id, nameEl); };
     li.querySelector('.detach').onclick = (e) => { e.stopPropagation(); detachSession(id); };
     li.querySelector('.kill').onclick = (e) => { e.stopPropagation(); killSession(id); };
-    // tunnel rows: click opens the local URL; the × closes just that tunnel.
+    // tunnel rows: active -> open the local URL; inactive -> re-open the tunnel; × closes/forgets.
     li.querySelectorAll('.tunnel').forEach((el) => {
       const remote = Number(el.getAttribute('data-remote'));
       el.querySelector('.tclose').onclick = (e) => { e.stopPropagation(); api.closeTunnel(id, remote); };
@@ -297,7 +305,14 @@ function renderSidebar() {
         if (e.target.classList.contains('tclose')) return;
         e.stopPropagation();
         const t = (v.tunnels || []).find((x) => x.remote === remote);
-        if (t) api.openExternal('http://localhost:' + t.local + '/');
+        if (t && t.active && t.local) {
+          api.openExternal('http://localhost:' + t.local + '/');
+        } else {
+          // inactive/persisted: re-open the tunnel to the remote port (recreates ssh -L + opens).
+          setStatus('re-opening port ' + remote + '…');
+          api.openForwardedUrl(id, 'http://localhost:' + remote + '/')
+            .then(() => refreshTunnels(id)).catch(() => {});
+        }
       };
     });
     li.onclick = (e) => {
@@ -535,9 +550,8 @@ api.onReady(({ id }) => {
   if (!v) { dbg('onReady: NO VIEW for id=' + id); return; }
   v.inputReady = true;   // display flag only; the backend already flushed its buffered input
   if (id === activeId) setStatus(statusLine(v, v.state));
-  // §18: on (re)connect, refresh the forwarded-port list — tunnels are separate ssh processes
-  // that survive a session's reconnect, so they should stay visible after the connection bounces.
-  api.listTunnels(id).then((t) => { if (Array.isArray(t)) { v.tunnels = t; renderSidebar(); } }).catch(() => {});
+  // §18: on (re)connect, refresh the forwarded-port status (active/inactive).
+  refreshTunnels(id);
 });
 // §18: the backend pushes the updated forwarded-port list; mirror it into the view + sidebar.
 api.onTunnels(({ id, tunnels }) => {
@@ -629,7 +643,14 @@ document.getElementById('form').addEventListener('submit', async (e) => {
     v.started = false;   // not connected yet; mount() will start (reattach) on click
   }
   renderSidebar();
+  // §18: show persisted forwarded ports for every restored session up front (greyed until
+  // re-opened), so the list survives an app restart without waiting for a connect.
+  for (const meta of persisted) refreshTunnels(meta.id);
   setStatus(persisted.length ? `${persisted.length} session(s) restored — click to reconnect` : 'no sessions — create one');
   // Auto-reconnect the first restored session so reopening the app "just works".
   if (persisted.length) mount(persisted[0].id);
 })();
+
+// §18: periodically re-probe the active session's tunnels so a stopped dev server goes grey (and
+// a restarted one goes active) without a manual refresh. Light: one call every 5s for the shown one.
+setInterval(() => { if (activeId != null && views.has(activeId)) refreshTunnels(activeId); }, 5000);

@@ -4,12 +4,25 @@
 //! local URL. Tunnels are separate ssh processes (never the -CC channel), tracked per session and
 //! reused across clicks to the same remote port, and torn down when the session closes.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::net::TcpStream;
+use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use crate::validation::{parse_host, ValidationError};
+
+/// One forwarded port's status for the sidebar: the remote port, its local port if a tunnel is
+/// currently open, and whether the forward is ACTIVE (something is really answering on the remote).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct TunnelStatus {
+    pub remote: u16,
+    pub local: Option<u16>,
+    pub active: bool,
+}
 
 /// A parsed loopback URL: the remote port to reach and the path (incl. query) to open.
 #[derive(Debug, PartialEq)]
@@ -63,10 +76,32 @@ struct Tunnel {
     child: Child,
 }
 
-/// Per-session set of live tunnels, keyed by remote port (so repeat clicks reuse one).
+/// Probe a local forwarded port: connect + send a minimal HTTP HEAD and see if we get ANY bytes
+/// back. A plain TCP connect is NOT enough — ssh's local listener accepts before forwarding, so a
+/// dead remote port still "connects" (verified). Only an actual round-trip distinguishes them.
+pub fn probe_local_port(local_port: u16) -> bool {
+    let addr = format!("127.0.0.1:{}", local_port);
+    let stream = TcpStream::connect_timeout(
+        &addr.parse().unwrap(), Duration::from_millis(600));
+    let mut s = match stream { Ok(s) => s, Err(_) => return false };
+    let _ = s.set_read_timeout(Some(Duration::from_millis(700)));
+    let _ = s.set_write_timeout(Some(Duration::from_millis(500)));
+    // A bare HEAD; we don't care about the status, only that SOMETHING answers (dead remote ->
+    // ssh closes/refuses the forwarded channel -> read returns 0/err).
+    if s.write_all(b"HEAD / HTTP/1.0\r\n\r\n").is_err() { return false; }
+    let mut buf = [0u8; 16];
+    matches!(s.read(&mut buf), Ok(n) if n > 0)
+}
+
+/// Per-session set of live tunnels, keyed by remote port (so repeat clicks reuse one). Also
+/// persists the set of remote ports per session to disk, so after an app restart the sidebar can
+/// show the (inactive) rows and the user can re-open them.
 pub struct TunnelRegistry {
     // session id -> (remote_port -> Tunnel)
     by_session: Mutex<HashMap<String, HashMap<u16, Tunnel>>>,
+    // session id -> set of remote ports ever forwarded (persisted); source of truth for the list.
+    persisted: Mutex<BTreeMap<String, Vec<u16>>>,
+    store_path: Option<PathBuf>,
 }
 
 impl Default for TunnelRegistry {
@@ -75,7 +110,73 @@ impl Default for TunnelRegistry {
 
 impl TunnelRegistry {
     pub fn new() -> Self {
-        TunnelRegistry { by_session: Mutex::new(HashMap::new()) }
+        TunnelRegistry {
+            by_session: Mutex::new(HashMap::new()),
+            persisted: Mutex::new(BTreeMap::new()),
+            store_path: None,
+        }
+    }
+
+    /// Registry backed by a JSON file at `path` (tunnels.json); loads any existing persisted ports.
+    pub fn with_store(path: PathBuf) -> Self {
+        let persisted = std::fs::read_to_string(&path).ok()
+            .and_then(|s| serde_json::from_str::<BTreeMap<String, Vec<u16>>>(&s).ok())
+            .unwrap_or_default();
+        TunnelRegistry {
+            by_session: Mutex::new(HashMap::new()),
+            persisted: Mutex::new(persisted),
+            store_path: Some(path),
+        }
+    }
+
+    fn save_persisted(&self, map: &BTreeMap<String, Vec<u16>>) {
+        if let Some(path) = &self.store_path {
+            if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
+            if let Ok(json) = serde_json::to_string_pretty(map) {
+                let tmp = path.with_extension("json.tmp");
+                if std::fs::write(&tmp, json).is_ok() { let _ = std::fs::rename(&tmp, path); }
+            }
+        }
+    }
+
+    fn remember(&self, session_id: &str, remote_port: u16) {
+        let mut p = self.persisted.lock().unwrap();
+        let ports = p.entry(session_id.to_string()).or_default();
+        if !ports.contains(&remote_port) { ports.push(remote_port); ports.sort(); }
+        let snapshot = p.clone();
+        drop(p);
+        self.save_persisted(&snapshot);
+    }
+
+    fn forget(&self, session_id: &str, remote_port: u16) {
+        let mut p = self.persisted.lock().unwrap();
+        if let Some(ports) = p.get_mut(session_id) {
+            ports.retain(|&x| x != remote_port);
+            if ports.is_empty() { p.remove(session_id); }
+        }
+        let snapshot = p.clone();
+        drop(p);
+        self.save_persisted(&snapshot);
+    }
+
+    /// The persisted+live status of a session's forwarded ports, for the sidebar. Each remote port
+    /// (persisted or currently live) is probed: `active` is true only if the forward really answers.
+    /// Reuses a live tunnel's local port; a persisted-but-not-open port has `local: None, active:false`.
+    pub fn status(&self, session_id: &str) -> Vec<TunnelStatus> {
+        // union of persisted ports and currently-live ones
+        let persisted = self.persisted.lock().unwrap().get(session_id).cloned().unwrap_or_default();
+        let live: Vec<(u16, u16)> = self.list(session_id); // prunes dead ssh
+        let live_map: HashMap<u16, u16> = live.iter().cloned().collect();
+
+        let mut ports: Vec<u16> = persisted.clone();
+        for (rp, _) in &live { if !ports.contains(rp) { ports.push(*rp); } }
+        ports.sort();
+
+        ports.into_iter().map(|remote| {
+            let local = live_map.get(&remote).copied();
+            let active = match local { Some(lp) => probe_local_port(lp), None => false };
+            TunnelStatus { remote, local, active }
+        }).collect()
     }
 
     /// Ensure a tunnel exists for (session, remote_port); return the LOCAL port. Reuses a live one.
@@ -126,6 +227,8 @@ impl TunnelRegistry {
 
         crate::dlog!("tunnel: session={} local {} -> remote localhost:{}", session_id, local_port, remote_port);
         per.insert(remote_port, Tunnel { local_port, remote_port, child });
+        drop(map);
+        self.remember(session_id, remote_port);   // persist so it survives restart
         Ok(local_port)
     }
 
@@ -146,20 +249,25 @@ impl TunnelRegistry {
         out
     }
 
-    /// Close ONE tunnel (by remote port) for a session. Returns true if one was closed.
+    /// Close ONE tunnel (by remote port) for a session AND forget it from disk — this is the user
+    /// explicitly dismissing the row, so it should not reappear on next launch. Returns true if a
+    /// live tunnel was killed (also succeeds/forgets for a persisted-but-not-open port).
     pub fn close(&self, session_id: &str, remote_port: u16) -> bool {
-        let mut map = self.by_session.lock().unwrap();
-        if let Some(per) = map.get_mut(session_id) {
-            if let Some(mut t) = per.remove(&remote_port) {
-                let _ = t.child.kill();
-                crate::dlog!("tunnel: closed local {} (remote {}) for {}", t.local_port, remote_port, session_id);
-                return true;
+        let killed = {
+            let mut map = self.by_session.lock().unwrap();
+            match map.get_mut(session_id).and_then(|per| per.remove(&remote_port)) {
+                Some(mut t) => { let _ = t.child.kill();
+                    crate::dlog!("tunnel: closed local {} (remote {}) for {}", t.local_port, remote_port, session_id);
+                    true }
+                None => false,
             }
-        }
-        false
+        };
+        self.forget(session_id, remote_port);
+        killed
     }
 
-    /// Tear down all tunnels for a session (called on session close/kill).
+    /// Tear down all LIVE tunnels for a session but KEEP the persisted port list (detach: the
+    /// session survives, so its ports should still show — inactive — on next launch/reconnect).
     pub fn close_session(&self, session_id: &str) {
         if let Some(mut per) = self.by_session.lock().unwrap().remove(session_id) {
             for (_, mut t) in per.drain() {
@@ -167,6 +275,16 @@ impl TunnelRegistry {
                 crate::dlog!("tunnel: closed local {} (remote {})", t.local_port, t.remote_port);
             }
         }
+    }
+
+    /// Kill a session for good: tear down tunnels AND forget its persisted ports.
+    pub fn forget_session(&self, session_id: &str) {
+        self.close_session(session_id);
+        let mut p = self.persisted.lock().unwrap();
+        p.remove(session_id);
+        let snapshot = p.clone();
+        drop(p);
+        self.save_persisted(&snapshot);
     }
 }
 
@@ -221,5 +339,53 @@ mod tests {
         assert!(p > 0);
         // can bind again after the picker dropped its listener
         assert!(TcpListener::bind(("127.0.0.1", p)).is_ok());
+    }
+
+    // probe: a real local HTTP-ish listener that answers -> active; nothing listening -> inactive.
+    #[test]
+    fn probe_active_vs_inactive() {
+        use std::io::{Read, Write};
+        // a listener that reads the request and writes a minimal response = "active"
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let h = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = l.accept() {
+                let mut b = [0u8; 64]; let _ = s.read(&mut b);
+                let _ = s.write_all(b"HTTP/1.0 200 OK\r\n\r\nok");
+            }
+        });
+        assert!(probe_local_port(port), "a listener that answers is active");
+        let _ = h.join();
+
+        // a port with nothing listening -> inactive
+        let dead = free_local_port().unwrap();
+        assert!(!probe_local_port(dead), "no listener -> inactive");
+    }
+
+    // persistence: remembered ports survive a reload; status() shows them inactive (no live tunnel).
+    #[test]
+    fn persists_and_reports_inactive() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("dt_tun_test_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let reg = TunnelRegistry::with_store(path.clone());
+        reg.remember("sess", 3000);
+        reg.remember("sess", 5173);
+
+        // a fresh registry from the same file sees the persisted ports as inactive rows
+        let reg2 = TunnelRegistry::with_store(path.clone());
+        let st = reg2.status("sess");
+        assert_eq!(st.iter().map(|s| s.remote).collect::<Vec<_>>(), vec![3000, 5173]);
+        assert!(st.iter().all(|s| s.local.is_none() && !s.active), "persisted-only -> inactive");
+
+        // close() forgets one; forget_session clears the rest
+        reg2.close("sess", 3000);
+        let reg3 = TunnelRegistry::with_store(path.clone());
+        assert_eq!(reg3.status("sess").iter().map(|s| s.remote).collect::<Vec<_>>(), vec![5173]);
+        reg3.forget_session("sess");
+        assert!(TunnelRegistry::with_store(path.clone()).status("sess").is_empty());
+
+        let _ = std::fs::remove_file(&path);
     }
 }

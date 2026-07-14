@@ -56,6 +56,24 @@ fn live_tunnel_forwards_remote_loopback() {
     let listed = reg.list("sessX");
     assert_eq!(listed, vec![(rport, local)], "list() reports the live tunnel");
 
+    // status(): with a real server behind it, the port probes ACTIVE.
+    let st = reg.status("sessX");
+    assert_eq!(st.len(), 1);
+    assert_eq!(st[0].remote, rport);
+    assert_eq!(st[0].local, Some(local));
+    assert!(st[0].active, "a served port probes active");
+
+    // Stop the remote server -> the SAME tunnel now probes INACTIVE (ssh accepts locally but the
+    // remote connect fails), and the row remains (persisted) so the user can close/re-open it.
+    sh(&format!("{t} -L tunhttp kill-server 2>/dev/null", t = tmux));
+    sleep_ms(1200);
+    let st2 = reg.status("sessX");
+    assert_eq!(st2.len(), 1, "port still listed after the server stops");
+    assert!(!st2[0].active, "stopped server -> inactive (grey)");
+    // restart the server for the remaining assertions
+    sh(&format!("{t} -L tunhttp new-session -d -s h 'cd /tmp/dt_tun && python3 -m http.server {p} --bind 127.0.0.1'", t = tmux, p = rport));
+    sleep_ms(1500);
+
     // close() ONE tunnel by remote port -> gone from the list and stops forwarding.
     assert!(reg.close("sessX", rport), "close() returns true for a live tunnel");
     assert!(reg.list("sessX").is_empty(), "list() empty after closing the only tunnel");
