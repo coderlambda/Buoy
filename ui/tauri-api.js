@@ -29,8 +29,10 @@ window.terminalAPI = {
   // §18: open a remote-loopback URL via an ssh -L tunnel -> { ok, localUrl }
   openForwardedUrl: (id, url) => invoke('open_forwarded_url', { id, url }),
   getConfig: () => invoke('get_config'),   // { loopbackHosts }
-  listTunnels: (id) => invoke('list_tunnels', { id }),        // -> [{ remote, local }]
+  listTunnels: (id) => invoke('list_tunnels', { id }),        // -> [{ remote, local, active }]
   closeTunnel: (id, remote) => invoke('close_tunnel', { id, remote }),
+  listHosts: () => invoke('list_hosts'),                      // host history (most-recent-first)
+  rememberHost: (host) => invoke('remember_host', { host }),
   // project tabs (§14) — native/control mode
   tabNew: (id) => invoke('tab_new', { id }),
   tabSelect: (id, win) => invoke('tab_select', { id, win }),

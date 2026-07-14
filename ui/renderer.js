@@ -599,17 +599,54 @@ window.addEventListener('resize', () => {
 const dialog = document.getElementById('dialog');
 const fKind = document.getElementById('f-kind');
 const remoteFields = document.getElementById('remote-fields');
-document.getElementById('new').onclick = () => { document.getElementById('f-err').textContent = ''; dialog.showModal(); };
+const fHost = document.getElementById('f-host');
+const fControl = document.getElementById('f-control');   // native-mode toggle button
+const hostHistoryEl = document.getElementById('host-history');
+
+// Native mode is a toggle; default ON. Click flips it.
+function setNative(on) { fControl.classList.toggle('on', !!on); fControl.setAttribute('aria-checked', on ? 'true' : 'false'); }
+fControl.onclick = () => setNative(!fControl.classList.contains('on'));
+
 const updateFields = () => { remoteFields.style.display = fKind.value === 'remote' ? 'block' : 'none'; };
 fKind.onchange = updateFields;
-document.getElementById('new').addEventListener('click', updateFields);
+
+document.getElementById('new').addEventListener('click', () => {
+  document.getElementById('f-err').textContent = '';
+  setNative(true);                    // default to native mode each time the dialog opens
+  updateFields();
+  hideHostHistory();
+  dialog.showModal();
+});
+
+// --- host history dropdown ---
+let _hostHistory = [];
+function hideHostHistory() { hostHistoryEl.className = ''; hostHistoryEl.innerHTML = ''; }
+async function showHostHistory() {
+  try { _hostHistory = await api.listHosts(); } catch (_) { _hostHistory = []; }
+  const typed = fHost.value.trim().toLowerCase();
+  const items = _hostHistory.filter((h) => !typed || h.toLowerCase().includes(typed));
+  if (!items.length) { hideHostHistory(); return; }
+  hostHistoryEl.innerHTML = '';
+  items.forEach((h) => {
+    const li = document.createElement('li');
+    li.textContent = h;
+    // mousedown (not click) so it fires before the input's blur hides the list.
+    li.onmousedown = (e) => { e.preventDefault(); fHost.value = h; hideHostHistory(); fHost.focus(); };
+    hostHistoryEl.appendChild(li);
+  });
+  hostHistoryEl.className = 'on';
+}
+fHost.addEventListener('focus', showHostHistory);
+fHost.addEventListener('click', showHostHistory);
+fHost.addEventListener('input', showHostHistory);
+fHost.addEventListener('blur', () => setTimeout(hideHostHistory, 120));   // allow mousedown to land
 
 document.getElementById('form').addEventListener('submit', async (e) => {
   // form method=dialog closes automatically; only act on OK
   const ok = e.submitter && e.submitter.value === 'ok';
   if (!ok) return;
   const kind = fKind.value;
-  const host = document.getElementById('f-host').value.trim();
+  const host = fHost.value.trim();
   if (kind === 'remote' && !host) {   // guard: remote needs a host
     e.preventDefault();               // keep the dialog open
     document.getElementById('f-err').textContent = 'Enter a host (user@host).';
@@ -618,7 +655,7 @@ document.getElementById('form').addEventListener('submit', async (e) => {
   const meta = {
     kind,
     transport: 'ssh',   // ssh is the only remote transport
-    mode: document.getElementById('f-control').checked ? 'control' : 'plain',
+    mode: fControl.classList.contains('on') ? 'control' : 'plain',
     title: document.getElementById('f-title').value.trim() || (kind === 'local' ? 'local' : host),
     host,
     // NOTE: no session name from the user — main.js generates & owns it.

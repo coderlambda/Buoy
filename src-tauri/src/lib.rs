@@ -17,6 +17,7 @@ pub mod probe;
 pub mod remote_file;
 pub mod supervisor;
 pub mod tunnel;
+pub mod host_history;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -86,6 +87,7 @@ struct AppState {
     sessions: Mutex<HashMap<String, Session>>,
     store: SessionStore,
     tunnels: tunnel::TunnelRegistry,
+    hosts: host_history::HostHistory,
     config: AppConfig,
 }
 
@@ -288,6 +290,7 @@ fn create_session(app: AppHandle, state: State<AppState>, meta: CreateArgs) -> R
     };
 
     dlog!("create_session: spawned backend id={} session={} mode={}", id, session, mode);
+    if !meta.host.is_empty() { state.hosts.remember(&meta.host); }   // host history for the dialog
     state.sessions.lock().unwrap().insert(id.clone(), Session { backend, meta: session_meta });
     Ok(json!({ "id": id, "session": session, "mode": mode }))
 }
@@ -467,6 +470,16 @@ fn get_config(state: State<AppState>) -> serde_json::Value {
     json!({ "loopbackHosts": state.config.loopback_hosts })
 }
 
+// Host history for the new-session dialog dropdown (most-recent-first).
+#[tauri::command]
+fn list_hosts(state: State<AppState>) -> Vec<String> {
+    state.hosts.list()
+}
+#[tauri::command]
+fn remember_host(state: State<AppState>, host: String) {
+    state.hosts.remember(&host);
+}
+
 // Open a remote-loopback URL (localhost:PORT) via an ssh -L tunnel, then open the LOCAL tunnel URL
 // in the browser (§18). Reuses a live tunnel for the same (session, remote port). If the URL isn't
 // a configured loopback URL, this is a no-op error (the renderer opens plain URLs directly).
@@ -531,14 +544,17 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
             sessions: Mutex::new(HashMap::new()), store,
-            tunnels: tunnel::TunnelRegistry::with_store(user_data_dir().join("tunnels.json")), config,
+            tunnels: tunnel::TunnelRegistry::with_store(user_data_dir().join("tunnels.json")),
+            hosts: host_history::HostHistory::load(user_data_dir().join("hosts.json")),
+            config,
         })
         .invoke_handler(tauri::generate_handler![
             list_sessions, create_session, session_input, session_resize,
             session_close, session_kill, session_rename,
             tab_new, tab_select, tab_close, tab_capture, open_external, ui_log,
             read_remote_file, save_file, session_retry,
-            open_forwarded_url, get_config, list_tunnels, close_tunnel
+            open_forwarded_url, get_config, list_tunnels, close_tunnel,
+            list_hosts, remember_host
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
