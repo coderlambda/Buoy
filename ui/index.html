@@ -31,10 +31,13 @@
     .session .sub { font-size:10px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .session .name .rename-input { width:100%; box-sizing:border-box; font:inherit; color:var(--fg);
       background:var(--bg); border:1px solid var(--accent); border-radius:4px; padding:1px 4px; }
-    .session .retry { display:none; font-size:11px; color:var(--accent); flex:none; }
-    .session.dead .retry { display:inline; }
-    .session .act { display:none; flex:none; font-size:13px; color:var(--muted); cursor:pointer; padding:0 3px; }
-    .session:hover .act { display:inline; }
+    .session .retry { visibility:hidden; font-size:11px; color:var(--accent); flex:none; }
+    .session.dead .retry { visibility:visible; }
+    /* Icons always occupy their space (visibility, not display) so showing them on hover does NOT
+       reflow the row. Fixed box + small line-height keeps the ⏻/⤫ glyphs from inflating row height. */
+    .session .act { visibility:hidden; flex:none; width:16px; text-align:center; font-size:11px;
+      line-height:16px; color:var(--muted); cursor:pointer; }
+    .session:hover .act { visibility:visible; }
     .session .act.detach:hover { color:var(--fg); }
     .session .act.kill:hover { color:#f38ba8; }
     /* §18: forwarded-port list under the project name */
