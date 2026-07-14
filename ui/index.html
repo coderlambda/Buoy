@@ -46,8 +46,12 @@
     .session .tunnel.inactive .tport { color:var(--muted); }
     .session .tunnel .tarrow { opacity:.6; }
     .session .tunnel .tlocal { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .session .tunnel .tclose { margin-left:auto; color:var(--muted); font-size:12px; visibility:hidden; }
-    .session .tunnel:hover .tclose { visibility:visible; }
+    .session .tunnel .tlocal.same { color:#a6e3a1; }   /* local port == remote port (forced) */
+    .session .tunnel .tforce, .session .tunnel .tclose { margin-left:2px; color:var(--muted);
+      font-size:12px; visibility:hidden; flex:none; }
+    .session .tunnel .tforce { margin-left:auto; }
+    .session .tunnel:hover .tforce, .session .tunnel:hover .tclose { visibility:visible; }
+    .session .tunnel .tforce:hover { color:var(--accent); }
     .session .tunnel .tclose:hover { color:#f38ba8; }
     #new { margin:10px; padding:8px; border:1px dashed #45475a; border-radius:6px; text-align:center;
       color:var(--muted); cursor:pointer; }

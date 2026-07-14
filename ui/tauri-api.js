@@ -31,6 +31,7 @@ window.terminalAPI = {
   getConfig: () => invoke('get_config'),   // { loopbackHosts }
   listTunnels: (id) => invoke('list_tunnels', { id }),        // -> [{ remote, local, active }]
   closeTunnel: (id, remote) => invoke('close_tunnel', { id, remote }),
+  forceForward: (id, remote) => invoke('force_forward', { id, remote }),   // same local port; errors if taken
   listHosts: () => invoke('list_hosts'),                      // host history (most-recent-first)
   rememberHost: (host) => invoke('remember_host', { host }),
   // project tabs (§14) — native/control mode

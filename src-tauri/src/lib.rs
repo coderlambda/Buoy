@@ -535,6 +535,21 @@ fn close_tunnel(app: AppHandle, state: State<AppState>, id: String, remote: u16)
     emit_tunnels(&app, &state, &id);
 }
 
+// Force-forward a remote port onto the SAME local port (localhost:<remote> -> localhost:<remote>).
+// Errors (e.g. "local port N is already in use") propagate so the renderer can alert.
+#[tauri::command]
+fn force_forward(app: AppHandle, state: State<AppState>, id: String, remote: u16) -> Result<serde_json::Value, String> {
+    let meta = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.get(&id).map(|s| s.meta.clone())
+    }.or_else(|| state.store.load().into_iter().find(|s| s.id == id))
+     .ok_or_else(|| "unknown session".to_string())?;
+    if meta.host.is_empty() { return Err("local session has no remote to forward".into()); }
+    let local = state.tunnels.force_same_port(&id, &meta.host, remote, &[])?;
+    emit_tunnels(&app, &state, &id);
+    Ok(json!({ "ok": true, "local": local }))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let store = SessionStore::new(user_data_dir().join("sessions.json"));
@@ -553,7 +568,7 @@ pub fn run() {
             session_close, session_kill, session_rename,
             tab_new, tab_select, tab_close, tab_capture, open_external, ui_log,
             read_remote_file, save_file, session_retry,
-            open_forwarded_url, get_config, list_tunnels, close_tunnel,
+            open_forwarded_url, get_config, list_tunnels, close_tunnel, force_forward,
             list_hosts, remember_host
         ])
         .run(tauri::generate_context!())

@@ -179,28 +179,58 @@ impl TunnelRegistry {
         }).collect()
     }
 
-    /// Ensure a tunnel exists for (session, remote_port); return the LOCAL port. Reuses a live one.
-    /// `host` is the [user@]host[:sshport] connection string; `base_args` extra ssh opts.
+    /// Ensure a tunnel exists for (session, remote_port); return the LOCAL port. Reuses a live one,
+    /// else opens one on a random free local port.
     pub fn ensure(&self, session_id: &str, host: &str, remote_port: u16, base_args: &[String])
         -> Result<u16, String>
     {
-        let mut map = self.by_session.lock().unwrap();
-        let per = map.entry(session_id.to_string()).or_default();
-
-        // Reuse if the existing tunnel's ssh is still alive.
-        if let Some(t) = per.get_mut(&remote_port) {
-            match t.child.try_wait() {
-                Ok(None) => return Ok(t.local_port),           // still running
-                _ => { let _ = t.child.kill(); per.remove(&remote_port); }  // died -> respawn
+        // Reuse a live tunnel.
+        {
+            let mut map = self.by_session.lock().unwrap();
+            if let Some(per) = map.get_mut(session_id) {
+                if let Some(t) = per.get_mut(&remote_port) {
+                    match t.child.try_wait() {
+                        Ok(None) => return Ok(t.local_port),
+                        _ => { let _ = t.child.kill(); per.remove(&remote_port); }
+                    }
+                }
             }
         }
+        let local_port = free_local_port().map_err(|e| e.to_string())?;
+        self.spawn_tunnel(session_id, host, local_port, remote_port, base_args)
+    }
 
+    /// FORCE a tunnel that binds the LOCAL side to the SAME port number as the remote (so a remote
+    /// localhost:3000 becomes localhost:3000 locally — matches apps that hardcode their port in
+    /// redirects). Errors if that local port is already in use (the UI alerts). Replaces any
+    /// existing tunnel for this remote port.
+    pub fn force_same_port(&self, session_id: &str, host: &str, remote_port: u16, base_args: &[String])
+        -> Result<u16, String>
+    {
+        // Is the local port free? (bind test — the same check ssh would fail on, surfaced early.)
+        if TcpListener::bind(("127.0.0.1", remote_port)).is_err() {
+            return Err(format!("local port {} is already in use", remote_port));
+        }
+        // Drop any existing tunnel for this remote port so we can rebind to the fixed local port.
+        {
+            let mut map = self.by_session.lock().unwrap();
+            if let Some(per) = map.get_mut(session_id) {
+                if let Some(mut t) = per.remove(&remote_port) { let _ = t.child.kill(); }
+            }
+        }
+        self.spawn_tunnel(session_id, host, remote_port, remote_port, base_args)
+    }
+
+    /// Spawn `ssh -L 127.0.0.1:<local>:localhost:<remote>` and record it. `host` is
+    /// [user@]host[:sshport]; `base_args` extra ssh opts.
+    fn spawn_tunnel(&self, session_id: &str, host: &str, local_port: u16, remote_port: u16, base_args: &[String])
+        -> Result<u16, String>
+    {
         let parts = parse_host(host).map_err(|e: ValidationError| e.to_string())?;
         let target = match &parts.user {
             Some(u) => format!("{}@{}", u, parts.host),
             None => parts.host.clone(),
         };
-        let local_port = free_local_port().map_err(|e| e.to_string())?;
 
         let mut args: Vec<String> = Vec::new();
         if let Some(p) = parts.port { args.push("-p".into()); args.push(p.to_string()); }
@@ -226,8 +256,9 @@ impl TunnelRegistry {
             .map_err(|e| format!("ssh -L failed to start: {}", e))?;
 
         crate::dlog!("tunnel: session={} local {} -> remote localhost:{}", session_id, local_port, remote_port);
-        per.insert(remote_port, Tunnel { local_port, remote_port, child });
-        drop(map);
+        self.by_session.lock().unwrap()
+            .entry(session_id.to_string()).or_default()
+            .insert(remote_port, Tunnel { local_port, remote_port, child });
         self.remember(session_id, remote_port);   // persist so it survives restart
         Ok(local_port)
     }
@@ -360,6 +391,17 @@ mod tests {
         // a port with nothing listening -> inactive
         let dead = free_local_port().unwrap();
         assert!(!probe_local_port(dead), "no listener -> inactive");
+    }
+
+    // force_same_port refuses when the local port is already taken (surfaces as the UI alert).
+    #[test]
+    fn force_same_port_errors_when_local_taken() {
+        // hold the port so force_same_port's bind-test fails; no ssh is ever spawned.
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let reg = TunnelRegistry::new();
+        let err = reg.force_same_port("s", "me@h", port, &[]).unwrap_err();
+        assert!(err.contains("already in use"), "reports port-in-use: {}", err);
     }
 
     // persistence: remembered ports survive a reload; status() shows them inactive (no live tunnel).

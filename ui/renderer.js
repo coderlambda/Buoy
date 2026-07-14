@@ -278,8 +278,12 @@ function renderSidebar() {
       const active = !!t.active;
       const localTxt = t.local ? `localhost:${t.local}` : '—';
       const title = active ? `open http://localhost:${t.local}/` : `port ${t.remote} inactive — click to re-open`;
+      // "same" marker when the local port matches the remote (forced same-port mapping).
+      const same = t.local && t.local === t.remote;
       return `<span class="tunnel${active ? '' : ' inactive'}" data-remote="${t.remote}" title="${title}">
-         <span class="tport">:${t.remote}</span><span class="tarrow">→</span><span class="tlocal">${localTxt}</span>
+         <span class="tport">:${t.remote}</span><span class="tarrow">→</span>
+         <span class="tlocal${same ? ' same' : ''}">${localTxt}</span>
+         <span class="tforce" title="force map to the same local port (:${t.remote})">⇄</span>
          <span class="tclose" title="close tunnel">×</span>
        </span>`;
     }).join('');
@@ -297,12 +301,20 @@ function renderSidebar() {
     nameEl.ondblclick = (e) => { e.stopPropagation(); startRename(id, nameEl); };
     li.querySelector('.detach').onclick = (e) => { e.stopPropagation(); detachSession(id); };
     li.querySelector('.kill').onclick = (e) => { e.stopPropagation(); killSession(id); };
-    // tunnel rows: active -> open the local URL; inactive -> re-open the tunnel; × closes/forgets.
+    // tunnel rows: active -> open the local URL; inactive -> re-open; ⇄ force same-port; × close.
     li.querySelectorAll('.tunnel').forEach((el) => {
       const remote = Number(el.getAttribute('data-remote'));
       el.querySelector('.tclose').onclick = (e) => { e.stopPropagation(); api.closeTunnel(id, remote); };
+      // ⇄ force-map to the SAME local port; alert if that local port is already taken.
+      el.querySelector('.tforce').onclick = (e) => {
+        e.stopPropagation();
+        setStatus('mapping port ' + remote + ' -> localhost:' + remote + '…');
+        api.forceForward(id, remote)
+          .then(() => { setStatus('mapped localhost:' + remote); refreshTunnels(id); })
+          .catch((err) => { const m = (err && err.message) || String(err); setStatus('⚠ ' + m); alert('Could not map port ' + remote + ':\n' + m); });
+      };
       el.onclick = (e) => {
-        if (e.target.classList.contains('tclose')) return;
+        if (e.target.classList.contains('tclose') || e.target.classList.contains('tforce')) return;
         e.stopPropagation();
         const t = (v.tunnels || []).find((x) => x.remote === remote);
         if (t && t.active && t.local) {
