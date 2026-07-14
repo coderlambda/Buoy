@@ -8,7 +8,11 @@
     "test": "node --test test/validation.test.js test/backpressure.test.js test/supervisor.test.js test/sessionStore.test.js test/backend.test.js test/remoteBackend.test.js test/env.test.js test/probeTmux.test.js test/controlModeParser.test.js test/plugins.test.js",
     "smoke": "electron test/smoke-headless.js",
     "itest": "node test/integration-control-mode.js",
-    "gui-live": "electron test/gui-live.js"
+    "gui-live": "electron test/gui-live.js",
+    "tauri": "cargo tauri",
+    "tauri:dev": "cargo tauri dev",
+    "tauri:build": "cargo tauri build",
+    "tauri:test": "cd src-tauri && cargo test --lib"
   },
   "license": "MIT",
   "devDependencies": {
