@@ -287,3 +287,47 @@ fn live_sustained_output_survives() {
     eprintln!("LIVE OK: survived sustained output ({} data events)",
         data_count.load(std::sync::atomic::Ordering::Relaxed));
 }
+
+// Resize must reach tmux: after resize(cols,rows), the session's client width should match.
+// Also verifies rapid resizes (a drag) don't wedge or crash the backend.
+#[test]
+#[ignore]
+fn live_resize_reaches_tmux() {
+    let host = match env("DT_LIVE_HOST") { Some(h) => h, None => { eprintln!("SKIP: set DT_LIVE_HOST"); return; } };
+    let tmux = env("DT_TMUX").unwrap_or_else(|| "tmux".into());
+    let session = "rustresize";
+    let socket = durable_terminal_lib::tmux_socket::socket_name("control", Some((3, 7)));
+    let sh = |cmd: &str| -> String {
+        std::process::Command::new("ssh")
+            .args(["-o", "BatchMode=yes", "--", &host, cmd])
+            .output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default()
+    };
+    let kill = || { let _ = sh(&format!("{} -L {} kill-session -t {} 2>/dev/null; true", tmux, socket, session)); };
+    kill();
+
+    let rec = Arc::new(Mutex::new(Recorder::default()));
+    let backend = ControlBackend::spawn(
+        BackendConfig { host: host.clone(), session: session.into(),
+            tmux_path: tmux.clone(), tmux_version: Some((3, 7)), base_args: vec![] },
+        sink(rec.clone()), 80, 24,
+    ).expect("spawn");
+    for _ in 0..40 { if rec.lock().unwrap().ready { break; } sleep_ms(250); }
+    assert!(rec.lock().unwrap().ready, "ready");
+
+    // Simulate a drag: many rapid resizes, ending at 132x40.
+    for w in [100u16, 110, 120, 125, 132] {
+        backend.resize(w, 40);
+        sleep_ms(60);
+    }
+    sleep_ms(1500);
+
+    // tmux reports the window width; the -CC client sizing drives it via refresh-client -C.
+    let width = sh(&format!("{} -L {} display-message -p -t {} '#{{window_width}}'", tmux, socket, session));
+    eprintln!("tmux window_width after resize to 132 = {:?}", width);
+    assert_eq!(width, "132", "tmux window width tracks the resize");
+    assert!(rec.lock().unwrap().ready, "backend healthy after rapid resizes");
+
+    backend.kill();
+    kill();
+    eprintln!("LIVE OK: resize reaches tmux and survives a rapid drag ({} host)", host);
+}

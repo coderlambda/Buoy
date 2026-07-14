@@ -11,6 +11,7 @@ const termHost = document.getElementById('term');
 
 const views = new Map();   // id -> { term, fit, meta, state }
 let activeId = null;
+let _lastSize = { cols: 0, rows: 0 };   // last size sent for the active view (resize debounce)
 
 // --- plugin framework (§13): link matchers turn URLs/paths (and custom patterns) into
 // clickable links. URL + path are built-in plugins; third parties register more via
@@ -164,7 +165,9 @@ function showActiveTab(v) {
   for (const [, t] of v.tabs) { const el = t.content.element && t.content.element(); if (el) el.style.display = (t === tab) ? 'block' : 'none'; }
   requestAnimationFrame(() => {
     const size = tab.content.fit ? tab.content.fit() : null;
-    if (size) api.resize(v.meta.id, size.cols, size.rows);
+    // Always re-assert size on show (a switched-to session/tab must be told its dimensions), and
+    // keep _lastSize in sync so the debounced window-resize handler's change check stays correct.
+    if (size) { api.resize(v.meta.id, size.cols, size.rows); if (v.meta.id === activeId) _lastSize = size; }
     if (tab.content.focus) tab.content.focus();
   });
 }
@@ -421,13 +424,27 @@ api.onInfo(({ id, info, tmuxVersion }) => {
 function byteLength(s) { return new TextEncoder().encode(s).length; }
 
 // --- resize ---
-window.addEventListener('resize', () => {
+// The window 'resize' event fires continuously during a drag (dozens/sec). Each fit()+resize
+// makes tmux repaint the WHOLE screen via refresh-client -C, so firing per-event floods the
+// terminal with full-screen repaints that fight each other (the resize flicker/garble). Debounce:
+// coalesce the burst and send ONE resize once the drag settles. Only tell the backend when the
+// grid size (cols/rows) actually CHANGED — a pixel drag that doesn't cross a cell boundary needs
+// no tmux round-trip.
+let _resizeTimer = null;
+function applyResize() {
   const v = views.get(activeId);
   if (!v) return;
   const tab = activeTab(v);
   if (!tab || !tab.mounted || !tab.content.fit) return;
-  const size = tab.content.fit();
-  if (size) api.resize(activeId, size.cols, size.rows);
+  const size = tab.content.fit();   // fit() also resizes the local xterm grid immediately
+  if (size && (size.cols !== _lastSize.cols || size.rows !== _lastSize.rows)) {
+    _lastSize = size;
+    api.resize(activeId, size.cols, size.rows);
+  }
+}
+window.addEventListener('resize', () => {
+  clearTimeout(_resizeTimer);
+  _resizeTimer = setTimeout(applyResize, 120);   // settle window before the single tmux resize
 });
 
 // --- new session dialog ---
