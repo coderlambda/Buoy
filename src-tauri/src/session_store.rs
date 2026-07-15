@@ -28,6 +28,15 @@ pub struct SessionMeta {
     pub title: Option<String>,
     #[serde(default)]
     pub order: i64,
+    // §20: sidebar/tab customization, all persisted so they survive restart.
+    #[serde(default)]
+    pub color: Option<String>,                    // project accent color (hex like "#89b4fa")
+    #[serde(default)]
+    pub last_tab: Option<String>,                 // last-active tmux window id ("@N")
+    #[serde(default)]
+    pub tab_order: Vec<String>,                   // custom tab order (window ids); missing -> tmux order
+    #[serde(default)]
+    pub tab_colors: std::collections::BTreeMap<String, String>,   // window id -> accent color
 }
 
 fn default_transport() -> String { "ssh".into() }
@@ -130,10 +139,38 @@ mod tests {
             transport: "ssh".into(), mode: "control".into(),
             tmux_path: Some("/t".into()), tmux_version: Some((3, 7)),
             title: Some("x".into()), order: 0,
+            color: None, last_tab: None, tab_order: vec![], tab_colors: Default::default(),
         };
         let json = serde_json::to_string(&m).unwrap();
         assert!(json.contains("\"tmuxPath\""), "must serialize camelCase tmuxPath");
         assert!(json.contains("\"tmuxVersion\""));
         assert!(!json.contains("tmux_path"), "must NOT emit snake_case");
+    }
+
+    // §20: order + customization survive a save/load round-trip, and load is order-sorted.
+    #[test]
+    fn persists_order_and_customization() {
+        let dir = std::env::temp_dir().join(format!("dt-store-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("sessions.json");
+        let store = SessionStore::new(path.clone());
+        let mk = |id: &str, order: i64, color: Option<&str>| SessionMeta {
+            id: id.into(), host: "me@h".into(), session: format!("dt-{id}"),
+            transport: "ssh".into(), mode: "control".into(),
+            tmux_path: None, tmux_version: None, title: Some(id.into()), order,
+            color: color.map(String::from), last_tab: Some("@2".into()),
+            tab_order: vec!["@2".into(), "@0".into()],
+            tab_colors: [("@0".to_string(), "#89b4fa".to_string())].into_iter().collect(),
+        };
+        // save() assigns order by array position; load() returns in that order.
+        store.save(&[mk("a", 0, None), mk("b", 1, Some("#a6e3a1"))]);
+        let loaded = store.load();
+        assert_eq!(loaded.iter().map(|s| s.id.clone()).collect::<Vec<_>>(), vec!["a", "b"]);
+        let b = loaded.iter().find(|s| s.id == "b").unwrap();
+        assert_eq!(b.color.as_deref(), Some("#a6e3a1"));
+        assert_eq!(b.last_tab.as_deref(), Some("@2"));
+        assert_eq!(b.tab_order, vec!["@2".to_string(), "@0".to_string()]);
+        assert_eq!(b.tab_colors.get("@0").map(String::as_str), Some("#89b4fa"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

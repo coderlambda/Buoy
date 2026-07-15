@@ -40,6 +40,12 @@ window.terminalAPI = {
   tabClose: (id, win) => invoke('tab_close', { id, win }),
   tabCapture: (id, win) => invoke('tab_capture', { id, win }),
   tabRename: (id, win, title) => invoke('tab_rename', { id, win, title }),   // manual tab rename (empty -> auto)
+  // §20: sidebar/tab persistence
+  reorderSessions: (ids) => invoke('reorder_sessions', { ids }),             // new project order (ids top->bottom)
+  setSessionColor: (id, color) => invoke('set_session_color', { id, color }),// project accent (null clears)
+  setLastActive: (id) => invoke('set_last_active', { id }),                  // remember last-focused project
+  setLastTab: (id, win) => invoke('set_last_tab', { id, win }),              // remember a project's last tab
+  setTabPrefs: (id, tabOrder, tabColor) => invoke('set_tab_prefs', { id, tabOrder, tabColor }), // tabColor=[win,color|null]
 
   // events main -> renderer
   onData: (cb) => on('session:data', cb),

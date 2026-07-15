@@ -59,6 +59,12 @@ function makeView(meta) {
     el: null,                               // container in #term holding tab elements
     tmuxVersion: meta.tmuxVersion,
     tunnels: [],                            // §18: [{remote, local}] forwarded ports (sidebar list)
+    // §20: persisted customization (from the store via list_sessions).
+    color: meta.color || null,              // project accent color
+    savedTabOrder: Array.isArray(meta.tabOrder) ? meta.tabOrder.slice() : [],  // custom tab order
+    tabColors: meta.tabColors || {},        // winId -> color
+    lastTab: meta.lastTab || null,          // last-active tab (persisted; updated as tabs switch)
+    restoreTab: meta.lastTab || null,       // one-shot: tab to reveal on first connect (see onWindow)
   };
   views.set(meta.id, v);
   // For non-control (plain/local) there are no tmux window events; use a single implicit tab.
@@ -237,6 +243,7 @@ async function mount(id) {
   }
 
   activeId = id;
+  if (v.meta.kind !== 'local') api.setLastActive(id).catch(() => {});   // §20: restore-on-open target
   showActiveTab(v);        // mount + reveal the active tab's content
   renderTabs(v);
   renderSidebar();
@@ -271,6 +278,10 @@ function renderSidebar() {
   for (const [id, v] of views) {
     const li = document.createElement('li');
     li.className = 'session' + (id === activeId ? ' active' : '') + (v.state === 'dead' ? ' dead' : '');
+    li.draggable = true;                       // §20: drag to reorder
+    li.dataset.id = id;
+    if (v.color) li.style.setProperty('--accent-bar', v.color);   // left accent bar (CSS uses it)
+    li.classList.toggle('has-color', !!v.color);
     const sub = v.meta.host ? escapeHtml(v.meta.host) + (v.tmuxVersion ? ` · tmux ${v.tmuxVersion.join('.')}` : '') : (v.meta.kind || 'local');
     // §18: forwarded ports under the project name. Active rows show the local port and open on
     // click; inactive (grey) rows are persisted-but-not-serving — click re-opens the tunnel.
@@ -339,11 +350,92 @@ function renderSidebar() {
       if (nameEl.querySelector('input')) return;   // ignore clicks while editing
       mount(id);
     };
+    // §20: right-click opens the color palette for this project.
+    li.oncontextmenu = (e) => { e.preventDefault(); openColorMenu(e, v.color, (c) => setProjectColor(id, c)); };
+    // §20: drag-to-reorder (project list).
+    wireSidebarDnD(li, id);
     sessionsEl.appendChild(li);
   }
 }
 
+// --- §20: project drag-and-drop reorder -------------------------------------------------------
+let _dragId = null;
+function wireSidebarDnD(li, id) {
+  li.ondragstart = (e) => { _dragId = id; li.classList.add('dragging'); try { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', id); } catch (_) {} };
+  li.ondragend = () => { _dragId = null; li.classList.remove('dragging'); sessionsEl.querySelectorAll('.drop-before,.drop-after').forEach((n) => n.classList.remove('drop-before', 'drop-after')); };
+  li.ondragover = (e) => {
+    if (_dragId == null || _dragId === id) return;
+    e.preventDefault();
+    const r = li.getBoundingClientRect();
+    const after = e.clientY > r.top + r.height / 2;
+    li.classList.toggle('drop-after', after);
+    li.classList.toggle('drop-before', !after);
+  };
+  li.ondragleave = () => li.classList.remove('drop-before', 'drop-after');
+  li.ondrop = (e) => {
+    e.preventDefault();
+    const after = li.classList.contains('drop-after');
+    li.classList.remove('drop-before', 'drop-after');
+    if (_dragId != null && _dragId !== id) reorderProject(_dragId, id, after);
+  };
+}
+
+// Move dragged project to before/after the target, rebuild the views Map in the new order, persist.
+function reorderProject(dragId, targetId, after) {
+  if (!views.has(dragId) || !views.has(targetId)) return;   // a project vanished mid-drag
+  const ids = [...views.keys()].filter((x) => x !== dragId);
+  const at = ids.indexOf(targetId) + (after ? 1 : 0);
+  ids.splice(at, 0, dragId);
+  const reordered = new Map();
+  for (const id of ids) { const v = views.get(id); if (v) reordered.set(id, v); }
+  views.clear();
+  for (const [id, v] of reordered) views.set(id, v);
+  renderSidebar();
+  api.reorderSessions([...views.keys()]).catch(() => {});
+}
+
 function escapeHtml(s) { return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+
+// --- §20: color palette --------------------------------------------------------------------
+// A small fixed palette (Catppuccin-ish accents) + a "none" chip. Reused for projects and tabs.
+const PALETTE = ['#f38ba8', '#fab387', '#f9e2af', '#a6e3a1', '#94e2d5', '#89b4fa', '#cba6f7', '#f5c2e7'];
+function openColorMenu(ev, current, onPick) {
+  closeColorMenu();
+  const menu = document.createElement('div');
+  menu.className = 'color-menu';
+  menu.id = 'color-menu';
+  for (const c of PALETTE) {
+    const sw = document.createElement('button');
+    sw.className = 'color-swatch' + (current === c ? ' sel' : '');
+    sw.style.background = c;
+    sw.title = c;
+    sw.onclick = (e) => { e.stopPropagation(); closeColorMenu(); onPick(c); };
+    menu.appendChild(sw);
+  }
+  const none = document.createElement('button');
+  none.className = 'color-swatch none' + (current ? '' : ' sel');
+  none.textContent = '⌀'; none.title = 'no color';
+  none.onclick = (e) => { e.stopPropagation(); closeColorMenu(); onPick(null); };
+  menu.appendChild(none);
+  document.body.appendChild(menu);
+  // position near the cursor, clamped to the viewport
+  const mw = menu.offsetWidth, mh = menu.offsetHeight;
+  menu.style.left = Math.min(ev.clientX, window.innerWidth - mw - 8) + 'px';
+  menu.style.top = Math.min(ev.clientY, window.innerHeight - mh - 8) + 'px';
+  setTimeout(() => {
+    const off = (e) => { if (!menu.contains(e.target)) { closeColorMenu(); document.removeEventListener('mousedown', off); } };
+    document.addEventListener('mousedown', off);
+  }, 0);
+}
+function closeColorMenu() { const m = document.getElementById('color-menu'); if (m && m.parentNode) m.parentNode.removeChild(m); }
+
+function setProjectColor(id, color) {
+  const v = views.get(id);
+  if (!v) return;
+  v.color = color;
+  renderSidebar();
+  api.setSessionColor(id, color).catch(() => {});
+}
 
 // Remove a project view from the UI (dispose all its tabs). Does NOT touch the remote.
 function removeView(id) {
@@ -526,8 +618,18 @@ api.onWindow(({ id, action, window, name, order }) => {
       v.activeWindow = window;
       if (id === activeId) { showActiveTab(v); lazyCapture(v, window); }
     }
+    // Don't overwrite the saved last-tab from tmux's initial active event while a restore is still
+    // pending — otherwise we'd clobber the tab we're about to restore to.
+    if (!v.restoreTab) rememberLastTab(v, window);
   }
   if (Array.isArray(order)) v.tabOrder = order;      // keep tab strip in tmux's window order
+  // §20: on first connect, reveal the saved last-active tab once it exists (one-shot). Uses a
+  // separate `restoreTab` snapshot so the live `lastTab` updates above don't clobber the target.
+  if (v.restoreTab && v.tabs.has(v.restoreTab)) {
+    const target = v.restoreTab;
+    v.restoreTab = null;
+    if (target !== v.activeWindow) switchTab(v, target);
+  }
   if (id === activeId) renderTabs(v);
 });
 
@@ -538,18 +640,27 @@ function lazyCapture(v, winId) {
   if (tab && !tab.backfilled) { tab.backfilled = true; api.tabCapture(v.meta.id, winId); }
 }
 
+// Compute the tab display order: the user's saved custom order first (§20), then any tabs not in
+// it (new windows) in tmux's window order, then anything else (viewer tabs) in insertion order.
+function tabDisplayOrder(v) {
+  const order = [];
+  for (const w of (v.savedTabOrder || [])) if (v.tabs.has(w) && !order.includes(w)) order.push(w);
+  for (const w of (v.tabOrder || [])) if (v.tabs.has(w) && !order.includes(w)) order.push(w);
+  for (const w of v.tabs.keys()) if (!order.includes(w)) order.push(w);
+  return order;
+}
+
 // Render the tab strip for the active control-mode project (hidden for plain/single).
 function renderTabs(v) {
   if (!v || v.meta.mode !== 'control') { tabsEl.className = ''; tabsEl.innerHTML = ''; return; }
   tabsEl.className = 'on';
   tabsEl.innerHTML = '';
-  // Show tabs in tmux's window order when known, else insertion order.
-  const order = (v.tabOrder || []).filter((w) => v.tabs.has(w));
-  for (const w of v.tabs.keys()) if (!order.includes(w)) order.push(w);
-  for (const wid of order) {
+  for (const wid of tabDisplayOrder(v)) {
     const tab = v.tabs.get(wid);
     const el = document.createElement('div');
     el.className = 'tab' + (wid === v.activeWindow ? ' active' : '');
+    const color = v.tabColors[wid];
+    if (color) { el.style.setProperty('--tab-color', color); el.classList.add('has-color'); }
     el.innerHTML = `<span class="tlabel" title="double-click to rename">${escapeHtml(tab.title || wid)}</span><span class="tclose" title="close">×</span>`;
     const label = el.querySelector('.tlabel');
     label.onclick = () => switchTab(v, wid);
@@ -557,6 +668,9 @@ function renderTabs(v) {
     // automatic-rename for that window); clearing it re-enables auto-rename.
     if (isWindowTab(wid)) label.ondblclick = (e) => { e.stopPropagation(); startTabRename(v, wid, label); };
     el.querySelector('.tclose').onclick = (e) => { e.stopPropagation(); closeTab(v, wid); };
+    // §20: right-click a tab -> color palette; drag to reorder within the strip.
+    el.oncontextmenu = (e) => { e.preventDefault(); openColorMenu(e, v.tabColors[wid], (c) => setTabColor(v, wid, c)); };
+    wireTabDnD(el, v, wid);
     tabsEl.appendChild(el);
   }
   // '+' new session in this project
@@ -566,15 +680,63 @@ function renderTabs(v) {
   tabsEl.appendChild(plus);
 }
 
+function setTabColor(v, wid, color) {
+  if (color) v.tabColors[wid] = color; else delete v.tabColors[wid];
+  renderTabs(v);
+  api.setTabPrefs(v.meta.id, null, [wid, color || null]).catch(() => {});
+}
+
+// §20: tab drag-and-drop reorder (horizontal). Persists the custom order for this project.
+let _dragTab = null;
+function wireTabDnD(el, v, wid) {
+  el.draggable = true;
+  el.ondragstart = (e) => { _dragTab = wid; el.classList.add('dragging'); try { e.dataTransfer.effectAllowed = 'move'; } catch (_) {} };
+  el.ondragend = () => { _dragTab = null; el.classList.remove('dragging'); tabsEl.querySelectorAll('.drop-before,.drop-after').forEach((n) => n.classList.remove('drop-before', 'drop-after')); };
+  el.ondragover = (e) => {
+    if (_dragTab == null || _dragTab === wid) return;
+    e.preventDefault();
+    const r = el.getBoundingClientRect();
+    const after = e.clientX > r.left + r.width / 2;
+    el.classList.toggle('drop-after', after);
+    el.classList.toggle('drop-before', !after);
+  };
+  el.ondragleave = () => el.classList.remove('drop-before', 'drop-after');
+  el.ondrop = (e) => {
+    e.preventDefault();
+    const after = el.classList.contains('drop-after');
+    el.classList.remove('drop-before', 'drop-after');
+    if (_dragTab != null && _dragTab !== wid) reorderTab(v, _dragTab, wid, after);
+  };
+}
+
+function reorderTab(v, dragWid, targetWid, after) {
+  const order = tabDisplayOrder(v).filter((w) => w !== dragWid);
+  const at = order.indexOf(targetWid) + (after ? 1 : 0);
+  order.splice(at, 0, dragWid);
+  // Persist + track only real tmux-window ids (viewer tabs are app-local, never restored), so the
+  // in-memory savedTabOrder can't diverge from what's stored.
+  const windowOrder = order.filter(isWindowTab);
+  v.savedTabOrder = windowOrder;
+  renderTabs(v);
+  api.setTabPrefs(v.meta.id, windowOrder, null).catch(() => {});
+}
+
 // Switch the active tab. For a tmux window, tell tmux to select it (its reconcile echoes an
 // 'active' event; we reveal now for responsiveness). A viewer tab is app-local — reveal it WITHOUT
 // any tmux command.
 function switchTab(v, winId) {
   if (v.activeWindow === winId) return;
   v.activeWindow = winId;
-  if (isWindowTab(winId)) { api.tabSelect(v.meta.id, winId); lazyCapture(v, winId); }
+  if (isWindowTab(winId)) { api.tabSelect(v.meta.id, winId); lazyCapture(v, winId); rememberLastTab(v, winId); }
   showActiveTab(v);
   renderTabs(v);
+}
+
+// §20: persist a project's last-active tab so it's restored when the project is reopened.
+function rememberLastTab(v, winId) {
+  if (!isWindowTab(winId) || v.lastTab === winId) return;
+  v.lastTab = winId;
+  api.setLastTab(v.meta.id, winId).catch(() => {});
 }
 
 // Close a tab. Terminal tabs -> tmux kill-window (backend removes it, emits close). Viewer tabs
@@ -726,12 +888,17 @@ document.getElementById('form').addEventListener('submit', async (e) => {
 
 // --- restore persisted sessions on launch (lazy: create views, connect on click) ---
 (async function init() {
-  // §18: load the loopback host set (for URL classification) before wiring links.
-  try { const cfg = await api.getConfig(); if (cfg && Array.isArray(cfg.loopbackHosts)) loopbackHosts = cfg.loopbackHosts; } catch (_) {}
+  // §18/§20: load config (loopback hosts + last-active project) before wiring.
+  let lastActive = null;
+  try {
+    const cfg = await api.getConfig();
+    if (cfg && Array.isArray(cfg.loopbackHosts)) loopbackHosts = cfg.loopbackHosts;
+    if (cfg && cfg.lastActive) lastActive = cfg.lastActive;
+  } catch (_) {}
   const persisted = await api.listSessions();
-  dbg('init: ' + persisted.length + ' persisted; first=' + JSON.stringify(persisted[0] || null));
+  dbg('init: ' + persisted.length + ' persisted; lastActive=' + lastActive);
   for (const meta of persisted) {
-    // meta already has {id, host, session, transport, title} from the store.
+    // meta already has {id, host, session, transport, title, color, lastTab, tabOrder, tabColors}.
     const v = makeView({ ...meta, kind: 'remote' });
     v.started = false;   // not connected yet; mount() will start (reattach) on click
   }
@@ -740,8 +907,12 @@ document.getElementById('form').addEventListener('submit', async (e) => {
   // re-opened), so the list survives an app restart without waiting for a connect.
   for (const meta of persisted) refreshTunnels(meta.id);
   setStatus(persisted.length ? `${persisted.length} session(s) restored — click to reconnect` : 'no sessions — create one');
-  // Auto-reconnect the first restored session so reopening the app "just works".
-  if (persisted.length) mount(persisted[0].id);
+  // §20: reopen the LAST-USED project (fall back to the first) so the app resumes where you left off.
+  // The project restores its own last-active tab once its windows arrive (see onWindow).
+  if (persisted.length) {
+    const target = (lastActive && views.has(lastActive)) ? lastActive : persisted[0].id;
+    mount(target);
+  }
 })();
 
 // §18: periodically re-probe the active session's tunnels so a stopped dev server goes grey (and

@@ -89,24 +89,49 @@ struct AppState {
     store: SessionStore,
     tunnels: tunnel::TunnelRegistry,
     hosts: host_history::HostHistory,
-    config: AppConfig,
+    config: Mutex<AppConfig>,
 }
 
 // Small app config loaded from config.json in the app data dir (§18). No settings UI yet.
-#[derive(Clone, serde::Deserialize)]
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct AppConfig {
     #[serde(default = "default_loopback_hosts")]
     loopback_hosts: Vec<String>,
+    // §20: last-active project id, restored + focused on next app open.
+    #[serde(default)]
+    last_active: Option<String>,
 }
 fn default_loopback_hosts() -> Vec<String> { vec!["localhost".into(), "127.0.0.1".into()] }
 impl Default for AppConfig {
-    fn default() -> Self { AppConfig { loopback_hosts: default_loopback_hosts() } }
+    fn default() -> Self { AppConfig { loopback_hosts: default_loopback_hosts(), last_active: None } }
 }
 fn load_config() -> AppConfig {
     let path = user_data_dir().join("config.json");
     std::fs::read_to_string(&path).ok()
         .and_then(|s| serde_json::from_str::<AppConfig>(&s).ok())
         .unwrap_or_default()
+}
+fn save_config(cfg: &AppConfig) {
+    let dir = user_data_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(json) = serde_json::to_string_pretty(cfg) {
+        let path = dir.join("config.json");
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, json).is_ok() { let _ = std::fs::rename(&tmp, &path); }
+    }
+}
+
+// §20: validate a user-supplied accent color: "#" + 3/6 hex digits, else None (clears it).
+fn sanitize_color(c: Option<&str>) -> Option<String> {
+    let c = c?.trim();
+    if c.is_empty() { return None; }
+    let hex = c.strip_prefix('#')?;
+    if (hex.len() == 3 || hex.len() == 6) && hex.chars().all(|d| d.is_ascii_hexdigit()) {
+        Some(format!("#{}", hex.to_lowercase()))
+    } else {
+        None
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -231,15 +256,28 @@ fn create_session(app: AppHandle, state: State<AppState>, meta: CreateArgs) -> R
         tmux_version,
         title: meta.title.clone().or_else(|| Some(meta.host.clone())),
         order: 0,
+        color: None, last_tab: None, tab_order: vec![], tab_colors: Default::default(),
     };
 
-    // Persist (dedupe by id).
+    // Persist (dedupe by id). Reconnecting an EXISTING session must NOT move it — preserve its
+    // stored order + user customizations (color/tab prefs) so the sidebar order is stable across
+    // restarts and click-to-reconnect. Only a genuinely new session is appended at the end.
     if meta.kind.as_deref() != Some("local") {
         let mut list = state.store.load();
-        list.retain(|s| s.id != id);
         let mut m = session_meta.clone();
-        m.order = list.len() as i64;
+        if let Some(existing) = list.iter().find(|s| s.id == id) {
+            m.order = existing.order;
+            m.color = existing.color.clone();
+            m.last_tab = existing.last_tab.clone();
+            m.tab_order = existing.tab_order.clone();
+            m.tab_colors = existing.tab_colors.clone();
+            if m.title.is_none() { m.title = existing.title.clone(); }
+        } else {
+            m.order = list.iter().map(|s| s.order).max().map_or(0, |mx| mx + 1);
+        }
+        list.retain(|s| s.id != id);
         list.push(m);
+        list.sort_by_key(|s| s.order);
         state.store.save(&list);
     }
 
@@ -365,6 +403,65 @@ fn session_rename(state: State<AppState>, id: String, title: String) -> serde_js
     json!({ "ok": true, "title": clean })
 }
 
+// §20: persist a new project ORDER (array of session ids, top-to-bottom). Reorders the store
+// to match; unknown ids are ignored, missing ones keep their relative order at the end.
+#[tauri::command]
+fn reorder_sessions(state: State<AppState>, ids: Vec<String>) {
+    let mut list = state.store.load();
+    let rank: std::collections::HashMap<&String, usize> =
+        ids.iter().enumerate().map(|(i, id)| (id, i)).collect();
+    // stable sort: known ids by their new rank, unknown ids after (keeping prior order).
+    list.sort_by_key(|s| rank.get(&s.id).copied().unwrap_or(usize::MAX));
+    // save() reassigns .order by index, so the array position IS the persisted order.
+    state.store.save(&list);
+}
+
+// §20: set (or clear, when color is empty) a project's accent color.
+#[tauri::command]
+fn set_session_color(state: State<AppState>, id: String, color: Option<String>) {
+    let clean = sanitize_color(color.as_deref());
+    let mut list = state.store.load();
+    if let Some(e) = list.iter_mut().find(|s| s.id == id) {
+        e.color = clean;
+        state.store.save(&list);
+    }
+}
+
+// §20: remember which project was last active (restored + focused on next app open).
+#[tauri::command]
+fn set_last_active(state: State<AppState>, id: String) {
+    let mut cfg = state.config.lock().unwrap();
+    cfg.last_active = Some(id);
+    save_config(&cfg);
+}
+
+// §20: remember a project's last-active tab (tmux window id), restored when it's reopened.
+#[tauri::command]
+fn set_last_tab(state: State<AppState>, id: String, win: String) {
+    let mut list = state.store.load();
+    if let Some(e) = list.iter_mut().find(|s| s.id == id) {
+        e.last_tab = Some(win);
+        state.store.save(&list);
+    }
+}
+
+// §20: persist a project's tab order and/or a single tab's color.
+#[tauri::command]
+fn set_tab_prefs(state: State<AppState>, id: String, tab_order: Option<Vec<String>>,
+                 tab_color: Option<(String, Option<String>)>) {
+    let mut list = state.store.load();
+    if let Some(e) = list.iter_mut().find(|s| s.id == id) {
+        if let Some(order) = tab_order { e.tab_order = order; }
+        if let Some((win, color)) = tab_color {
+            match sanitize_color(color.as_deref()) {
+                Some(c) => { e.tab_colors.insert(win, c); }
+                None => { e.tab_colors.remove(&win); }
+            }
+        }
+        state.store.save(&list);
+    }
+}
+
 // Project tab ops (control mode only; no-op on plain).
 #[tauri::command]
 fn tab_new(state: State<AppState>, id: String) {
@@ -472,7 +569,8 @@ fn open_external(app: AppHandle, url: String) -> serde_json::Value {
 // Expose config to the renderer (loopback host set for URL classification, §18).
 #[tauri::command]
 fn get_config(state: State<AppState>) -> serde_json::Value {
-    json!({ "loopbackHosts": state.config.loopback_hosts })
+    let cfg = state.config.lock().unwrap();
+    json!({ "loopbackHosts": cfg.loopback_hosts, "lastActive": cfg.last_active })
 }
 
 // Host history for the new-session dialog dropdown (most-recent-first).
@@ -492,7 +590,8 @@ fn remember_host(state: State<AppState>, host: String) {
 fn open_forwarded_url(app: AppHandle, state: State<AppState>, id: String, url: String)
     -> Result<serde_json::Value, String>
 {
-    let (_, lb) = tunnel::classify_loopback(&url, &state.config.loopback_hosts)
+    let loopback_hosts = state.config.lock().unwrap().loopback_hosts.clone();
+    let (_, lb) = tunnel::classify_loopback(&url, &loopback_hosts)
         .ok_or_else(|| "not a loopback URL".to_string())?;
     // Connection params from the VALIDATED store (never the renderer).
     let meta = {
@@ -566,11 +665,12 @@ pub fn run() {
             sessions: Mutex::new(HashMap::new()), store,
             tunnels: tunnel::TunnelRegistry::with_store(user_data_dir().join("tunnels.json")),
             hosts: host_history::HostHistory::load(user_data_dir().join("hosts.json")),
-            config,
+            config: Mutex::new(config),
         })
         .invoke_handler(tauri::generate_handler![
             list_sessions, create_session, session_input, session_resize,
             session_close, session_kill, session_rename,
+            reorder_sessions, set_session_color, set_last_active, set_last_tab, set_tab_prefs,
             tab_new, tab_select, tab_close, tab_capture, tab_rename, open_external, ui_log,
             read_remote_file, save_file, session_retry,
             open_forwarded_url, get_config, list_tunnels, close_tunnel, force_forward,
