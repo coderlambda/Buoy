@@ -380,7 +380,14 @@ impl Inner {
         // Emit any buffered output first so window add/active can't be reordered ahead of it.
         g.flush_output();
         for win in &diff.added {
+            // A newly-added window already has a name in tmux (auto-derived or a manual rename that
+            // persisted server-side). `added` alone carries only the id, so emit its name too —
+            // otherwise a reconnect/app-reopen shows the tab as "@N" instead of its real title.
+            let name = g.reg.name_of(win).filter(|n| n != win);
             g.emit(BackendEvent::WindowAdd { window: win.clone(), order: order.clone() });
+            if let Some(name) = name {
+                g.emit(BackendEvent::WindowRename { window: win.clone(), name: latin1_to_utf8(&name) });
+            }
         }
         for (win, name) in &diff.renamed {
             g.emit(BackendEvent::WindowRename { window: win.clone(), name: latin1_to_utf8(name) });

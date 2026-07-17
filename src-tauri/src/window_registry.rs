@@ -61,6 +61,11 @@ impl WindowRegistry {
         self.order.clone()
     }
 
+    /// The current name of a window (as reconciled from tmux), if known.
+    pub fn name_of(&self, win: &str) -> Option<String> {
+        self.windows.get(win).map(|w| w.name.clone())
+    }
+
     /// Reconcile against the authoritative listing rows; return the diff of what changed.
     pub fn reconcile(&mut self, rows: &[PaneRow]) -> Diff {
         let prev_wins: BTreeSet<String> = self.windows.keys().cloned().collect();
@@ -174,6 +179,19 @@ mod tests {
         let mut panes = d.newly_mapped_panes.clone();
         panes.sort();
         assert_eq!(panes, vec!["%0", "%1"]);
+    }
+
+    #[test]
+    fn tc_wr_name_of_after_add() {
+        // A window's name must be queryable right after it's added, so the backend can emit the
+        // real title (not just "@N") for windows discovered on a reconnect/app-reopen.
+        let mut r = WindowRegistry::new();
+        r.reconcile(&[row("@0", "%0", true, true, "MyTab")]);
+        assert_eq!(r.name_of("@0").as_deref(), Some("MyTab"));
+        assert_eq!(r.name_of("@9"), None);
+        // an empty tmux name falls back to the window id (never blank)
+        r.reconcile(&[row("@0", "%0", true, true, ""), row("@1", "%1", false, false, "")]);
+        assert_eq!(r.name_of("@1").as_deref(), Some("@1"));
     }
 
     #[test]
