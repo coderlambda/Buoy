@@ -201,7 +201,14 @@ pub fn build_ssh_args(
     args.extend(base_args.iter().cloned());
     args.push("--".into());
     args.push(host_token(&parts));
+    // Force a UTF-8 locale for the remote tmux. Many dev hosts log in with LANG unset / LC_CTYPE=C,
+    // and tmux only enables UTF-8 when its OWN process locale is UTF-8 — otherwise it replaces every
+    // non-ASCII byte with '_' EVERYWHERE it stores text (pane titles, window names, options). That
+    // turned agent tab titles like "✳ task" into "_ task". `env LC_ALL=C.UTF-8` sets it for the
+    // server fork; it only affects NEWLY-created servers (existing ones must be recreated).
     args.extend([
+        "env".into(),
+        "LC_ALL=C.UTF-8".into(),
         tmux_path.to_string(),
         "-L".into(),
         socket.to_string(),
@@ -223,10 +230,11 @@ pub fn build_control_mode_ssh_args(
     socket: &str,
 ) -> Result<Vec<String>> {
     let mut args = build_ssh_args(raw_host, raw_session, base_args, tmux_path, socket)?;
-    // args = [... "--", host, tmux, "-L", sock, "new-session", "-A", "-s", name]
-    if let Some(dd) = args.iter().position(|a| a == "--") {
-        // dd+1 host, dd+2 tmux binary -> insert -CC after the binary
-        args.insert(dd + 3, "-CC".into());
+    // args = [... "--", host, env, LC_ALL=…, tmux, "-L", sock, "new-session", "-A", "-s", name].
+    // -CC goes right after the tmux binary (i.e. immediately before its "-L" flag), independent of
+    // any env-prefix tokens before the binary.
+    if let Some(l) = args.iter().position(|a| a == "-L") {
+        args.insert(l, "-CC".into());
     }
     if let Some(ns) = args.iter().position(|a| a == "new-session") {
         args.insert(ns + 1, "-D".into());
@@ -357,8 +365,10 @@ mod tests {
     fn tc_v_build_ssh_args() {
         let a = build_ssh_args("me@h", "dev", &[], ".local/bin/tmux", "dtapp3-7").unwrap();
         let dd = a.iter().position(|x| x == "--").unwrap();
+        // remote command is prefixed with `env LC_ALL=C.UTF-8` so the tmux server is UTF-8.
         assert_eq!(&a[dd + 1..], &[
-            "me@h", ".local/bin/tmux", "-L", "dtapp3-7", "new-session", "-A", "-s", "dev"
+            "me@h", "env", "LC_ALL=C.UTF-8", ".local/bin/tmux", "-L", "dtapp3-7",
+            "new-session", "-A", "-s", "dev"
         ]);
         assert!(build_ssh_args("me@h", "a;b", &[], "tmux", "s").is_err());
     }
@@ -367,9 +377,9 @@ mod tests {
     fn tc_v_build_control_mode_args() {
         let a = build_control_mode_ssh_args("me@h", "dev", &[], "/t", "dtcc3-7").unwrap();
         let dd = a.iter().position(|x| x == "--").unwrap();
-        // -CC right after the tmux binary
-        assert_eq!(a[dd + 2], "/t");
-        assert_eq!(a[dd + 3], "-CC");
+        // env-prefixed, tmux binary, then -CC right before its -L flag.
+        assert_eq!(&a[dd + 1..dd + 6], &["me@h", "env", "LC_ALL=C.UTF-8", "/t", "-CC"]);
+        assert_eq!(a[dd + 6], "-L");
         // new-session -D -A -s dev
         let tail: Vec<&str> = a.iter().rev().take(5).rev().map(|s| s.as_str()).collect();
         assert_eq!(tail, ["new-session", "-D", "-A", "-s", "dev"]);
