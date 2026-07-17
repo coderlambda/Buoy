@@ -63,7 +63,8 @@ function renderMarkdown(md) {
   const out = [];
   let inCode = false, inUl = false;
   const closeUl = () => { if (inUl) { out.push('</ul>'); inUl = false; } };
-  for (const raw of lines) {
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
     if (/^```/.test(raw)) {
       if (inCode) { out.push('</code></pre>'); inCode = false; }
       else { closeUl(); out.push('<pre class="mdcode"><code>'); inCode = true; }
@@ -72,6 +73,22 @@ function renderMarkdown(md) {
     if (inCode) { out.push(escapeHtml(raw) + '\n'); continue; }
     const h = /^(#{1,6})\s+(.*)$/.exec(raw);
     if (h) { closeUl(); out.push(`<h${h[1].length}>${inline(h[2])}</h${h[1].length}>`); continue; }
+    // GFM table: a header row followed by a |---|:--:|--- separator row, then body rows.
+    if (isTableRow(raw) && i + 1 < lines.length && isTableSeparator(lines[i + 1])) {
+      closeUl();
+      const aligns = parseAligns(lines[i + 1]);
+      out.push(`<table class="mdtable"><thead><tr>${
+        splitRow(raw).map((cell, j) => `<th${alignAttr(aligns[j])}>${inline(cell)}</th>`).join('')
+      }</tr></thead><tbody>`);
+      i += 2;   // consumed header + separator
+      while (i < lines.length && isTableRow(lines[i])) {
+        out.push(`<tr>${splitRow(lines[i]).map((cell, j) => `<td${alignAttr(aligns[j])}>${inline(cell)}</td>`).join('')}</tr>`);
+        i++;
+      }
+      i--;      // for-loop will ++ back to the first non-row line
+      out.push('</tbody></table>');
+      continue;
+    }
     const li = /^\s*[-*]\s+(.*)$/.exec(raw);
     if (li) { if (!inUl) { out.push('<ul>'); inUl = true; } out.push(`<li>${inline(li[1])}</li>`); continue; }
     if (raw.trim() === '') { closeUl(); continue; }
@@ -81,6 +98,37 @@ function renderMarkdown(md) {
   if (inCode) out.push('</code></pre>');
   closeUl();
   return out.join('\n');
+
+  // A table row has at least one unescaped '|' and isn't a code/heading line.
+  function isTableRow(s) { return /\|/.test(s) && s.trim() !== ''; }
+  // Separator: cells of only -, :, spaces, with at least one '-' per cell, e.g. |---|:--:|--:|
+  function isTableSeparator(s) {
+    if (!/\|/.test(s)) return false;
+    const cells = splitRow(s);
+    return cells.length > 0 && cells.every((c) => /^:?-+:?$/.test(c.trim()));
+  }
+  // Split "| a | b |" -> ["a","b"], tolerating optional leading/trailing pipes. A backslash-escaped
+  // \| is kept as a literal pipe inside a cell (not a delimiter).
+  function splitRow(s) {
+    let t = s.trim().replace(/^\|/, '').replace(/\|$/, '');
+    const cells = [];
+    let cur = '';
+    for (let k = 0; k < t.length; k++) {
+      if (t[k] === '\\' && t[k + 1] === '|') { cur += '|'; k++; }
+      else if (t[k] === '|') { cells.push(cur.trim()); cur = ''; }
+      else cur += t[k];
+    }
+    cells.push(cur.trim());
+    return cells;
+  }
+  function parseAligns(sep) {
+    return splitRow(sep).map((c) => {
+      const t = c.trim();
+      const l = t.startsWith(':'), r = t.endsWith(':');
+      return r && l ? 'center' : r ? 'right' : l ? 'left' : '';
+    });
+  }
+  function alignAttr(a) { return a ? ` style="text-align:${a}"` : ''; }
 
   // inline spans: escape THEN apply a small set of patterns on the escaped text.
   function inline(s) {

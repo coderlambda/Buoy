@@ -63,3 +63,20 @@ test('TC-FV6 markdown links use data-url and safe schemes', () => {
   const bad = renderMarkdown('[x](javascript:alert(1))');
   assert.ok(!/mdlink/.test(bad), 'javascript: not linkified');
 });
+
+// TC-FV7 GFM tables: header + separator + rows, alignment, escaping, and non-tables left alone
+test('TC-FV7 markdown tables', () => {
+  const html = renderMarkdown('| Name | Qty |\n|:-----|----:|\n| Apple | 3 |\n| Pear | 12 |');
+  assert.match(html, /<table class="mdtable">/, 'table element');
+  assert.match(html, /<th style="text-align:left">Name<\/th>/, 'left-aligned header');
+  assert.match(html, /<th style="text-align:right">Qty<\/th>/, 'right-aligned header');
+  assert.match(html, /<td style="text-align:right">12<\/td>/, 'aligned body cell');
+  assert.ok(html.includes('<tbody>') && html.includes('</tbody>'), 'has tbody');
+  // cell content still runs through inline (and is escaped)
+  const esc = renderMarkdown('| a | b |\n|---|---|\n| <x> | **bold** |');
+  assert.ok(esc.includes('&lt;x&gt;'), 'cell content escaped');
+  assert.ok(esc.includes('<strong>bold</strong>'), 'inline markdown inside cells');
+  // a lone pipe line WITHOUT a separator row is NOT a table (stays a paragraph)
+  const notTable = renderMarkdown('a | b | c');
+  assert.ok(!/mdtable/.test(notTable), 'no separator -> not a table');
+});
