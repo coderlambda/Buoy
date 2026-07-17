@@ -100,6 +100,28 @@ test('TC-PL4d shift-click opens the chooser', () => {
   assert.equal(forwarded, null, 'shift does not auto-forward');
 });
 
+// TC-PL4e §21: the OSC 8 hyperlink handler uses the SAME openUrlSmart as the regex 'url' plugin,
+// so an embedded-URI link routes identically (loopback -> tunnel; else scheme-checked external;
+// unsafe scheme refused).
+test('TC-PL4e OSC 8 handler routes via openUrlSmart', () => {
+  const { openUrlSmart } = require('../ui/builtinPlugins');
+  let forwarded = null, external = null, status = null;
+  const ctx = {
+    isLoopback: (u) => /^(?:https?:\/\/)?(localhost|127\.0\.0\.1):\d+/.test(u),
+    openForwardedUrl: (u) => { forwarded = u; },
+    openExternal: (u) => { external = u; },
+    setStatus: (m) => { status = m; },
+  };
+  openUrlSmart('http://localhost:8080/', ctx, {});
+  assert.equal(forwarded, 'http://localhost:8080/', 'loopback OSC8 -> tunnel');
+  openUrlSmart('https://example.com', ctx, {});
+  assert.equal(external, 'https://example.com', 'plain OSC8 -> external');
+  external = null;
+  openUrlSmart('javascript:alert(1)', ctx, {});   // unsafe scheme
+  assert.equal(external, null, 'unsafe scheme not opened');
+  assert.match(status, /refused/, 'unsafe scheme refused with status');
+});
+
 // TC-PL5 custom plugin registers and matches; unregister works
 test('TC-PL5 custom plugin + unregister', () => {
   const r = new PluginRegistry();

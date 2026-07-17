@@ -5,16 +5,20 @@
 // onData/resize. This module is the reference implementation of the TabContent interface.
 /* global Terminal, FitAddon */
 
-// spec: { id, meta, linkProvider }  ctx: { input(bytes), ack(id,bytes), onReady?, ... }
+// spec: { id, meta, linkProvider, linkHandler }  ctx: { input(bytes), ack(id,bytes), onReady?, ... }
 // Returns a TabContent: { kind, mount(el), onData(d), resize(c,r), focus(), dispose(),
 //                         readBuffer() (test hook), term (raw xterm) }.
 function createTerminalTab(spec, ctx) {
   const term = new Terminal({
     fontFamily: 'Menlo, Consolas, monospace', fontSize: 13,
     theme: { background: '#1e1e2e', foreground: '#cdd6f4' }, scrollback: 5000,
+    // §21: handle OSC 8 hyperlinks (embedded-URI links). Without this xterm renders them
+    // underlined but the click is a no-op in the Tauri webview.
+    linkHandler: spec.linkHandler || undefined,
   });
   const fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
+  // §13 regex-based URL/path links (our plugin engine).
   if (spec.linkProvider) term.registerLinkProvider(spec.linkProvider);
 
   let mounted = false;

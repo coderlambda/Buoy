@@ -32,31 +32,27 @@ const PATH_RE = new RegExp(`${SLASH_PATH}|${REL_SLASH}|${BARE_WITH_EXT}|${KNOWN_
 
 // Build the two default plugins. Handlers are thin — they call into ctx, which the host
 // (renderer) supplies with openExternal / copyText / setStatus / meta.
+// Smart URL open, shared by the regex 'url' link plugin AND the OSC 8 hyperlink handler (§21) so
+// both behave identically. mods = { shift, meta, alt } (§18): plain = smart (loopback -> ssh -L
+// tunnel + local browser; else default browser); Shift(+Cmd) = chooser (where to open). Terminal
+// text is untrusted, so only safe schemes are opened.
+function openUrlSmart(text, ctx, mods) {
+  if (mods && mods.shift && ctx.chooseOpen) { ctx.chooseOpen(text); return; }
+  if (ctx.isLoopback && ctx.isLoopback(text) && ctx.openForwardedUrl) { ctx.openForwardedUrl(text); return; }
+  let url = text;
+  if (/^www\./i.test(url)) url = 'https://' + url;
+  if (!/^(https?|ftp|file):\/\//i.test(url)) { ctx.setStatus('refused to open: ' + text); return; }
+  ctx.openExternal(url);
+  ctx.setStatus('opened ' + url);
+}
+
 function builtinLinkPlugins() {
   return [
     {
       name: 'url',
       priority: 10,   // URLs win over paths when they'd overlap (e.g. file:///a/b)
       regex: URL_RE,
-      // mods = { shift, meta, alt } (§18). Plain click = smart: loopback -> ssh -L tunnel + local
-      // browser; other -> default browser. Shift(+Cmd) click -> chooser (where to open).
-      onClick(text, ctx, mods) {
-        if (mods && mods.shift) { if (ctx.chooseOpen) { ctx.chooseOpen(text); return; } }
-
-        // Loopback URL (localhost:PORT / 127.0.0.1:PORT) -> forward through the session and open
-        // the LOCAL tunnel URL. The host reaches the remote's loopback; the browser can't directly.
-        if (ctx.isLoopback && ctx.isLoopback(text) && ctx.openForwardedUrl) {
-          ctx.openForwardedUrl(text);
-          return;
-        }
-
-        let url = text;
-        if (/^www\./i.test(url)) url = 'https://' + url;
-        // Only open safe schemes (terminal text is untrusted).
-        if (!/^(https?|ftp|file):\/\//i.test(url)) { ctx.setStatus('refused to open: ' + text); return; }
-        ctx.openExternal(url);
-        ctx.setStatus('opened ' + url);
-      },
+      onClick(text, ctx, mods) { openUrlSmart(text, ctx, mods); },
     },
     {
       name: 'path',
@@ -76,5 +72,5 @@ function builtinLinkPlugins() {
 }
 
 // UMD-lite: CommonJS for tests, global for the sandboxed renderer (<script> tag).
-if (typeof module !== 'undefined' && module.exports) module.exports = { builtinLinkPlugins, URL_RE, PATH_RE, KNOWN_NAMES };
-if (typeof window !== 'undefined') window.DTBuiltinPlugins = { builtinLinkPlugins, URL_RE, PATH_RE, KNOWN_NAMES };
+if (typeof module !== 'undefined' && module.exports) module.exports = { builtinLinkPlugins, openUrlSmart, URL_RE, PATH_RE, KNOWN_NAMES };
+if (typeof window !== 'undefined') window.DTBuiltinPlugins = { builtinLinkPlugins, openUrlSmart, URL_RE, PATH_RE, KNOWN_NAMES };

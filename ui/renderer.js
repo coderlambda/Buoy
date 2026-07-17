@@ -77,14 +77,14 @@ function makeView(meta) {
 // Create (once) a tab for a window id, backed by a 'terminal' TabContent via the registry.
 function ensureTab(v, winId) {
   if (v.tabs.has(winId)) return v.tabs.get(winId);
-  const linkProvider = makeLinkProvider(() => tab.content.term, v.meta);
+  const { provider: linkProvider, linkHandler } = makeLinkProvider(() => tab.content.term, v.meta);
   const ctx = {
     // Always forward: the backend owns input gating (buffers until ready, then replays in order)
     // and addresses keystrokes to the active window. The renderer no longer buffers input itself.
     input: (data) => api.input(v.meta.id, data),
     ack: (bytes) => api.ack(v.meta.id, bytes),
   };
-  const content = registry.createTabContent('terminal', { id: v.meta.id, meta: v.meta, linkProvider }, ctx);
+  const content = registry.createTabContent('terminal', { id: v.meta.id, meta: v.meta, linkProvider, linkHandler }, ctx);
   const tab = { winId, title: winId, content, mounted: false };
   v.tabs.set(winId, tab);
   return tab;
@@ -185,7 +185,7 @@ function makeLinkProvider(getTerm, meta) {
     // §18: Shift+Cmd chooser — where to open a URL.
     chooseOpen: (url) => chooseOpen(meta.id, url),
   };
-  return {
+  const provider = {
     provideLinks(lineNumber, callback) {
       const term = getTerm();
       if (!term) { callback(undefined); return; }
@@ -211,6 +211,17 @@ function makeLinkProvider(getTerm, meta) {
       callback(links);
     },
   };
+  // §21: OSC 8 hyperlinks (`\e]8;;URI\e\\text\e]8;;\e\\`) are underlined natively by xterm, but the
+  // click does NOTHING unless a linkHandler is set (default is null -> a blocked window.open in the
+  // Tauri webview). Route the embedded URI through the SAME smart open as regex URL links (shared
+  // openUrlSmart): loopback -> ssh -L tunnel; else scheme-checked openExternal; shift-click chooser.
+  const linkHandler = {
+    activate(event, uri) {
+      const mods = { shift: !!(event && event.shiftKey), meta: !!(event && (event.metaKey || event.ctrlKey)), alt: !!(event && event.altKey) };
+      DTBuiltinPlugins.openUrlSmart(uri, ctx, mods);
+    },
+  };
+  return { provider, linkHandler };
 }
 
 async function mount(id) {
