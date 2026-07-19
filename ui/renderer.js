@@ -9,6 +9,53 @@ const sessionsEl = document.getElementById('sessions');
 const statusEl = document.getElementById('status');
 const termHost = document.getElementById('term');
 
+// §22: console gate overlay — a blurred, non-interactive scrim shown while the active session is
+// connecting or its link is broken, so the user can't type into a session that can't receive it.
+const termGate = document.createElement('div');
+termGate.className = 'term-gate';
+const termGateBadge = document.createElement('div');
+termGateBadge.className = 'gate-badge';
+termGate.appendChild(termGateBadge);
+termHost.appendChild(termGate);
+
+// §22: is the console fully "live" — connected AND (control mode) past the attach settle? When
+// false we blur the console. This is the VISUAL gate.
+function isConsoleLive(v) {
+  if (!v) return false;
+  if (v.meta.mode === 'control') return v.state === 'connected' && v.inputReady;
+  return v.state === 'connected' || v.state === 'idle';   // plain/local: no reconnect lifecycle
+}
+
+// Whether keystrokes should be DROPPED (vs. forwarded to the backend). Note this is intentionally
+// NARROWER than isConsoleLive: during a control session's *initial* connect the backend already
+// buffers input and replays it on ready, so we let it through and only drop when the link is
+// genuinely broken (reconnecting after a drop / dead / closed) — where the backend would silently
+// discard it anyway and a replay-later surprise is unwanted.
+function shouldDropInput(v) {
+  if (!v) return true;
+  return v.state === 'reconnecting' || v.state === 'dead' || v.state === 'closed';
+}
+
+// Reflect the ACTIVE session's connection state onto the console (blur while not live).
+function updateConsoleGate() {
+  const v = activeId != null ? views.get(activeId) : null;
+  const gated = !!v && !isConsoleLive(v);
+  termHost.classList.toggle('gated', gated);
+  termHost.classList.toggle('dead', gated && v && (v.state === 'dead' || v.state === 'closed'));
+  if (gated) {
+    const label = v.state === 'dead' ? 'connection lost'
+      : v.state === 'closed' ? 'disconnected'
+      : v.state === 'reconnecting' ? 'reconnecting…'
+      : 'connecting…';
+    termGateBadge.textContent = label;
+    // Never leave a blurred terminal holding focus/keystrokes while the link is broken.
+    if (shouldDropInput(v)) {
+      const t = activeTab(v);
+      if (t && t.content && t.content.term) { try { t.content.term.blur(); } catch (_) {} }
+    }
+  }
+}
+
 const views = new Map();   // id -> { term, fit, meta, state }
 let activeId = null;
 let _lastSize = { cols: 0, rows: 0 };   // last size sent for the active view (resize debounce)
@@ -79,9 +126,11 @@ function ensureTab(v, winId) {
   if (v.tabs.has(winId)) return v.tabs.get(winId);
   const { provider: linkProvider, linkHandler } = makeLinkProvider(() => tab.content.term, v.meta);
   const ctx = {
-    // Always forward: the backend owns input gating (buffers until ready, then replays in order)
-    // and addresses keystrokes to the active window. The renderer no longer buffers input itself.
-    input: (data) => api.input(v.meta.id, data),
+    // Forward keystrokes to the backend, which owns the real input gating (control mode buffers
+    // during the initial attach settle and replays on ready). We only DROP input when the link is
+    // genuinely broken (reconnecting/dead/closed) — where it would be silently discarded anyway —
+    // so the blurred-but-broken console can't swallow keystrokes (§22).
+    input: (data) => { if (!shouldDropInput(v)) api.input(v.meta.id, data); },
     ack: (bytes) => api.ack(v.meta.id, bytes),
   };
   const content = registry.createTabContent('terminal', { id: v.meta.id, meta: v.meta, linkProvider, linkHandler }, ctx);
@@ -258,6 +307,7 @@ async function mount(id) {
   showActiveTab(v);        // mount + reveal the active tab's content
   renderTabs(v);
   renderSidebar();
+  updateConsoleGate();     // §22: blur/allow the console per this session's connection state
   // §18: pull the forwarded-port status (persisted + live, probed) for this session.
   refreshTunnels(id);
 }
@@ -280,7 +330,9 @@ function showActiveTab(v) {
     // Always re-assert size on show (a switched-to session/tab must be told its dimensions), and
     // keep _lastSize in sync so the debounced window-resize handler's change check stays correct.
     if (size) { api.resize(v.meta.id, size.cols, size.rows); if (v.meta.id === activeId) _lastSize = size; }
-    if (tab.content.focus) tab.content.focus();
+    // Don't focus a broken console — it must not capture keystrokes (§22). (A control session
+    // still-settling on initial connect keeps focus so early input buffers as designed.)
+    if (tab.content.focus && !shouldDropInput(v)) tab.content.focus();
   });
 }
 
@@ -588,7 +640,7 @@ api.onState(({ id, state }) => {
   const v = views.get(id);
   if (!v) return;
   v.state = state;
-  if (id === activeId) setStatus(statusLine(v, state));
+  if (id === activeId) { setStatus(statusLine(v, state)); updateConsoleGate(); }
   renderSidebar();
 });
 
@@ -778,7 +830,7 @@ api.onReady(({ id }) => {
   const v = views.get(id);
   if (!v) { dbg('onReady: NO VIEW for id=' + id); return; }
   v.inputReady = true;   // display flag only; the backend already flushed its buffered input
-  if (id === activeId) setStatus(statusLine(v, v.state));
+  if (id === activeId) { setStatus(statusLine(v, v.state)); updateConsoleGate(); }
   // §18: on (re)connect, refresh the forwarded-port status (active/inactive).
   refreshTunnels(id);
 });
