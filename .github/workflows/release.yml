@@ -1,0 +1,80 @@
+name: Release
+
+# Build Buoy for macOS, Linux, and Windows on their NATIVE runners (Tauri can't cross-bundle),
+# and attach the installers to a GitHub Release. Triggered by pushing a version tag (e.g. v0.1.0),
+# or run manually from the Actions tab.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    permissions:
+      contents: write            # tauri-action needs this to create/upload the Release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS: universal binary (Intel + Apple Silicon in one .dmg/.app).
+          - platform: macos-latest
+            args: '--target universal-apple-darwin'
+            rust-targets: 'aarch64-apple-darwin,x86_64-apple-darwin'
+          # Linux: .deb / .rpm / .AppImage (x86_64).
+          - platform: ubuntu-22.04
+            args: ''
+            rust-targets: ''
+          # Windows: .msi / .exe (x86_64).
+          - platform: windows-latest
+            args: ''
+            rust-targets: ''
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Linux build deps: WebKitGTK (the webview) + the bundling tools Tauri shells out to.
+      # tauri-action installs most, but the webkit/gtk dev libs must be present first.
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential \
+            libssl-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      # Cache the Rust build so repeat releases are fast. Keyed on the platform + Cargo.lock.
+      - name: Cache cargo
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+          key: ${{ matrix.platform }}
+
+      # Builds the app and, when a tag triggered the run, creates a GitHub Release and uploads
+      # every bundle produced (dmg/app, deb/rpm/AppImage, msi/exe). No npm build step: the
+      # frontend is the static ui/ directory (frontendDist), so there's nothing to compile there.
+      - name: Build & release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Buoy ${{ github.ref_name }}'
+          releaseBody: |
+            Buoy ${{ github.ref_name }}.
+
+            Unsigned builds — first launch requires bypassing the OS gatekeeper:
+            - macOS: right-click the app → Open (or `xattr -dr com.apple.quarantine /Applications/Buoy.app`).
+            - Windows: SmartScreen → More info → Run anyway.
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
