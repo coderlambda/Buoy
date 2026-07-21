@@ -174,20 +174,14 @@ function refreshTunnels(id) {
   }).catch(() => {});
 }
 
-// §18: Shift+Cmd chooser — a small popup letting the user pick where to open a URL. Loopback URLs
-// offer tunnel-open; all URLs offer copy and open-plain.
-function chooseOpen(sessionId, url) {
-  const loop = isLoopbackUrl(url);
-  const items = [];
-  if (loop) items.push(['Open in local browser (tunnel)', () => api.openForwardedUrl(sessionId, url)]);
-  items.push(['Open in browser', () => api.openExternal(loop && !/^https?:\/\//.test(url) ? 'http://' + url : url)]);
-  items.push(['Copy URL', () => api.copyText(url)]);
-
+// Generic action-chooser modal: a title + a list of [label, fn] buttons, dismissed on
+// backdrop-click or Escape. Reused by the URL chooser (§18) and the file chooser (§21).
+function showChooser(titleText, items) {
   const back = document.createElement('div');
   back.className = 'chooser-back';
   const box = document.createElement('div');
   box.className = 'chooser';
-  const title = document.createElement('div'); title.className = 'chooser-title'; title.textContent = url;
+  const title = document.createElement('div'); title.className = 'chooser-title'; title.textContent = titleText;
   box.appendChild(title);
   const close = () => { if (back.parentNode) back.parentNode.removeChild(back); };
   items.forEach(([label, fn]) => {
@@ -200,6 +194,26 @@ function chooseOpen(sessionId, url) {
   back.onclick = (e) => { if (e.target === back) close(); };
   document.addEventListener('keydown', function esc(e) { if (e.key === 'Escape') { close(); document.removeEventListener('keydown', esc); } });
   document.body.appendChild(back);
+}
+
+// §18: Shift+Cmd chooser — pick where to open a URL. Loopback URLs offer tunnel-open; all URLs
+// offer copy and open-plain.
+function chooseOpen(sessionId, url) {
+  const loop = isLoopbackUrl(url);
+  const items = [];
+  if (loop) items.push(['Open in local browser (tunnel)', () => api.openForwardedUrl(sessionId, url)]);
+  items.push(['Open in browser', () => api.openExternal(loop && !/^https?:\/\//.test(url) ? 'http://' + url : url)]);
+  items.push(['Copy URL', () => api.copyText(url)]);
+  showChooser(url, items);
+}
+
+// §21: Shift+Cmd chooser for a remote FILE path (from an OSC 8 file:// link) — preview in-app or
+// copy the absolute path. The path is on the REMOTE host, so there's no "open locally" option.
+function chooseOpenFile(sessionId, path) {
+  showChooser(path, [
+    ['Preview in app', () => openViewer(sessionId, path)],
+    ['Copy path', () => api.copyText(path)],
+  ]);
 }
 
 // The active tab (or the sole tab for single-window/plain views).
@@ -262,11 +276,21 @@ function makeLinkProvider(getTerm, meta) {
   };
   // §21: OSC 8 hyperlinks (`\e]8;;URI\e\\text\e]8;;\e\\`) are underlined natively by xterm, but the
   // click does NOTHING unless a linkHandler is set (default is null -> a blocked window.open in the
-  // Tauri webview). Route the embedded URI through the SAME smart open as regex URL links (shared
-  // openUrlSmart): loopback -> ssh -L tunnel; else scheme-checked openExternal; shift-click chooser.
+  // Tauri webview). Claude Code (and others) emit these for file-path tool calls with the ABSOLUTE
+  // remote path as a file:// URI (display text is the short relative path). Route by scheme:
+  //   file:// -> the path is on the REMOTE host, so preview it in-app via the ssh fetch (NOT
+  //             openExternal, which would wrongly try to open it on the local Mac). Shift-click
+  //             offers a chooser (preview / copy path).
+  //   else    -> openUrlSmart (loopback tunnel / browser / URL chooser), unchanged.
   const linkHandler = {
     activate(event, uri) {
       const mods = { shift: !!(event && event.shiftKey), meta: !!(event && (event.metaKey || event.ctrlKey)), alt: !!(event && event.altKey) };
+      const filePath = DTBuiltinPlugins.parseFileUri(uri);
+      if (filePath) {
+        if (mods.shift) chooseOpenFile(meta.id, filePath);
+        else openViewer(meta.id, filePath);
+        return;
+      }
       DTBuiltinPlugins.openUrlSmart(uri, ctx, mods);
     },
   };

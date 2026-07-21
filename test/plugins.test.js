@@ -3,7 +3,7 @@ const { test } = require('node:test');
 const assert = require('node:assert');
 const { PluginRegistry } = require('../src/shared/plugins');
 // The Tauri app serves ui/ ; that's the live copy of the link plugins.
-const { builtinLinkPlugins, URL_RE, PATH_RE } = require('../ui/builtinPlugins');
+const { builtinLinkPlugins, parseFileUri, URL_RE, PATH_RE } = require('../ui/builtinPlugins');
 
 function reg() {
   const r = new PluginRegistry();
@@ -120,6 +120,24 @@ test('TC-PL4e OSC 8 handler routes via openUrlSmart', () => {
   openUrlSmart('javascript:alert(1)', ctx, {});   // unsafe scheme
   assert.equal(external, null, 'unsafe scheme not opened');
   assert.match(status, /refused/, 'unsafe scheme refused with status');
+});
+
+// TC-PL4f §21: parseFileUri extracts the absolute remote path from an OSC 8 file:// URI (Claude
+// Code emits these for file tool-calls), returns null for non-file URIs so callers fall through.
+test('TC-PL4f parseFileUri', () => {
+  // classic file:/// with empty host (what Claude Code emits)
+  assert.equal(parseFileUri('file:///local/home/y/w/index.ts'), '/local/home/y/w/index.ts');
+  // file://host/path — host ignored, path kept absolute
+  assert.equal(parseFileUri('file://somehost/etc/hosts'), '/etc/hosts');
+  // percent-encoding decoded (spaces etc.)
+  assert.equal(parseFileUri('file:///a/My%20Docs/x.md'), '/a/My Docs/x.md');
+  // trailing :line and :line:col stripped so the path resolves
+  assert.equal(parseFileUri('file:///a/foo.rs:42'), '/a/foo.rs');
+  assert.equal(parseFileUri('file:///a/foo.rs:42:7'), '/a/foo.rs');
+  // non-file URIs -> null (handler falls through to openUrlSmart)
+  assert.equal(parseFileUri('https://example.com'), null);
+  assert.equal(parseFileUri('localhost:3000'), null);
+  assert.equal(parseFileUri('mailto:x@y.com'), null);
 });
 
 // TC-PL5 custom plugin registers and matches; unregister works

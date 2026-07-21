@@ -46,6 +46,20 @@ function openUrlSmart(text, ctx, mods) {
   ctx.setStatus('opened ' + url);
 }
 
+// §21: parse a file:// URI into an absolute remote path, or null if it isn't a file URI. Handles
+// `file:///abs`, `file://host/abs` (host ignored — CC uses an empty host), percent-encoding, and a
+// trailing `:line[:col]` suffix some tools append (stripped so the path resolves). Returns null for
+// anything that isn't file://, so callers fall through to URL handling.
+function parseFileUri(uri) {
+  const m = /^file:\/\/[^/]*(\/[^\s]*)$/i.exec(String(uri).trim());
+  if (!m) return null;
+  let path = m[1];
+  try { path = decodeURIComponent(path); } catch (_) { /* keep raw on bad encoding */ }
+  // strip a trailing :line or :line:col (but NOT a lone drive-like ":" mid-path)
+  path = path.replace(/:\d+(?::\d+)?$/, '');
+  return path;
+}
+
 function builtinLinkPlugins() {
   return [
     {
@@ -72,5 +86,5 @@ function builtinLinkPlugins() {
 }
 
 // UMD-lite: CommonJS for tests, global for the sandboxed renderer (<script> tag).
-if (typeof module !== 'undefined' && module.exports) module.exports = { builtinLinkPlugins, openUrlSmart, URL_RE, PATH_RE, KNOWN_NAMES };
-if (typeof window !== 'undefined') window.DTBuiltinPlugins = { builtinLinkPlugins, openUrlSmart, URL_RE, PATH_RE, KNOWN_NAMES };
+if (typeof module !== 'undefined' && module.exports) module.exports = { builtinLinkPlugins, openUrlSmart, parseFileUri, URL_RE, PATH_RE, KNOWN_NAMES };
+if (typeof window !== 'undefined') window.DTBuiltinPlugins = { builtinLinkPlugins, openUrlSmart, parseFileUri, URL_RE, PATH_RE, KNOWN_NAMES };
