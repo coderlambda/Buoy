@@ -3,7 +3,7 @@ const { test } = require('node:test');
 const assert = require('node:assert');
 const { PluginRegistry } = require('../src/shared/plugins');
 // The Tauri app serves ui/ ; that's the live copy of the link plugins.
-const { builtinLinkPlugins, parseFileUri, URL_RE, PATH_RE } = require('../ui/builtinPlugins');
+const { builtinLinkPlugins, parseFileUri, extractOsc8FileLinks, URL_RE, PATH_RE } = require('../ui/builtinPlugins');
 
 function reg() {
   const r = new PluginRegistry();
@@ -25,6 +25,17 @@ test('TC-PL2 detects paths', () => {
   const m = r.findMatches('open /etc/hosts or ~/notes/todo.md or ./src/a.js');
   const paths = m.filter((x) => x.plugin.name === 'path').map((x) => x.text);
   assert.deepEqual(paths, ['/etc/hosts', '~/notes/todo.md', './src/a.js']);
+});
+
+// TC-PL2b a path wrapped in a tool call — Update(/a/b/x.md) — must NOT swallow the trailing ')'
+test('TC-PL2b paren-wrapped path excludes the trailing paren', () => {
+  const r = reg();
+  const m = r.findMatches('Update(/local/home/y/w/proj/docs/data-migration-plan.md)');
+  const paths = m.filter((x) => x.plugin.name === 'path').map((x) => x.text);
+  assert.deepEqual(paths, ['/local/home/y/w/proj/docs/data-migration-plan.md'], 'no trailing )');
+  // and a paren-wrapped relative dir path stays intact
+  const m2 = r.findMatches('Bash(cd /srv/app/bin)');
+  assert.deepEqual(m2.filter((x) => x.plugin.name === 'path').map((x) => x.text), ['/srv/app/bin']);
 });
 
 // TC-PL3 plain words (no slash, no extension, not a known name) are NOT paths
@@ -138,6 +149,27 @@ test('TC-PL4f parseFileUri', () => {
   assert.equal(parseFileUri('https://example.com'), null);
   assert.equal(parseFileUri('localhost:3000'), null);
   assert.equal(parseFileUri('mailto:x@y.com'), null);
+});
+
+// TC-PL4g §21: extractOsc8FileLinks harvests display-text -> absolute path from raw OSC 8 output
+// (the renderer maps these so a clicked relative filename opens the agent's authoritative abs path).
+test('TC-PL4g extractOsc8FileLinks', () => {
+  const E = '\x1b';
+  // real Claude Code shape: id= param, file:// abs uri (ST terminator), short display text
+  const st = E + ']8;id=lakfgb;file:///local/home/y/w/proj/README.md' + E + '\\' + 'README.md' + E + ']8;;' + E + '\\';
+  assert.deepEqual(extractOsc8FileLinks('pre ' + st + ' post'),
+    [{ shown: 'README.md', path: '/local/home/y/w/proj/README.md' }]);
+  // BEL-terminated variant
+  const bel = E + ']8;;file:///a/b/x.ts\x07' + 'src/x.ts' + E + ']8;;\x07';
+  assert.deepEqual(extractOsc8FileLinks(bel), [{ shown: 'src/x.ts', path: '/a/b/x.ts' }]);
+  // multiple links in one chunk
+  const two = st + 'noise' + bel;
+  assert.equal(extractOsc8FileLinks(two).length, 2);
+  // non-file OSC 8 (e.g. http hyperlink) is ignored (path null)
+  const http = E + ']8;;https://example.com' + E + '\\' + 'example' + E + ']8;;' + E + '\\';
+  assert.deepEqual(extractOsc8FileLinks(http), []);
+  // no OSC 8 at all -> empty
+  assert.deepEqual(extractOsc8FileLinks('just plain text README.md'), []);
 });
 
 // TC-PL5 custom plugin registers and matches; unregister works

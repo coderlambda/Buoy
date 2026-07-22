@@ -18,8 +18,11 @@ const URL_RE = /\b(?:https?|ftp|file):\/\/[^\s"'<>`)]+|(?:\bwww\.[^\s"'<>`)]+)|(
 // A plain word with no slash, no extension, and not on the known list stays unmatched (avoids
 // underlining every token). Trailing shell punctuation is excluded from the char classes.
 const KNOWN_NAMES = ['Makefile', 'Dockerfile', 'LICENSE', 'README', 'Gemfile', 'Rakefile'];
-// 1. leading-anchored slash paths: absolute, home, or ./ ../ relative.
-const SLASH_PATH = String.raw`(?:~\/|\.{1,2}\/|\/)[^\s"'<>\`:]+`;
+// 1. leading-anchored slash paths: absolute, home, or ./ ../ relative. The char class excludes
+//    ')' (and '(') so a path wrapped in a tool call — e.g. Update(/a/b/x.md) — doesn't swallow the
+//    trailing paren (matches URL_RE's exclusions). Paths literally containing parens are rare and
+//    not worth mis-capturing every wrapped path for.
+const SLASH_PATH = String.raw`(?:~\/|\.{1,2}\/|\/)[^\s"'<>\`:()]+`;
 // 2. relative path with an interior slash and a filename WITH an extension: src/main.rs, a/b/c.txt.
 //    (requires an extension on the last segment so bare dir words like "src/foo" without a dot
 //    still match here only when the final segment has an ext — keeps noise down.)
@@ -60,6 +63,24 @@ function parseFileUri(uri) {
   return path;
 }
 
+// §21: extract OSC 8 file:// hyperlinks from a raw output chunk as [{shown, path}] pairs (path is
+// the absolute path from the file:// URI). Format: ESC ] 8 ; params ; uri (ST|BEL) text ESC ] 8 ; ; (ST|BEL).
+// Non-file links and malformed sequences are skipped. Pure/testable; the renderer builds a lookup
+// map from these so a clicked relative filename resolves to the agent's authoritative absolute path.
+const OSC8_LINK_RE = /\x1b\]8;[^;]*;([^\x07\x1b]*)(?:\x07|\x1b\\)([^\x1b]*)\x1b\]8;;(?:\x07|\x1b\\)/g;
+function extractOsc8FileLinks(data) {
+  const out = [];
+  if (!data || data.indexOf('\x1b]8;') === -1) return out;
+  OSC8_LINK_RE.lastIndex = 0;
+  let m;
+  while ((m = OSC8_LINK_RE.exec(data)) !== null) {
+    const shown = (m[2] || '').trim();
+    const path = parseFileUri(m[1]);
+    if (shown && path) out.push({ shown, path });
+  }
+  return out;
+}
+
 function builtinLinkPlugins() {
   return [
     {
@@ -86,5 +107,5 @@ function builtinLinkPlugins() {
 }
 
 // UMD-lite: CommonJS for tests, global for the sandboxed renderer (<script> tag).
-if (typeof module !== 'undefined' && module.exports) module.exports = { builtinLinkPlugins, openUrlSmart, parseFileUri, URL_RE, PATH_RE, KNOWN_NAMES };
-if (typeof window !== 'undefined') window.DTBuiltinPlugins = { builtinLinkPlugins, openUrlSmart, parseFileUri, URL_RE, PATH_RE, KNOWN_NAMES };
+if (typeof module !== 'undefined' && module.exports) module.exports = { builtinLinkPlugins, openUrlSmart, parseFileUri, extractOsc8FileLinks, URL_RE, PATH_RE, KNOWN_NAMES };
+if (typeof window !== 'undefined') window.DTBuiltinPlugins = { builtinLinkPlugins, openUrlSmart, parseFileUri, extractOsc8FileLinks, URL_RE, PATH_RE, KNOWN_NAMES };

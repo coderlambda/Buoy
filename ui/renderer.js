@@ -112,6 +112,9 @@ function makeView(meta) {
     tabColors: meta.tabColors || {},        // winId -> color
     lastTab: meta.lastTab || null,          // last-active tab (persisted; updated as tabs switch)
     restoreTab: meta.lastTab || null,       // one-shot: tab to reveal on first connect (see onWindow)
+    // §21: OSC 8 file-link map — display text (e.g. "README.md") -> absolute remote path harvested
+    // from the raw output stream (xterm drops the hyperlink from scrollback, so we capture it here).
+    linkMap: new Map(),
   };
   views.set(meta.id, v);
   // For non-control (plain/local) there are no tmux window events; use a single implicit tab.
@@ -144,6 +147,19 @@ function ensureTab(v, winId) {
 function isWindowTab(winId) { return /^@\d+$/.test(winId); }
 
 let _viewerSeq = 0;
+
+// §21: scan a raw output chunk for OSC 8 file:// hyperlinks and record display-text -> absolute
+// remote path in the project's linkMap. xterm strips the hyperlink from scrollback cells, so this
+// raw-stream scan (BEFORE term.write) is our only capture point. Agents (Claude Code) emit the
+// absolute path in the URI while the display text is a short/relative path.
+function harvestOsc8FileLinks(v, data) {
+  if (!v) return;
+  for (const { shown, path } of DTBuiltinPlugins.extractOsc8FileLinks(data)) {
+    v.linkMap.set(shown, path);   // newest wins (a path can move; last seen is freshest)
+  }
+  // Bound memory on a long-lived session: drop oldest entries past a cap.
+  while (v.linkMap.size > 500) { v.linkMap.delete(v.linkMap.keys().next().value); }
+}
 
 // Open a file-viewer tab for a clicked path (§16). App-local tab (no tmux window): synthetic id,
 // tmux commands are gated off it. Fetches its own content on mount.
@@ -231,8 +247,15 @@ function makeLinkProvider(getTerm, meta) {
     openExternal: (url) => api.openExternal(url),
     copyText: (text) => api.copyText(text),
     setStatus: (msg) => setStatus(msg),
-    // §16: open a clicked path in an in-app file-viewer tab of this session.
-    openViewer: (path) => openViewer(meta.id, path),
+    // §16/§21: open a clicked path in an in-app file-viewer tab. If the SAME display text was seen
+    // as an OSC 8 file:// link (agents like Claude Code emit the absolute path that way), prefer
+    // that authoritative absolute path — the bare relative text often can't be located from the
+    // pane cwd alone (Claude's paths are relative to its project root, not the shell's cwd).
+    openViewer: (path) => {
+      const v = views.get(meta.id);
+      const abs = v && v.linkMap.get(String(path).trim());
+      openViewer(meta.id, abs || path);
+    },
     // §18: is this URL a remote-loopback URL (needs an ssh -L tunnel to reach)?
     isLoopback: (url) => isLoopbackUrl(url),
     // §18: open a loopback URL via a tunnel (host forwards + opens the local URL).
@@ -636,6 +659,9 @@ const pendingData = {};   // id -> [data] buffered before the view exists
 
 // Deliver a data chunk to a resolved tab (mounting/revealing it if it's the active one).
 function deliver(v, tab, data) {
+  // §21: harvest OSC 8 file:// links from the raw stream into the project's path map BEFORE xterm
+  // consumes the data (xterm strips the hyperlink from scrollback, so this is our only capture point).
+  harvestOsc8FileLinks(v, data);
   if (!tab) { (v.pending = v.pending || []).push(data); return; }
   // If this tab isn't mounted yet but its project is the active one, mount it now so the
   // data (e.g. scrollback back-fill on reattach) is displayed, not just buffered.
