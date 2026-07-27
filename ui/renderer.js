@@ -145,6 +145,10 @@ function ensureTab(v, winId) {
     // so the blurred-but-broken console can't swallow keystrokes (§22).
     input: (data) => { if (!shouldDropInput(v)) api.input(v.meta.id, data); },
     ack: (bytes) => api.ack(v.meta.id, bytes),
+    // Clipboard: xterm ignores OSC 52 by default and there's no built-in Cmd+C, so the terminal
+    // tab wires both through here. copyText -> system clipboard; setStatus -> status line feedback.
+    copyText: (text) => api.copyText(text),
+    setStatus: (m) => setStatus(m),
   };
   const content = registry.createTabContent('terminal', { id: v.meta.id, meta: v.meta, linkProvider, linkHandler }, ctx);
   const tab = { winId, title: winId, content, mounted: false };

@@ -21,12 +21,48 @@ function createTerminalTab(spec, ctx) {
   // §13 regex-based URL/path links (our plugin engine).
   if (spec.linkProvider) term.registerLinkProvider(spec.linkProvider);
 
+  // Clipboard support. Two independent paths, both landing in the system clipboard via ctx.copyText:
+  //   1. OSC 52 (remote-driven copy): a program on the remote (Claude Code, tmux, vim) selects text
+  //      and emits ESC ] 52 ; c ; <base64> ST to set the clipboard. xterm.js ignores OSC 52 by
+  //      default (security: any program could overwrite the clipboard), so WE opt in here — decode
+  //      the base64 and write it. Without this the remote prints "Sent N chars via OSC 52" but the
+  //      text never reaches the Mac clipboard.
+  //   2. Local Cmd/Ctrl+C and right-click (user-driven copy): when the remote app has mouse
+  //      reporting ON, a drag is sent to the remote instead of making a native xterm selection; but
+  //      when it's OFF the user CAN select in xterm, and expects Cmd+C / a context menu to copy. We
+  //      wire both to term.getSelection(). Keyboard handling is registered in mount() (after open).
+  const copySelection = () => {
+    const sel = (() => { try { return term.getSelection(); } catch (_) { return ''; } })();
+    if (!sel) return false;
+    if (ctx.copyText) ctx.copyText(sel);
+    if (ctx.setStatus) ctx.setStatus('copied ' + sel.length + ' chars');
+    return true;
+  };
+  if (term.parser && term.parser.registerOscHandler) {
+    term.parser.registerOscHandler(52, (payload) => {
+      const text = decodeOsc52(payload);
+      if (text && ctx.copyText) { ctx.copyText(text); if (ctx.setStatus) ctx.setStatus('copied ' + text.length + ' chars'); }
+      return true;   // handled — suppress xterm's default (which would do nothing anyway)
+    });
+  }
+
   let mounted = false;
   let el = null;
   const preOpen = [];   // bytes buffered until the xterm is opened
 
   // input up (gating is applied by the caller via ctx.input, which may buffer)
   term.onData((data) => ctx.input(data));
+
+  // Local copy shortcuts. Cmd+C (mac) / Ctrl+Shift+C (elsewhere) copy the xterm selection when
+  // there IS one; otherwise fall through so the key reaches the shell (Ctrl+C = SIGINT). Attached
+  // via attachCustomKeyEventHandler so it runs before onData forwards the byte to the backend.
+  term.attachCustomKeyEventHandler((e) => {
+    if (e.type !== 'keydown') return true;
+    const isCopy = (e.key === 'c' || e.key === 'C') &&
+      ((e.metaKey && !e.ctrlKey && !e.altKey) || (e.ctrlKey && e.shiftKey && !e.metaKey && !e.altKey));
+    if (isCopy && term.hasSelection && term.hasSelection()) { copySelection(); return false; }
+    return true;
+  });
 
   return {
     kind: 'terminal',
@@ -40,6 +76,10 @@ function createTerminalTab(spec, ctx) {
       container.appendChild(el);
       term.open(el);
       mounted = true;
+      // Right-click: copy the selection if there is one (otherwise let the default menu through).
+      el.addEventListener('contextmenu', (e) => {
+        if (term.hasSelection && term.hasSelection()) { e.preventDefault(); copySelection(); }
+      });
       if (preOpen.length) { const b = preOpen.splice(0); b.forEach((d) => term.write(d)); }
       this.fit();
     },
@@ -66,5 +106,20 @@ function createTerminalTab(spec, ctx) {
 
 function byteLen(s) { return typeof TextEncoder !== 'undefined' ? new TextEncoder().encode(s).length : Buffer.byteLength(s); }
 
-if (typeof module !== 'undefined' && module.exports) module.exports = { createTerminalTab };
-if (typeof window !== 'undefined') window.DTTerminalTab = { createTerminalTab };
+// Decode an OSC 52 clipboard-SET payload into UTF-8 text, or '' if it isn't one we act on.
+// payload = "<selection>;<base64>" where selection is c/p/q/s/0-7 (which clipboard). We treat all
+// selections the same (write to the system clipboard). A "?" data field is a clipboard READ
+// request — we refuse it (returning '') so a remote program can't exfiltrate the clipboard.
+function decodeOsc52(payload) {
+  const semi = String(payload == null ? '' : payload).indexOf(';');
+  const b64 = semi >= 0 ? payload.slice(semi + 1) : payload;
+  if (!b64 || b64 === '?') return '';
+  const b64decode = (s) => (typeof atob === 'function')
+    ? atob(s)
+    : Buffer.from(s, 'base64').toString('binary');
+  try { return decodeURIComponent(escape(b64decode(b64))); }   // base64(binary) -> UTF-8
+  catch (_) { try { return b64decode(b64); } catch (_) { return ''; } }
+}
+
+if (typeof module !== 'undefined' && module.exports) module.exports = { createTerminalTab, decodeOsc52 };
+if (typeof window !== 'undefined') window.DTTerminalTab = { createTerminalTab, decodeOsc52 };
