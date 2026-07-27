@@ -305,6 +305,12 @@ fn create_session(app: AppHandle, state: State<AppState>, meta: CreateArgs) -> R
             supervisor::real_backend_factory(),
             app_sink, state_sink,
             Arc::new(|d| std::thread::sleep(d)),
+            // Monotonic clock in millis for the stable-connection check (Instant can't panic like
+            // SystemTime and is immune to wall-clock jumps).
+            {
+                let base = std::time::Instant::now();
+                Arc::new(move || base.elapsed().as_millis() as u64)
+            },
         );
         sup.start(90, 30);
         Backend::Supervised(sup)
