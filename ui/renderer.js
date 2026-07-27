@@ -18,6 +18,13 @@ termGateBadge.className = 'gate-badge';
 termGate.appendChild(termGateBadge);
 termHost.appendChild(termGate);
 
+// §22: when a session has given up auto-reconnecting (Dead, after the attempt cap), the center
+// badge becomes a Reconnect button — clicking it calls the backend's manual retry (fresh budget).
+termGateBadge.addEventListener('click', () => {
+  const v = activeId != null ? views.get(activeId) : null;
+  if (v && v.state === 'dead') api.retry(v.meta.id);
+});
+
 // §22: is the console fully "live" — connected AND (control mode) past the attach settle? When
 // false we blur the console. This is the VISUAL gate.
 function isConsoleLive(v) {
@@ -42,8 +49,11 @@ function updateConsoleGate() {
   const gated = !!v && !isConsoleLive(v);
   termHost.classList.toggle('gated', gated);
   termHost.classList.toggle('dead', gated && v && (v.state === 'dead' || v.state === 'closed'));
+  // The badge is a clickable Reconnect button only when Dead (auto-reconnect exhausted).
+  const dead = gated && v && v.state === 'dead';
+  termGateBadge.classList.toggle('clickable', !!dead);
   if (gated) {
-    const label = v.state === 'dead' ? 'connection lost'
+    const label = v.state === 'dead' ? '⟳ Reconnect'
       : v.state === 'closed' ? 'disconnected'
       : v.state === 'reconnecting' ? 'reconnecting…'
       : 'connecting…';

@@ -109,6 +109,11 @@
       color:var(--fg); background:rgba(30,30,46,.85); border:1px solid #45475a;
       box-shadow:0 4px 20px rgba(0,0,0,.4); }
     #term.gated.dead .gate-badge { color:#f38ba8; border-color:#f38ba8; }
+    /* Dead sessions show the badge as a Reconnect button (manual retry, fresh budget). */
+    .term-gate .gate-badge.clickable { cursor:pointer; padding:8px 18px; font-weight:600;
+      user-select:none; transition:background .12s, transform .06s; }
+    .term-gate .gate-badge.clickable:hover { background:rgba(243,139,168,.18); }
+    .term-gate .gate-badge.clickable:active { transform:scale(.97); }
     #status { height:22px; line-height:22px; padding:0 10px; background:var(--panel);
       color:var(--muted); font-size:11px; border-top:1px solid #313244; }
     dialog { background:var(--panel); color:var(--fg); border:1px solid #45475a; border-radius:8px; }
