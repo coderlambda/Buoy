@@ -167,12 +167,18 @@ impl Supervisor {
     pub fn state(&self) -> State { *self.shared.state.lock().unwrap() }
 
     fn spawn(self: &Arc<Self>) {
-        // Tear down any previous backend first (so an old ssh can't keep streaming — the
-        // doubled-output guard from the JS version).
+        // Bump the generation BEFORE tearing down the old backend. kill() makes the old ssh exit,
+        // and that exit arrives asynchronously (tmux `%exit` + reader EOF) a beat later. If we bumped
+        // AFTER kill(), that exit would still see its own generation as current, pass the gate, and
+        // run on_exit() — scheduling a SECOND respawn that races this one. The two ssh control
+        // clients then evict each other forever via `new-session -D` (the force-reconnect flap loop).
+        // Bumping first means the dying backend's generation is already stale, so its exit is dropped.
+        let gen = self.shared.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        // Tear down any previous backend (so an old ssh can't keep streaming — the doubled-output
+        // guard from the JS version). Its late exit is now gen-stale and ignored.
         if let Some(old) = self.shared.backend.lock().unwrap().take() {
             old.kill();
         }
-        let gen = self.shared.generation.fetch_add(1, Ordering::Relaxed) + 1;
         self.shared.connected_at_ms.store(0, Ordering::Relaxed);   // this attempt hasn't reached Ready yet
         self.set_state(State::Connecting);
 
@@ -187,6 +193,14 @@ impl Supervisor {
         // connection stayed up long enough to be considered stable.
         let me = Arc::clone(self);
         let app_sink = self.app_sink.clone();
+        // Per-generation "already handled its exit" latch. A SINGLE backend death can surface twice:
+        // tmux sends `%exit` (a control event) AND the reader thread then hits EOF — control_backend
+        // emits BackendEvent::Exit for both. Without this latch on_exit() would run twice for one
+        // death, double-incrementing the attempt budget and scheduling TWO respawns; the two ssh
+        // control clients then evict each other forever via `new-session -D` (the force-reconnect
+        // flap loop). The generation check drops a REPLACED backend's late exit; this latch collapses
+        // the %exit+EOF pair from the CURRENT backend into exactly one reconnect.
+        let exited = Arc::new(AtomicBool::new(false));
         let wrapped: BackendSink = Arc::new(move |ev: BackendEvent| {
             match ev {
                 BackendEvent::Ready => {
@@ -195,8 +209,10 @@ impl Supervisor {
                     app_sink(BackendEvent::Ready);
                 }
                 BackendEvent::Exit => {
-                    // Only the current generation's exit drives reconnect.
-                    if gen == me.shared.generation.load(Ordering::Relaxed) {
+                    // Only the current generation's FIRST exit drives reconnect (idempotent per death).
+                    if gen == me.shared.generation.load(Ordering::Relaxed)
+                        && !exited.swap(true, Ordering::Relaxed)
+                    {
                         me.on_exit();
                     }
                 }
@@ -251,6 +267,17 @@ impl Supervisor {
         if self.state() != State::Dead { return; }
         self.shared.attempts.store(0, Ordering::Relaxed);
         self.spawn();
+    }
+
+    /// User-initiated FORCE reconnect from ANY live state (connected / connecting / reconnecting /
+    /// dead) — tears down the current backend and reattaches fresh with a reset budget. Unlike
+    /// retry() this doesn't require Dead: it's the "my session is wedged, reconnect now" button.
+    /// A no-op only after an intentional close() (the session is gone; don't resurrect it).
+    pub fn force_reconnect(self: &Arc<Self>) {
+        if self.shared.intentional.load(Ordering::Relaxed) { return; }
+        self.shared.attempts.store(0, Ordering::Relaxed);
+        self.spawn();   // spawn() kills any existing backend first and bumps the generation, so the
+                        // old ssh's later Exit is ignored (no double-reconnect).
     }
 
     /// Intentional close: stop respawning and tear the backend down.
@@ -432,6 +459,52 @@ mod tests {
         assert_eq!(spawns.load(Ordering::Relaxed), before + 1, "retry spawns again");
     }
 
+    #[test]
+    fn tc_sup_force_reconnect_from_connected_respawns() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let killed = Arc::new(AtomicBool::new(false));
+        let last_sink: Arc<Mutex<Option<BackendSink>>> = Arc::new(Mutex::new(None));
+        let sp = spawns.clone(); let ls = last_sink.clone(); let kd = killed.clone();
+        let factory: BackendFactory = Arc::new(move |_c, sink, _cc, _rr| {
+            sp.fetch_add(1, Ordering::Relaxed);
+            *ls.lock().unwrap() = Some(sink.clone());
+            Ok(Box::new(FakeBackend { sink, killed: kd.clone() }) as Box<dyn BackendHandle>)
+        });
+        let sup = Supervisor::new(cfg(), opts_fast(), factory,
+            Arc::new(|_| {}), Arc::new(|_| {}), nosleep(), fake_clock().1);
+        sup.start(80, 24);
+        let sink = || last_sink.lock().unwrap().clone().unwrap();
+        sink()(BackendEvent::Ready);
+        assert_eq!(sup.state(), State::Connected);
+        // Force reconnect from a HEALTHY connection (unlike retry, which requires Dead): the current
+        // backend is torn down and a fresh one spawned.
+        let before = spawns.load(Ordering::Relaxed);
+        sup.force_reconnect();
+        assert_eq!(spawns.load(Ordering::Relaxed), before + 1, "force_reconnect respawns while connected");
+        assert!(killed.load(Ordering::Relaxed), "old backend was killed");
+        assert_eq!(sup.state(), State::Connecting);
+    }
+
+    #[test]
+    fn tc_sup_force_reconnect_noop_after_close() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let last_sink: Arc<Mutex<Option<BackendSink>>> = Arc::new(Mutex::new(None));
+        let sp = spawns.clone(); let ls = last_sink.clone();
+        let factory: BackendFactory = Arc::new(move |_c, sink, _cc, _rr| {
+            sp.fetch_add(1, Ordering::Relaxed);
+            *ls.lock().unwrap() = Some(sink.clone());
+            Ok(Box::new(FakeBackend { sink, killed: Arc::new(AtomicBool::new(false)) }) as Box<dyn BackendHandle>)
+        });
+        let sup = Supervisor::new(cfg(), opts_fast(), factory,
+            Arc::new(|_| {}), Arc::new(|_| {}), nosleep(), fake_clock().1);
+        sup.start(80, 24);
+        sup.close();
+        let before = spawns.load(Ordering::Relaxed);
+        sup.force_reconnect();   // intentionally closed -> must NOT resurrect the session
+        assert_eq!(spawns.load(Ordering::Relaxed), before, "no respawn after intentional close");
+        assert_eq!(sup.state(), State::Closed);
+    }
+
     // The credential-expiry flap: each attempt REACHES Ready (ssh briefly accepts, tmux attaches)
     // but drops again almost immediately — under the stable window. These transient "Connected"
     // flashes must NOT reset the retry budget, so the supervisor still reaches Dead at the cap
@@ -459,5 +532,79 @@ mod tests {
         sink()(BackendEvent::Ready); clock.fetch_add(100, Ordering::Relaxed); sink()(BackendEvent::Exit); // > cap
         for _ in 0..1000 { if sup.state() == State::Dead { break; } thread::sleep(Duration::from_millis(1)); }
         assert_eq!(sup.state(), State::Dead, "flapping connect/attach/drop still reaches Dead, not an endless loop");
+    }
+
+    // REGRESSION (force-reconnect flap): a SINGLE backend death surfaces as TWO Exit events — tmux
+    // `%exit` AND the reader-thread EOF. Both hit the same generation's sink. They must collapse into
+    // exactly ONE on_exit() (one attempt, one respawn); otherwise the budget double-increments and
+    // two ssh control clients race, evicting each other via `new-session -D` forever.
+    #[test]
+    fn tc_sup_double_exit_same_backend_reconnects_once() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let last_sink: Arc<Mutex<Option<BackendSink>>> = Arc::new(Mutex::new(None));
+        let sp = spawns.clone(); let ls = last_sink.clone();
+        let factory: BackendFactory = Arc::new(move |_c, sink, _cc, _rr| {
+            sp.fetch_add(1, Ordering::Relaxed);
+            *ls.lock().unwrap() = Some(sink.clone());
+            Ok(Box::new(FakeBackend { sink, killed: Arc::new(AtomicBool::new(false)) }) as Box<dyn BackendHandle>)
+        });
+        let sup = Supervisor::new(cfg(), opts_fast(), factory,
+            Arc::new(|_| {}), Arc::new(|_| {}), nosleep(), fake_clock().1);
+        sup.start(80, 24);
+        assert_eq!(spawns.load(Ordering::Relaxed), 1);
+        // Grab THIS backend's sink and fire both of its exit signals (%exit then EOF) before the
+        // respawn swaps last_sink.
+        let s = last_sink.lock().unwrap().clone().unwrap();
+        s(BackendEvent::Exit);
+        s(BackendEvent::Exit);
+        for _ in 0..1000 { if spawns.load(Ordering::Relaxed) >= 2 { break; } thread::sleep(Duration::from_millis(1)); }
+        // Exactly one respawn (2 total spawns), never two from the single death.
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(spawns.load(Ordering::Relaxed), 2, "double exit from one backend -> exactly one respawn");
+        assert_eq!(sup.shared.attempts.load(Ordering::Relaxed), 1, "attempt budget incremented once, not twice");
+    }
+
+    // REGRESSION (force-reconnect flap): the real timing race. A live backend's kill() makes its ssh
+    // exit, and that exit surfaces SYNCHRONOUSLY-ish, WHILE spawn() is still tearing down the old
+    // backend — i.e. before the fresh backend exists. If spawn() bumped the generation only AFTER
+    // kill(), that exit would still see its own generation as current, pass the gate, and schedule a
+    // SECOND respawn racing the fresh one (the loop). Bumping the generation BEFORE kill() makes the
+    // dying backend's gen already stale, so its kill-triggered exit is dropped.
+    //
+    // We model the real timing with a backend whose kill() fires Exit on its own sink synchronously.
+    #[test]
+    fn tc_sup_kill_triggered_exit_does_not_double_respawn() {
+        // A backend that emits Exit from kill() — exactly what a real ssh does when torn down.
+        struct KillFiresExit { sink: BackendSink }
+        impl BackendHandle for KillFiresExit {
+            fn write(&self, _: &str) {}
+            fn resize(&self, _: u16, _: u16) {}
+            fn new_window(&self) {}
+            fn select_window(&self, _: &str) {}
+            fn kill_window(&self, _: &str) {}
+            fn rename_window(&self, _: &str, _: &str) {}
+            fn capture_window(&self, _: &str) {}
+            fn kill(&self) { (self.sink)(BackendEvent::Exit); }   // ssh dies -> exit surfaces during kill
+        }
+
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let sp = spawns.clone();
+        let factory: BackendFactory = Arc::new(move |_c, sink, _cc, _rr| {
+            sp.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(KillFiresExit { sink }) as Box<dyn BackendHandle>)
+        });
+        let sup = Supervisor::new(cfg(), opts_fast(), factory,
+            Arc::new(|_| {}), Arc::new(|_| {}), nosleep(), fake_clock().1);
+        sup.start(80, 24);
+        assert_eq!(spawns.load(Ordering::Relaxed), 1);
+
+        // force_reconnect -> spawn(): kills the old backend (which fires its Exit mid-teardown) and
+        // spawns exactly one fresh backend. If the old exit weren't gen-stale it would schedule an
+        // extra respawn here.
+        sup.force_reconnect();
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(spawns.load(Ordering::Relaxed), 2,
+            "force_reconnect spawns exactly once; the old backend's kill-exit must be gen-stale, not a 2nd respawn");
+        assert_eq!(sup.state(), State::Connecting, "settled on the fresh backend, not flapping");
     }
 }

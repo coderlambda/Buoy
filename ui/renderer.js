@@ -431,6 +431,7 @@ function renderSidebar() {
           <span class="name" title="double-click to rename">${escapeHtml(v.meta.title || v.meta.session || v.meta.kind)}</span>
           <span class="controls">
             <span class="retry">retry</span>
+            <span class="act reconnect" title="Force reconnect now">⟳</span>
             <span class="act detach" title="Detach (keeps running on the remote)">⤫</span>
             <span class="act kill" title="Kill (ends the remote session)">⏻</span>
           </span>
@@ -441,6 +442,7 @@ function renderSidebar() {
     const nameEl = li.querySelector('.name');
     // Double-click the name to rename (display title only; tmux session name unchanged).
     nameEl.ondblclick = (e) => { e.stopPropagation(); startRename(id, nameEl); };
+    li.querySelector('.reconnect').onclick = (e) => { e.stopPropagation(); forceReconnect(id); };
     li.querySelector('.detach').onclick = (e) => { e.stopPropagation(); detachSession(id); };
     li.querySelector('.kill').onclick = (e) => { e.stopPropagation(); killSession(id); };
     // tunnel rows: active -> open the local URL; inactive -> re-open; ⇄ force same-port; × close.
@@ -579,6 +581,19 @@ function removeView(id) {
 
 // Detach: stop the local client; the remote tmux session keeps running (reattach later).
 function detachSession(id) { api.close(id); removeView(id); }
+
+// Force reconnect: tear down and reattach the SAME session now, even if it currently looks
+// connected (e.g. a wedged/half-open link after a network change). The backend resets its retry
+// budget and respawns; we reset the display gate so the console blurs to "connecting…" until the
+// new attach settles (Ready). tmux keeps the session alive, so windows/scrollback come back.
+function forceReconnect(id) {
+  const v = views.get(id);
+  if (!v || v.meta.mode !== 'control') return;   // only supervised control sessions reconnect
+  v.inputReady = false;
+  if (id === activeId) updateConsoleGate();
+  setStatus('reconnecting…');
+  api.forceReconnect(id);
+}
 
 // Kill: terminate the remote tmux session (ends its processes). Irreversible → confirm.
 async function killSession(id) {

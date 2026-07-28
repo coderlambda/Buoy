@@ -101,7 +101,10 @@ impl ControlBackend {
         let pair = pty.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .expect("openpty failed");
 
-        let mut cmd = CommandBuilder::new("ssh");
+        // The ssh binary is overridable via BUOY_SSH_BIN so a test can inject a fake transport that
+        // execs a LOCAL tmux (no network/sshd) and exercise the real backend + supervisor end to end.
+        let ssh_bin = std::env::var("BUOY_SSH_BIN").unwrap_or_else(|_| "ssh".into());
+        let mut cmd = CommandBuilder::new(&ssh_bin);
         cmd.args(&ssh_args);
         // Augment PATH so a Finder-launched app still finds ssh/tmux (mirrors env.js).
         cmd.env("PATH", crate::augmented_path());
@@ -209,21 +212,7 @@ impl ControlBackend {
 
     /// Shell input -> send-keys addressed to the active window (buffered until ready).
     pub fn write(&self, data: &str) {
-        let mut g = self.inner.lock().unwrap();
-        let target = g.reg.active_window.clone();
-        match target {
-            Some(t) if g.ready => {
-                for line in encode_send_keys(data, &t) {
-                    g.send(line, ReplyKind::Ignore);
-                }
-            }
-            _ => {
-                if g.pending_input.len() >= MAX_BUFFER {
-                    g.pending_input.remove(0);
-                }
-                g.pending_input.push(data.to_string());
-            }
-        }
+        self.inner.lock().unwrap().write_input(data);
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
@@ -404,6 +393,10 @@ impl Inner {
         for pane in &diff.newly_mapped_panes {
             g.flush_pane_buffer(pane);
         }
+        // If we became ready before the active window was known (mark_ready ran first on a slow
+        // reconnect), input piled up in pending_input with no drain path. Now that reconcile has set
+        // active_window, flush it — otherwise the session shows "connected" but ignores keystrokes.
+        g.flush_pending_input();
     }
 
     fn route_output(&mut self, pane: String, data: String) {
@@ -495,15 +488,48 @@ impl Inner {
         if g.ready { return; }
         g.ready = true;
         crate::dlog!("mark_ready: active={:?} pending_input={}", g.reg.active_window, g.pending_input.len());
-        let queued: Vec<String> = std::mem::take(&mut g.pending_input);
-        if let Some(target) = g.reg.active_window.clone() {
-            for d in queued {
-                for line in encode_send_keys(&d, &target) {
-                    g.send(line, ReplyKind::Ignore);
-                }
-            }
+        g.flush_pending_input();
+        // If we went ready WITHOUT knowing the active window yet (a timer fired before the topology
+        // reply landed, or %session-changed was missed on a degraded reconnect), any input the user
+        // types now would be buffered with no way to drain it — write()'s send path needs an active
+        // window, and mark_ready won't run again. Force a topology refresh so active_window gets set;
+        // the resulting apply_topology drains pending_input. Without this the session looks
+        // "connected" but silently eats keystrokes.
+        if g.reg.active_window.is_none() {
+            crate::dlog!("mark_ready: no active window yet -> forcing topology refresh");
+            g.refresh_now();
         }
         g.emit(BackendEvent::Ready);
+    }
+
+    /// Route shell input: send-keys to the active window when ready, else buffer it (replayed by
+    /// flush_pending_input once BOTH ready and the active window are known). Sending requires an
+    /// active window even when ready, so a Ready that raced ahead of topology still buffers.
+    fn write_input(&mut self, data: &str) {
+        match self.reg.active_window.clone() {
+            Some(t) if self.ready => {
+                for line in encode_send_keys(data, &t) { self.send(line, ReplyKind::Ignore); }
+            }
+            _ => {
+                if self.pending_input.len() >= MAX_BUFFER { self.pending_input.remove(0); }
+                self.pending_input.push(data.to_string());
+            }
+        }
+    }
+
+    /// Send any buffered input to the active window. No-op unless we're ready AND know the active
+    /// window (send-keys must target a window). Called from mark_ready and, to cover the race where
+    /// topology lands after we're already ready, from apply_topology.
+    fn flush_pending_input(&mut self) {
+        if !self.ready || self.pending_input.is_empty() { return; }
+        let Some(target) = self.reg.active_window.clone() else { return };
+        let queued: Vec<String> = std::mem::take(&mut self.pending_input);
+        crate::dlog!("flush_pending_input: {} chunks -> {}", queued.len(), target);
+        for d in queued {
+            for line in encode_send_keys(&d, &target) {
+                self.send(line, ReplyKind::Ignore);
+            }
+        }
     }
 
     fn paint_capture(inner: &Arc<Mutex<Inner>>, window: Option<String>, body: Vec<String>) {
@@ -612,6 +638,84 @@ fn decode_utf8_prefix(bytes: &[u8]) -> (String, Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    // A Write that records everything sent to it (the control-mode commands the backend flushes).
+    #[derive(Clone)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().extend_from_slice(buf); Ok(buf.len()) }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    // Build an Inner with a capturing writer and a no-op sink, for driving the input/ready/topology
+    // state machine directly (no ssh/pty).
+    fn test_inner() -> (Arc<Mutex<Inner>>, Arc<Mutex<Vec<u8>>>) {
+        let sent = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut reply = ReplyChannel::new();
+        reply.start();
+        let inner = Arc::new(Mutex::new(Inner {
+            parser: ControlModeParser::new(),
+            reg: WindowRegistry::new(),
+            reply,
+            writer: Box::new(CaptureWriter(sent.clone())),
+            sink: Arc::new(|_| {}),
+            session: "s".into(),
+            ready: false,
+            attached: false,
+            pending_input: Vec::new(),
+            pending_output: std::collections::BTreeMap::new(),
+            utf8_carry: std::collections::BTreeMap::new(),
+            out_buf: std::collections::BTreeMap::new(),
+            refresh_queued: false,
+            stopped: false,
+        }));
+        (inner, sent)
+    }
+
+    fn sent_str(sent: &Arc<Mutex<Vec<u8>>>) -> String {
+        String::from_utf8_lossy(&sent.lock().unwrap()).into_owned()
+    }
+
+    // REGRESSION: "connected but can't input" after a slow reconnect. mark_ready can fire (from its
+    // timer) BEFORE the topology reply lands, so active_window is still None. Input typed in that
+    // window is buffered into pending_input, and since mark_ready won't run again the buffer would
+    // strand — the session looks connected but eats keystrokes. apply_topology (once the reply
+    // arrives) must drain pending_input.
+    #[test]
+    fn tc_cb_ready_before_topology_drains_input_after_topology() {
+        let (inner, sent) = test_inner();
+        // Ready arrives with no active window known yet.
+        Inner::mark_ready(&inner);
+        assert!(inner.lock().unwrap().ready, "ready set");
+        assert!(inner.lock().unwrap().reg.active_window.is_none(), "no active window yet");
+
+        // User types while "connected but not yet topologized" -> buffered, nothing sent as input.
+        sent.lock().unwrap().clear();
+        inner.lock().unwrap().write_input("echo hi\n");
+        assert!(!sent_str(&sent).contains("send-keys"), "input must NOT be sent before topology");
+        assert_eq!(inner.lock().unwrap().pending_input.len(), 1, "input buffered");
+
+        // Topology reply lands -> active window becomes @0 -> buffered input flushes as send-keys.
+        Inner::apply_topology(&inner, vec!["@0 %0 1 1 zsh".to_string()]);
+        assert_eq!(inner.lock().unwrap().reg.active_window.as_deref(), Some("@0"));
+        assert!(sent_str(&sent).contains("send-keys"), "pending input flushed after topology");
+        assert!(inner.lock().unwrap().pending_input.is_empty(), "pending_input drained");
+    }
+
+    // The reverse order (topology first, then Ready) must also end up sending buffered input.
+    #[test]
+    fn tc_cb_topology_before_ready_drains_input_on_ready() {
+        let (inner, sent) = test_inner();
+        Inner::apply_topology(&inner, vec!["@0 %0 1 1 zsh".to_string()]);
+        // Not ready yet: input buffers even though we know the window.
+        inner.lock().unwrap().write_input("ls\n");
+        assert!(!sent_str(&sent).contains("send-keys"), "not sent before ready");
+        sent.lock().unwrap().clear();
+        Inner::mark_ready(&inner);
+        assert!(sent_str(&sent).contains("send-keys"), "flushed on ready");
+        assert!(inner.lock().unwrap().pending_input.is_empty());
+    }
 
     #[test]
     fn parse_list_row_ok() {

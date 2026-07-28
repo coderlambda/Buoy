@@ -51,6 +51,7 @@ fn live_reconnects_after_ssh_killed() {
         real_backend_factory(),
         app_sink, state_sink,
         Arc::new(|d| thread::sleep(d)),
+        { let base = std::time::Instant::now(); Arc::new(move || base.elapsed().as_millis() as u64) },
     );
     sup.start(90, 30);
 

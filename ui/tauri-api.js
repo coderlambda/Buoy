@@ -20,6 +20,7 @@ window.terminalAPI = {
   close: (id) => invoke('session_close', { id }),   // detach (remote keeps running)
   kill: (id) => invoke('session_kill', { id }),     // terminate remote tmux session
   retry: (id) => invoke('session_retry', { id }),   // manual reconnect from a dead session
+  forceReconnect: (id) => invoke('session_force_reconnect', { id }),   // reconnect now from any state
   rename: (id, title) => invoke('session_rename', { id, title }),
   openExternal: (url) => invoke('open_external', { url }),
   copyText: (text) => { try { return navigator.clipboard.writeText(String(text == null ? '' : text)); } catch (_) { return Promise.resolve(); } },

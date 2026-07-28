@@ -77,6 +77,7 @@ impl Backend {
     fn rename_window(&self, win: &str, title: &str) { if let Backend::Supervised(s) = self { s.rename_window(win, title); } }
     fn capture_window(&self, win: &str) { if let Backend::Supervised(s) = self { s.capture_window(win); } }
     fn retry(&self) { if let Backend::Supervised(s) = self { s.retry(); } }
+    fn force_reconnect(&self) { if let Backend::Supervised(s) = self { s.force_reconnect(); } }
 }
 
 struct Session {
@@ -496,6 +497,13 @@ fn session_retry(state: State<AppState>, id: String) {
     if let Some(s) = state.sessions.lock().unwrap().get(&id) { s.backend.retry(); }
 }
 
+// User-initiated FORCE reconnect from any state (renderer 'forceReconnect') — reattach now even if
+// the session currently looks connected (e.g. a wedged/half-open link after a network change).
+#[tauri::command]
+fn session_force_reconnect(state: State<AppState>, id: String) {
+    if let Some(s) = state.sessions.lock().unwrap().get(&id) { s.backend.force_reconnect(); }
+}
+
 // Largest file we'll transport for the viewer's Download-to-local path (DESIGN.md §16). Render
 // caps (text 1MB / image 5MB) are enforced renderer-side; this bounds the fetch itself.
 const DOWNLOAD_CAP: usize = 50 * 1024 * 1024;
@@ -678,7 +686,7 @@ pub fn run() {
             session_close, session_kill, session_rename,
             reorder_sessions, set_session_color, set_last_active, set_last_tab, set_tab_prefs,
             tab_new, tab_select, tab_close, tab_capture, tab_rename, open_external, ui_log,
-            read_remote_file, save_file, session_retry,
+            read_remote_file, save_file, session_retry, session_force_reconnect,
             open_forwarded_url, get_config, list_tunnels, close_tunnel, force_forward,
             list_hosts, remember_host
         ])
