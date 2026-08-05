@@ -18,11 +18,31 @@ termGateBadge.className = 'gate-badge';
 termGate.appendChild(termGateBadge);
 termHost.appendChild(termGate);
 
+// Reconnect in-flight guard (§5): every manual reconnect path (gate badge, sidebar retry, force
+// reconnect) tears down the backend and spawns a fresh ssh. Two overlapping spawns evict each other
+// via `new-session -D`, so a double-click used to cause the very flap the supervisor tries to avoid.
+// Cleared when the session next reports a state (connected/reconnecting/dead) or after a timeout, so
+// a lost event can't wedge the control permanently.
+const reconnectPending = new Map();   // id -> timeout handle
+function reconnectBusy(id) { return reconnectPending.has(id); }
+function markReconnecting(id) {
+  clearReconnect(id);
+  reconnectPending.set(id, setTimeout(() => reconnectPending.delete(id), 10000));
+}
+function clearReconnect(id) {
+  const t = reconnectPending.get(id);
+  if (t !== undefined) { clearTimeout(t); reconnectPending.delete(id); }
+}
+
 // §22: when a session has given up auto-reconnecting (Dead, after the attempt cap), the center
 // badge becomes a Reconnect button — clicking it calls the backend's manual retry (fresh budget).
 termGateBadge.addEventListener('click', () => {
   const v = activeId != null ? views.get(activeId) : null;
-  if (v && v.state === 'dead') api.retry(v.meta.id);
+  if (v && v.state === 'dead' && !reconnectBusy(v.meta.id)) {
+    markReconnecting(v.meta.id);
+    api.retry(v.meta.id);
+    renderSidebar();
+  }
 });
 
 // §22: is the console fully "live" — connected AND (control mode) past the attach settle? When
@@ -213,7 +233,14 @@ function showChooser(titleText, items) {
   box.className = 'chooser';
   const title = document.createElement('div'); title.className = 'chooser-title'; title.textContent = titleText;
   box.appendChild(title);
-  const close = () => { if (back.parentNode) back.parentNode.removeChild(back); };
+  // Unregister the key listener in close() itself, not in the Escape branch: close() is also reached
+  // from the backdrop and from every item button, and those paths used to leave the listener (and the
+  // DOM nodes it captured) attached to `document` forever — one leak per chooser use.
+  const esc = (e) => { if (e.key === 'Escape') close(); };
+  const close = () => {
+    document.removeEventListener('keydown', esc);
+    if (back.parentNode) back.parentNode.removeChild(back);
+  };
   items.forEach(([label, fn]) => {
     const b = document.createElement('button');
     b.className = 'chooser-item'; b.textContent = label;
@@ -222,7 +249,7 @@ function showChooser(titleText, items) {
   });
   back.appendChild(box);
   back.onclick = (e) => { if (e.target === back) close(); };
-  document.addEventListener('keydown', function esc(e) { if (e.key === 'Escape') { close(); document.removeEventListener('keydown', esc); } });
+  document.addEventListener('keydown', esc);
   document.body.appendChild(back);
 }
 
@@ -347,6 +374,21 @@ async function mount(id) {
   // Show this project's container, hide others (never re-open a live xterm — that blanks it).
   for (const [, other] of views) { if (other.el) other.el.style.display = (other === v) ? 'block' : 'none'; }
 
+  // Claim active BEFORE any await: session:data/state/ready/window handlers all gate on
+  // `id === activeId`, so leaving this until after the connect round-trip meant every event arriving
+  // during the connect was dropped for UI purposes — the console gate and tab strip stayed stale
+  // over a live terminal until some later unrelated event re-rendered them.
+  activeId = id;
+  // §20: restore-on-open target. Local sessions count too: they run under a local tmux whose server
+  // outlives the app (§5.3b), so they are persisted and reopenable exactly like remote ones.
+  api.setLastActive(id).catch(() => {});
+  showActiveTab(v);        // mount + reveal the active tab's content
+  renderTabs(v);
+  renderSidebar();
+  updateConsoleGate();     // §22: blur/allow the console per this session's connection state
+  // §18: pull the forwarded-port status (persisted + live, probed) for this session.
+  refreshTunnels(id);
+
   // Connect the project once (reattaches the SAME tmux session; tmux replays windows -> tabs).
   if (!v.started) {
     v.started = true;
@@ -355,22 +397,38 @@ async function mount(id) {
     if (v.meta.mode === 'control') v.inputReady = false;
     setStatus(`connecting ${v.meta.title || v.meta.host || 'session'}…`);
     dbg('mount->createSession id=' + v.meta.id + ' host=' + v.meta.host + ' session=' + v.meta.session + ' mode=' + v.meta.mode + ' tmuxPath=' + v.meta.tmuxPath + ' tmuxVersion=' + JSON.stringify(v.meta.tmuxVersion));
-    const res = await api.createSession({
-      id: v.meta.id, kind: v.meta.kind || 'remote', transport: v.meta.transport,
-      host: v.meta.host, session: v.meta.session, title: v.meta.title, mode: v.meta.mode,
-      tmuxPath: v.meta.tmuxPath, tmuxVersion: v.meta.tmuxVersion,
-    });
-    dbg('mount->createSession returned ' + JSON.stringify(res));
+    // createSession REJECTS on a spawn failure (bad host, ssh missing). Unhandled, that rejection
+    // escaped this async fn and left the UI on "connecting…" forever with no error shown, since the
+    // backend has no session:error event to fall back on.
+    try {
+      const res = await api.createSession({
+        id: v.meta.id, kind: v.meta.kind || 'remote', transport: v.meta.transport,
+        host: v.meta.host, session: v.meta.session, title: v.meta.title, mode: v.meta.mode,
+        tmuxPath: v.meta.tmuxPath, tmuxVersion: v.meta.tmuxVersion,
+      });
+      dbg('mount->createSession returned ' + JSON.stringify(res));
+      // The backend may have re-probed (unproven tmux path) or downgraded control -> plain. Adopt
+      // what it actually used so the next createSession doesn't re-send the stale pair, and so the
+      // sidebar shows the real tmux version.
+      if (res) {
+        if (res.tmuxPath) v.meta.tmuxPath = res.tmuxPath;
+        if (res.tmuxVersion) { v.meta.tmuxVersion = res.tmuxVersion; v.tmuxVersion = res.tmuxVersion; }
+        if (res.mode && res.mode !== v.meta.mode) {
+          dbg('mount->createSession mode changed ' + v.meta.mode + ' -> ' + res.mode);
+          v.meta.mode = res.mode;
+        }
+        renderSidebar();
+      }
+    } catch (e) {
+      v.started = false;          // allow a retry by clicking the session again
+      v.state = 'dead';
+      const msg = (e && (e.message || e)) || 'unknown error';
+      dbg('mount->createSession FAILED: ' + msg);
+      setStatus(`failed to connect ${v.meta.title || v.meta.host || 'session'}: ${msg}`);
+      if (id === activeId) updateConsoleGate();
+      renderSidebar();
+    }
   }
-
-  activeId = id;
-  if (v.meta.kind !== 'local') api.setLastActive(id).catch(() => {});   // §20: restore-on-open target
-  showActiveTab(v);        // mount + reveal the active tab's content
-  renderTabs(v);
-  renderSidebar();
-  updateConsoleGate();     // §22: blur/allow the console per this session's connection state
-  // §18: pull the forwarded-port status (persisted + live, probed) for this session.
-  refreshTunnels(id);
 }
 
 // Mount (if needed) and reveal the active tab's content; hide the project's other tabs.
@@ -385,7 +443,13 @@ function showActiveTab(v) {
     if (v.pending && v.pending.length) { const b = v.pending; v.pending = null; b.forEach((d) => tab.content.onData(d)); }
     if (tab.pre && tab.pre.length) { const b = tab.pre; tab.pre = null; b.forEach((d) => tab.content.onData(d)); }
   }
-  for (const [, t] of v.tabs) { const el = t.content.element && t.content.element(); if (el) el.style.display = (t === tab) ? 'block' : 'none'; }
+  // Reveal with '' (clear the inline value), NOT 'block': an inline display:block OVERRIDES the
+  // stylesheet, and the fileviewer's root is `display:flex` (.fv-root). Forcing it to block killed
+  // the flex column, so `.fv-body { flex:1 }` no longer stretched and its iframe collapsed to the
+  // CSS default 150px inside a 618px tab. Terminal tabs are plain divs, so '' resolves to the same
+  // block they were already getting. Each tab kind's own CSS decides its display; this only toggles
+  // VISIBILITY.
+  for (const [, t] of v.tabs) { const el = t.content.element && t.content.element(); if (el) el.style.display = (t === tab) ? '' : 'none'; }
   requestAnimationFrame(() => {
     const size = tab.content.fit ? tab.content.fit() : null;
     // Always re-assert size on show (a switched-to session/tab must be told its dimensions), and
@@ -402,24 +466,33 @@ function renderSidebar() {
   for (const [id, v] of views) {
     const li = document.createElement('li');
     li.className = 'session' + (id === activeId ? ' active' : '') + (v.state === 'dead' ? ' dead' : '');
-    li.draggable = true;                       // §20: drag to reorder
+    // NB: deliberately NOT `draggable = true` — reordering is pointer-driven (§24). Setting it would
+    // hand the gesture back to the native drag machinery that swallows it in the first place.
     li.dataset.id = id;
     if (v.color) li.style.setProperty('--accent-bar', v.color);   // left accent bar (CSS uses it)
     li.classList.toggle('has-color', !!v.color);
-    const sub = v.meta.host ? escapeHtml(v.meta.host) + (v.tmuxVersion ? ` · tmux ${v.tmuxVersion.join('.')}` : '') : (v.meta.kind || 'local');
+    // Subtitle: the host for a remote session, "local shell" for a local one. Both append the tmux
+    // version when known — a local session runs a real tmux too (§5.3b), so it earns the same badge;
+    // its absence is the visible signal that this machine has no tmux and the session isn't durable.
+    const ver = v.tmuxVersion ? ` · tmux ${v.tmuxVersion.join('.')}` : '';
+    const sub = v.meta.host ? escapeHtml(v.meta.host) + ver : 'local shell' + ver;
     // §18: forwarded ports under the project name. Active rows show the local port and open on
     // click; inactive (grey) rows are persisted-but-not-serving — click re-opens the tunnel.
     // String is short: ":<remote> → :<local>" (local shows "—" when not currently mapped).
+    // These values are ports (numbers) today, so nothing here can currently break out of the
+    // attribute — but this is an innerHTML sink, so escape like every other one (the tab-title and
+    // host sinks below/above do). Keeps one schema change from turning this into attribute XSS.
     const tunnelRows = (v.tunnels || []).map((t) => {
       const active = !!t.active;
-      const localTxt = t.local ? `:${t.local}` : '—';
-      const title = active ? `open http://localhost:${t.local}/` : `port ${t.remote} inactive — click to re-open`;
+      const remote = escapeHtml(t.remote);
+      const localTxt = t.local ? `:${escapeHtml(t.local)}` : '—';
+      const title = escapeHtml(active ? `open http://localhost:${t.local}/` : `port ${t.remote} inactive — click to re-open`);
       // "same" marker when the local port matches the remote (forced same-port mapping).
       const same = t.local && t.local === t.remote;
-      return `<span class="tunnel${active ? '' : ' inactive'}" data-remote="${t.remote}" title="${title}">
-         <span class="tport">:${t.remote}</span><span class="tarrow">→</span>
+      return `<span class="tunnel${active ? '' : ' inactive'}" data-remote="${remote}" title="${title}">
+         <span class="tport">:${remote}</span><span class="tarrow">→</span>
          <span class="tlocal${same ? ' same' : ''}">${localTxt}</span>
-         <span class="tforce" title="force map to the same local port (:${t.remote})">⇄</span>
+         <span class="tforce" title="force map to the same local port (:${remote})">⇄</span>
          <span class="tclose" title="close tunnel">×</span>
        </span>`;
     }).join('');
@@ -430,8 +503,8 @@ function renderSidebar() {
         <span class="name-row">
           <span class="name" title="double-click to rename">${escapeHtml(v.meta.title || v.meta.session || v.meta.kind)}</span>
           <span class="controls">
-            <span class="retry">retry</span>
-            <span class="act reconnect" title="Force reconnect now">⟳</span>
+            <span class="retry${reconnectBusy(id) ? ' busy' : ''}">retry</span>
+            <span class="act reconnect${reconnectBusy(id) ? ' busy' : ''}" title="${reconnectBusy(id) ? 'Reconnecting…' : 'Force reconnect now'}">⟳</span>
             <span class="act detach" title="Detach (keeps running on the remote)">⤫</span>
             <span class="act kill" title="Kill (ends the remote session)">⏻</span>
           </span>
@@ -440,8 +513,11 @@ function renderSidebar() {
         ${tunnelRows ? `<span class="tunnels">${tunnelRows}</span>` : ''}
       </span>`;
     const nameEl = li.querySelector('.name');
+    // Rename editor is rebuilt from view state on every render, so it survives the re-renders the
+    // double-click itself triggers (see startRename).
+    if (v.renaming) mountRenameInput(v, nameEl, id);
     // Double-click the name to rename (display title only; tmux session name unchanged).
-    nameEl.ondblclick = (e) => { e.stopPropagation(); startRename(id, nameEl); };
+    nameEl.ondblclick = (e) => { e.stopPropagation(); startRename(id); };
     li.querySelector('.reconnect').onclick = (e) => { e.stopPropagation(); forceReconnect(id); };
     li.querySelector('.detach').onclick = (e) => { e.stopPropagation(); detachSession(id); };
     li.querySelector('.kill').onclick = (e) => { e.stopPropagation(); killSession(id); };
@@ -472,8 +548,16 @@ function renderSidebar() {
       };
     });
     li.onclick = (e) => {
-      if (e.target.classList.contains('retry')) { api.retry(id); return; }
-      if (nameEl.querySelector('input')) return;   // ignore clicks while editing
+      if (e.target.classList.contains('retry')) {
+        if (!reconnectBusy(id)) { markReconnecting(id); api.retry(id); renderSidebar(); }
+        return;
+      }
+      if (v.renaming) return;                     // ignore clicks while editing this row
+      // A double-click on the NAME is the rename gesture, so don't also treat its clicks as
+      // "switch to this project": mounting an unconnected project spawns a backend, and the second
+      // click's re-render is what used to destroy the rename editor. detail >= 2 is the second click
+      // of a double-click; a single click anywhere in the row still mounts as before.
+      if (e.detail >= 2 && nameEl.contains(e.target)) return;
       mount(id);
     };
     // §20: right-click opens the color palette for this project.
@@ -484,34 +568,206 @@ function renderSidebar() {
   }
 }
 
-// --- §20: project drag-and-drop reorder -------------------------------------------------------
-let _dragId = null;
-function wireSidebarDnD(li, id) {
-  li.ondragstart = (e) => { _dragId = id; li.classList.add('dragging'); try { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', id); } catch (_) {} };
-  li.ondragend = () => { _dragId = null; li.classList.remove('dragging'); sessionsEl.querySelectorAll('.drop-before,.drop-after').forEach((n) => n.classList.remove('drop-before', 'drop-after')); };
-  li.ondragover = (e) => {
-    if (_dragId == null || _dragId === id) return;
-    e.preventDefault();
-    const r = li.getBoundingClientRect();
-    const after = e.clientY > r.top + r.height / 2;
-    li.classList.toggle('drop-after', after);
-    li.classList.toggle('drop-before', !after);
-  };
-  li.ondragleave = () => li.classList.remove('drop-before', 'drop-after');
-  li.ondrop = (e) => {
-    e.preventDefault();
-    const after = li.classList.contains('drop-after');
-    li.classList.remove('drop-before', 'drop-after');
-    if (_dragId != null && _dragId !== id) reorderProject(_dragId, id, after);
-  };
+// --- §20/§24: drag-to-reorder, on POINTER events (not HTML5 drag-and-drop) --------------------
+// HTML5 DnD (draggable + dragstart/dragover/drop) does not work inside this webview at all. wry
+// subclasses WKWebView to implement file-drop and overrides the NSDraggingDestination methods; its
+// `dragging_updated` returns NSDragOperationCopy whenever Tauri's handler returns true, and Tauri's
+// handler unconditionally does (tauri-runtime-wry/src/lib.rs). So every drag over the webview is
+// answered "copy" and NEVER forwarded to WebKit: the user sees a "+" badge, the card doesn't move,
+// and dragover/drop never fire in JS. Nothing we can do from the frontend makes that path work —
+// the interception is above us in the native view.
+//
+// So we implement dragging ourselves with pointer events, which are ordinary input the native
+// drag machinery never sees. Bonus: it's what gives us the live "cards move out of the way"
+// feedback that HTML5 DnD can't express (it can only paint a static insertion line).
+//
+// Shared by the project list (vertical) and the tab strip (horizontal) via `axis`. The gesture:
+//   pointerdown  -> arm, remember the origin, but do NOT start yet (a click must stay a click)
+//   pointermove  -> once past DRAG_THRESHOLD px, start: lift the element and follow the pointer
+//   pointerup    -> commit the pending index, or fall through to the click handler if never started
+const DRAG_THRESHOLD = 4;   // px of travel before a press becomes a drag, so clicks still click
+let _drag = null;           // the in-flight gesture, or null
+
+// Where would the dragged element land if the pointer stopped here? Counts the OTHER items whose
+// midpoint the pointer has passed, so the landing slot tracks real geometry instead of an assumed
+// uniform row height (sidebar rows genuinely differ in height — a project with forwarded ports is
+// taller).
+//
+// Fed rects SNAPSHOTTED at drag start rather than live ones. We shift the other items with CSS
+// transforms and getBoundingClientRect reports transformed boxes, so live reads would measure the
+// layout our own feedback just changed — and mid-transition, so the same pointer position could
+// answer differently frame to frame. (Measured: for these one- and two-slot drags live rects happen
+// to give the same answer, since displaced items move AWAY from the pointer. The snapshot is the
+// version whose correctness doesn't depend on that coincidence.)
+function dropIndexAt(rects, dragIndex, coord, axis) {
+  let index = 0;
+  for (let i = 0; i < rects.length; i++) {
+    if (i === dragIndex) continue;
+    const r = rects[i];
+    const mid = axis === 'y' ? r.top + r.height / 2 : r.left + r.width / 2;
+    if (coord > mid) index++;
+  }
+  return index;
 }
 
-// Move dragged project to before/after the target, rebuild the views Map in the new order, persist.
-function reorderProject(dragId, targetId, after) {
-  if (!views.has(dragId) || !views.has(targetId)) return;   // a project vanished mid-drag
-  const ids = [...views.keys()].filter((x) => x !== dragId);
-  const at = ids.indexOf(targetId) + (after ? 1 : 0);
-  ids.splice(at, 0, dragId);
+// How far the other items shift when the dragged one leaves its slot: its own extent PLUS the gap
+// between items, measured from a neighbour's snapshotted rect so it matches whatever the CSS gap /
+// margin actually is rather than hardcoding one.
+function slotSize(d) {
+  const me = d.rects[d.from];
+  const own = d.axis === 'y' ? me.height : me.width;
+  // Measure to whichever neighbour exists — the dragged item may be first or last. Compute the gap
+  // edge-to-edge (not top-to-top), so rows of DIFFERENT heights still yield the true gap: a project
+  // with forwarded ports is taller than one without.
+  const next = d.rects[d.from + 1], prev = d.rects[d.from - 1];
+  let gap = 0;
+  if (next) gap = d.axis === 'y' ? next.top - me.bottom : next.left - me.right;
+  else if (prev) gap = d.axis === 'y' ? me.top - prev.bottom : me.left - prev.right;
+  // Overlapping or wrapped layout gives a nonsense gap; fall back to the bare extent.
+  return own + (gap > 0 && gap < own ? gap : 0);
+}
+
+// Make `el` draggable-by-pointer within `container`. `itemSel` selects the reorderable siblings,
+// `commit(fromIndex, toIndex)` applies the move (indexes over the itemSel list — the standard
+// "remove at from, insert at to" pair).
+//
+// Only `pointerdown` is bound to the element; move/up/cancel live on `window`, installed for the
+// duration of one gesture. Measured, not assumed (see /tmp probes in the §24 notes): element-level
+// pointermove STOPS as soon as the dragged card gets `pointer-events:none` — which it must have, or
+// it sits under the cursor and hit-tests itself — and `setPointerCapture` does not hold in this
+// webview (`hasPointerCapture` reads back false). Window listeners receive every move in all cases.
+// They also survive the element being replaced by a re-render mid-gesture, which element listeners
+// would not.
+function wirePointerDrag(el, container, itemSel, axis, commit) {
+  el.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;                       // left button only; right = context menu
+    if (_drag) return;                                // a gesture is already in flight
+    // Don't hijack a press on something interactive: the action icons, the port rows, the ×, or a
+    // live rename editor. Those are clicks/edits (or text selection), not drags.
+    if (e.target.closest('input, .controls, .tunnel, .tclose, .plus')) return;
+    // Nor while THIS item is being renamed. The editor survives a reorder (it's rebuilt from view
+    // state, §23), but dragging a row you're mid-way through naming isn't a gesture anyone intends,
+    // and `li.onclick` already ignores clicks while renaming — the two should agree.
+    if (el.querySelector('input')) return;
+    const items = [...container.querySelectorAll(itemSel)];
+    const from = items.indexOf(el);
+    if (items.length < 2 || from < 0) return;          // nothing to reorder against
+    const d = {
+      el, container, items, axis, commit, from, to: from,
+      startX: e.clientX, startY: e.clientY, started: false, pointerId: e.pointerId,
+    };
+    _drag = d;
+    // One gesture's worth of window listeners, removed together in `end` — so nothing outlives the
+    // drag and a later re-render can't leave a stale handler behind.
+    d.onMove = (ev) => onDragMove(d, ev);
+    d.onUp = (ev) => endDrag(d, ev, true);
+    d.onCancel = () => endDrag(d, null, false);
+    window.addEventListener('pointermove', d.onMove);
+    window.addEventListener('pointerup', d.onUp);
+    window.addEventListener('pointercancel', d.onCancel);
+  });
+}
+
+function onDragMove(d, e) {
+  if (_drag !== d || e.pointerId !== d.pointerId) return;
+  const dx = e.clientX - d.startX, dy = e.clientY - d.startY;
+  if (!d.started) {
+    if (Math.hypot(dx, dy) < DRAG_THRESHOLD) return;
+    d.started = true;
+    // Snapshot geometry BEFORE any transform is applied — see dropIndexAt.
+    d.rects = d.items.map((it) => it.getBoundingClientRect());
+    d.slot = slotSize(d);
+    // Lift the card: it follows the pointer, and CSS gives .dragging pointer-events:none so it
+    // doesn't hit-test itself while sitting under the cursor.
+    d.el.classList.add('dragging');
+    d.container.classList.add('reordering');
+    // Freeze the extent so the space the card vacates stays exactly its own size.
+    const r = d.rects[d.from];
+    if (d.axis === 'y') d.el.style.height = r.height + 'px'; else d.el.style.width = r.width + 'px';
+    // Belt-and-braces for the selection: drop an anchor the press may have placed INSIDE this strip.
+    // `user-select:none` (see index.html) is what actually prevents the reported highlight, and in
+    // Chromium it's sufficient — measured, no caret is set at all, and removing this block fails no
+    // test. It's kept for WKWebView, which ships and can't be exercised here.
+    //
+    // Deliberately scoped to `d.container`, NOT a bare removeAllRanges(): a selection anywhere else
+    // is the user's (terminal output, a file preview) and clearing it would be a bug of our own. That
+    // is not hypothetical — the unscoped version wiped a planted terminal selection when probed.
+    // Text fields keep their own selection too, so an open rename editor's caret (§23) survives.
+    const sel = window.getSelection();
+    if (sel && sel.rangeCount && !(document.activeElement instanceof HTMLInputElement)
+        && d.container.contains(sel.anchorNode)) {
+      sel.removeAllRanges();
+    }
+  }
+  e.preventDefault();
+  // Follow the pointer along the drag axis only — sideways drift would just look broken.
+  d.el.style.transform = d.axis === 'y' ? `translateY(${dy}px)` : `translateX(${dx}px)`;
+  d.to = dropIndexAt(d.rects, d.from, d.axis === 'y' ? e.clientY : e.clientX, d.axis);
+  // "Move other cards dynamically": every item between the old and new slot shifts by one slot, so
+  // the gap that opens up IS the placeholder. Pure transforms — no reflow and no re-render, so the
+  // dragged element keeps its identity (and an open rename editor elsewhere is untouched).
+  for (let i = 0; i < d.items.length; i++) {
+    if (i === d.from) continue;
+    let shift = 0;
+    if (d.from < d.to && i > d.from && i <= d.to) shift = -d.slot;
+    else if (d.to < d.from && i >= d.to && i < d.from) shift = d.slot;
+    d.items[i].style.transform = shift
+      ? (d.axis === 'y' ? `translateY(${shift}px)` : `translateX(${shift}px)`) : '';
+  }
+}
+
+// End of gesture. `commitMove` false = cancelled (a system gesture, the window losing the pointer):
+// abandon WITHOUT persisting. A half-applied reorder would be worse than none.
+function endDrag(d, e, commitMove) {
+  if (_drag !== d || (e && e.pointerId !== d.pointerId)) return;
+  _drag = null;
+  window.removeEventListener('pointermove', d.onMove);
+  window.removeEventListener('pointerup', d.onUp);
+  window.removeEventListener('pointercancel', d.onCancel);
+  // Never started = the user just clicked. Leave everything alone so the click handler runs.
+  if (!d.started) return;
+  clearDragStyles(d);
+  // A completed drag can still be followed by a `click`, and the row/tab click handlers switch
+  // project / switch tab — reordering must not also select. Swallowed at the WINDOW, capture phase,
+  // because that's where the click actually lands: measured in Chromium, the post-drag click targets
+  // the CONTAINER, not the dragged element (the lifted card has pointer-events:none so it is never
+  // the mouseup target, which puts the down/up common ancestor at the container). A listener on the
+  // element would therefore never see it.
+  //
+  // On that measurement this guard is redundant in Chromium — no row handler receives the click
+  // either way, and removing it fails no test. It's kept as insurance for the shipping engine,
+  // WKWebView, which is not Chromium and which nothing here can exercise; the cost is one
+  // single-shot listener. Do not read the tests as proof that it's load-bearing.
+  const swallow = (ev) => { ev.stopPropagation(); ev.preventDefault(); };
+  window.addEventListener('click', swallow, { capture: true, once: true });
+  // Armed for one turn of the event loop only. With `once` alone, a drag that produced no click at
+  // all would leave the listener primed to eat an unrelated click later.
+  setTimeout(() => window.removeEventListener('click', swallow, { capture: true }), 0);
+  if (commitMove && d.to !== d.from) d.commit(d.from, d.to);
+}
+
+// Undo every inline style/class the drag applied. The subsequent re-render would drop them anyway
+// (both strips rebuild from innerHTML), but a cancelled drag doesn't re-render — so this is what
+// makes cancel actually restore the strip.
+function clearDragStyles(d) {
+  d.el.classList.remove('dragging');
+  d.container.classList.remove('reordering');
+  d.el.style.transform = ''; d.el.style.height = ''; d.el.style.width = '';
+  for (const item of d.items) item.style.transform = '';
+}
+
+function wireSidebarDnD(li, id) {
+  wirePointerDrag(li, sessionsEl, '.session', 'y', (from, to) => reorderProjectByIndex(from, to));
+}
+
+// Move the project at `from` to index `to`, rebuild the views Map in the new order, persist.
+// Index-based (not "before/after target id") because that's what the pointer drag knows: the
+// landing slot, which may be one past the last row — an id-relative form can't name that position.
+function reorderProjectByIndex(from, to) {
+  const ids = [...views.keys()];
+  if (from < 0 || from >= ids.length || to < 0 || to >= ids.length) return;   // list changed mid-drag
+  const [moved] = ids.splice(from, 1);
+  ids.splice(to, 0, moved);
   const reordered = new Map();
   for (const id of ids) { const v = views.get(id); if (v) reordered.set(id, v); }
   views.clear();
@@ -548,12 +804,21 @@ function openColorMenu(ev, current, onPick) {
   const mw = menu.offsetWidth, mh = menu.offsetHeight;
   menu.style.left = Math.min(ev.clientX, window.innerWidth - mw - 8) + 'px';
   menu.style.top = Math.min(ev.clientY, window.innerHeight - mh - 8) + 'px';
+  // Register the dismiss listener so closeColorMenu() unhooks it on EVERY close path. Picking a
+  // swatch calls closeColorMenu() directly, which used to remove the menu but leave this listener
+  // attached — one leaked handler per color pick.
   setTimeout(() => {
-    const off = (e) => { if (!menu.contains(e.target)) { closeColorMenu(); document.removeEventListener('mousedown', off); } };
+    const off = (e) => { if (!menu.contains(e.target)) closeColorMenu(); };
+    colorMenuDismiss = off;
     document.addEventListener('mousedown', off);
   }, 0);
 }
-function closeColorMenu() { const m = document.getElementById('color-menu'); if (m && m.parentNode) m.parentNode.removeChild(m); }
+let colorMenuDismiss = null;   // the outside-click handler for the open menu, if any
+function closeColorMenu() {
+  if (colorMenuDismiss) { document.removeEventListener('mousedown', colorMenuDismiss); colorMenuDismiss = null; }
+  const m = document.getElementById('color-menu');
+  if (m && m.parentNode) m.parentNode.removeChild(m);
+}
 
 function setProjectColor(id, color) {
   const v = views.get(id);
@@ -563,13 +828,26 @@ function setProjectColor(id, color) {
   api.setSessionColor(id, color).catch(() => {});
 }
 
+// Tear down a view's live UI (tabs + container) without deciding its fate. Shared by removeView
+// (session is gone) and detachSession (session survives on the remote and stays in the sidebar).
+function teardownViewUi(v) {
+  for (const [, t] of v.tabs) { try { t.content.dispose(); } catch (_) {} }
+  v.tabs.clear();
+  if (v.el && v.el.parentNode) v.el.parentNode.removeChild(v.el);
+  v.el = null;
+  v.activeWindow = null;
+  v.pending = null;
+}
+
 // Remove a project view from the UI (dispose all its tabs). Does NOT touch the remote.
 function removeView(id) {
   const v = views.get(id);
   if (!v) return;
-  for (const [, t] of v.tabs) { try { t.content.dispose(); } catch (_) {} }
-  if (v.el && v.el.parentNode) v.el.parentNode.removeChild(v.el);
+  teardownViewUi(v);
   views.delete(id);
+  // Drop any output buffered for an id that will never get a view again — makeView is the only
+  // drain, so leaving this would grow without bound for the app's lifetime.
+  delete pendingData[id];
   if (activeId === id) {
     activeId = null;
     tabsEl.className = ''; tabsEl.innerHTML = '';
@@ -580,7 +858,33 @@ function removeView(id) {
 }
 
 // Detach: stop the local client; the remote tmux session keeps running (reattach later).
-function detachSession(id) { api.close(id); removeView(id); }
+// The view STAYS in the sidebar (and its row stays in the store) reset to the unconnected state, so
+// clicking it reattaches via mount(). Removing it here would strand a live remote tmux session with
+// no way back to it — there is no remote-session discovery.
+function detachSession(id) {
+  const v = views.get(id);
+  if (!v) return;
+  api.close(id);
+  teardownViewUi(v);
+  delete pendingData[id];          // late output for the connection we just dropped
+  v.started = false;               // mount() will reattach on the next click
+  v.state = 'idle';
+  v.inputReady = v.meta.mode !== 'control';
+  v.tunnels = [];
+  v.restoreTab = v.lastTab || null;   // reveal the same tab again on reattach
+  if (v.meta.mode !== 'control') ensureTab(v, '@single');
+  if (activeId === id) {
+    activeId = null;
+    tabsEl.className = ''; tabsEl.innerHTML = '';
+    termHost.innerHTML = '';
+    const next = views.keys().next();
+    if (!next.done) mount(next.value); else setStatus('detached — click a session to reattach');
+  } else {
+    setStatus('detached (still running on the remote)');
+  }
+  renderSidebar();
+  updateConsoleGate();
+}
 
 // Force reconnect: tear down and reattach the SAME session now, even if it currently looks
 // connected (e.g. a wedged/half-open link after a network change). The backend resets its retry
@@ -589,10 +893,13 @@ function detachSession(id) { api.close(id); removeView(id); }
 function forceReconnect(id) {
   const v = views.get(id);
   if (!v || v.meta.mode !== 'control') return;   // only supervised control sessions reconnect
+  if (reconnectBusy(id)) { setStatus('reconnect already in progress…'); return; }
+  markReconnecting(id);
   v.inputReady = false;
   if (id === activeId) updateConsoleGate();
   setStatus('reconnecting…');
   api.forceReconnect(id);
+  renderSidebar();
 }
 
 // Kill: terminate the remote tmux session (ends its processes). Irreversible → confirm.
@@ -608,70 +915,148 @@ async function killSession(id) {
   removeView(id);
 }
 
-// Inline-edit the session's display title. On commit, persist via main and update the view.
-function startRename(id, nameEl) {
+// §23: inline-edit the session's display title.
+//
+// The editor is STATE-DRIVEN (v.renaming on the view), NOT a node this handler mutates directly.
+// That's load-bearing: a double-click delivers click, click, dblclick — and the row's click handler
+// calls mount(), which calls renderSidebar(), which rebuilds the whole list with `innerHTML = ''`.
+// So by the time dblclick fires, the node it closed over is already detached, and appending an
+// <input> to it produced an editor that was created and "focused" but not in the document —
+// invisible and untypable ("rename not enabled"). Holding the intent in the view instead means any
+// re-render (the clicks themselves, a session:state event, the 5s tunnel refresh) REBUILDS the
+// editor in the live row rather than destroying it. Covered by test/gui-rename.js, which drives
+// real OS-level double-clicks — a synthetic dblclick event skips the two clicks and can't see this.
+function startRename(id) {
   const v = views.get(id);
-  if (!v) return;
+  if (!v || v.renaming) return;
+  v.renaming = true;
+  v.renameDraft = v.meta.title || v.meta.session || '';
+  v.renameSel = null;       // caret, preserved across re-renders (see mountRenameInput)
+  v.renameFocus = true;     // focus once, on the next render
+  renderSidebar();
+}
+
+async function commitRename(id, save) {
+  const v = views.get(id);
+  // Guard: blur fires after Enter/Escape already committed, so the second call must be a no-op
+  // (otherwise a committed rename would be sent twice).
+  if (!v || !v.renaming) return;
   const current = v.meta.title || v.meta.session || '';
+  const next = (v.renameDraft || '').trim();
+  v.renaming = false; v.renameDraft = null; v.renameSel = null; v.renameFocus = false;
+  renderSidebar();
+  if (save && next && next !== current) {
+    const res = await api.rename(id, next);
+    if (res && res.ok) { v.meta.title = res.title; renderSidebar(); }
+  }
+}
+
+// Build the rename editor inside the row's (live) name node. Called from renderSidebar, so it runs
+// again on every re-render while the edit is open.
+function mountRenameInput(v, nameEl, id) {
   const input = document.createElement('input');
   input.type = 'text';
-  input.value = current;
   input.className = 'rename-input';
+  input.value = v.renameDraft != null ? v.renameDraft : '';
   nameEl.textContent = '';
   nameEl.appendChild(input);
-  input.focus();
-  input.select();
-
-  let done = false;
-  const commit = async (save) => {
-    if (done) return; done = true;
-    if (save) {
-      const next = input.value.trim();
-      if (next && next !== current) {
-        const res = await api.rename(id, next);
-        if (res && res.ok) v.meta.title = res.title;
-      }
-    }
-    renderSidebar();
+  // Mirror value AND caret into the view on every change, so a re-render mid-typing neither resets
+  // the field nor jumps the cursor.
+  const remember = () => {
+    v.renameDraft = input.value;
+    v.renameSel = [input.selectionStart, input.selectionEnd];
   };
+  input.oninput = remember;
+  input.onkeyup = remember;
+  input.onselect = remember;
+  input.onclick = (e) => e.stopPropagation();      // don't switch project while editing
+  input.ondblclick = (e) => e.stopPropagation();
   input.onkeydown = (e) => {
-    if (e.key === 'Enter') { e.preventDefault(); commit(true); }
-    else if (e.key === 'Escape') { e.preventDefault(); commit(false); }
+    if (e.key === 'Enter') { e.preventDefault(); commitRename(id, true); }
+    else if (e.key === 'Escape') { e.preventDefault(); commitRename(id, false); }
   };
-  input.onblur = () => commit(true);
+  input.onblur = () => commitRename(id, true);
+  if (v.renameFocus) {
+    v.renameFocus = false;
+    // Focus on the next frame: the node is in the tree now, but a rAF also survives the second
+    // click of the double-click re-rendering the row underneath us.
+    requestAnimationFrame(() => { if (input.isConnected) { input.focus(); input.select(); } });
+  } else {
+    // A later re-render (state event, tunnel tick): restore focus + caret so typing is unbroken.
+    if (v.renameSel) { try { input.setSelectionRange(v.renameSel[0], v.renameSel[1]); } catch (_) {} }
+    requestAnimationFrame(() => {
+      if (input.isConnected && document.activeElement !== input) {
+        input.focus();
+        if (v.renameSel) { try { input.setSelectionRange(v.renameSel[0], v.renameSel[1]); } catch (_) {} }
+      }
+    });
+  }
 }
 
 // Inline-edit a tmux-window tab's title. Sends the new name to tmux (rename-window, which also
 // pins it by disabling automatic-rename); an empty value clears the manual name so it follows the
 // pane title again. tmux echoes %window-renamed, which updates tab.title authoritatively.
-function startTabRename(v, wid, labelEl) {
+//
+// §23: state-driven for the same reason as the sidebar rename (see startRename): the tab's click handler
+// calls switchTab() -> renderTabs(), so the two clicks of a double-click rebuilt the strip before
+// dblclick fired and the editor landed on a detached node. The intent lives on the tab.
+function startTabRename(v, wid) {
   const tab = v.tabs.get(wid);
-  if (!tab) return;
+  if (!tab || tab.renaming) return;
+  tab.renaming = true;
+  tab.renameDraft = tab.title && tab.title !== wid ? tab.title : '';
+  tab.renameSel = null;
+  tab.renameFocus = true;
+  renderTabs(v);
+}
+
+function commitTabRename(v, wid, save) {
+  const tab = v.tabs.get(wid);
+  if (!tab || !tab.renaming) return;      // blur after Enter/Escape must not re-send
   const current = tab.title && tab.title !== wid ? tab.title : '';
+  const next = (tab.renameDraft || '').trim();
+  tab.renaming = false; tab.renameDraft = null; tab.renameSel = null; tab.renameFocus = false;
+  // An EMPTY value is meaningful here (it clears the manual name so tmux resumes auto-rename), so
+  // this sends on any change from current — unlike the project rename, where empty means "cancel".
+  if (save && next !== current) api.tabRename(v.meta.id, wid, next);
+  renderTabs(v);   // repaint; tmux's %window-renamed echo settles the final label
+}
+
+// Build the tab's rename editor inside the (live) label node; re-run on every renderTabs.
+function mountTabRenameInput(v, wid, labelEl) {
+  const tab = v.tabs.get(wid);
   const input = document.createElement('input');
   input.type = 'text';
-  input.value = current;
   input.className = 'tab-rename-input';
+  input.value = tab.renameDraft != null ? tab.renameDraft : '';
   labelEl.textContent = '';
   labelEl.appendChild(input);
-  input.focus();
-  input.select();
-  input.onclick = (e) => e.stopPropagation();   // don't switch tabs while editing
-
-  let done = false;
-  const commit = (save) => {
-    if (done) return; done = true;
-    if (save) {
-      const next = input.value.trim();
-      if (next !== current) api.tabRename(v.meta.id, wid, next);
-    }
-    renderTabs(v);   // repaint; tmux's %window-renamed echo will settle the final label
+  const remember = () => {
+    tab.renameDraft = input.value;
+    tab.renameSel = [input.selectionStart, input.selectionEnd];
   };
+  input.oninput = remember;
+  input.onkeyup = remember;
+  input.onselect = remember;
+  input.onclick = (e) => e.stopPropagation();     // don't switch tabs while editing
+  input.ondblclick = (e) => e.stopPropagation();
   input.onkeydown = (e) => {
-    if (e.key === 'Enter') { e.preventDefault(); commit(true); }
-    else if (e.key === 'Escape') { e.preventDefault(); commit(false); }
+    if (e.key === 'Enter') { e.preventDefault(); commitTabRename(v, wid, true); }
+    else if (e.key === 'Escape') { e.preventDefault(); commitTabRename(v, wid, false); }
   };
-  input.onblur = () => commit(true);
+  input.onblur = () => commitTabRename(v, wid, true);
+  if (tab.renameFocus) {
+    tab.renameFocus = false;
+    requestAnimationFrame(() => { if (input.isConnected) { input.focus(); input.select(); } });
+  } else {
+    if (tab.renameSel) { try { input.setSelectionRange(tab.renameSel[0], tab.renameSel[1]); } catch (_) {} }
+    requestAnimationFrame(() => {
+      if (input.isConnected && document.activeElement !== input) {
+        input.focus();
+        if (tab.renameSel) { try { input.setSelectionRange(tab.renameSel[0], tab.renameSel[1]); } catch (_) {} }
+      }
+    });
+  }
 }
 
 // --- events from main ---
@@ -716,9 +1101,15 @@ window.__testReadBuffer = () => {
   return tab && tab.content.readBuffer ? tab.content.readBuffer() : '';
 };
 api.onState(({ id, state }) => {
+  // Logged like onWindow/onReady: a session stuck showing "connecting" is exactly a missing/late
+  // state event, and without this line the log can't distinguish "never emitted" from "ignored".
+  dbg('onState id=' + id + ' state=' + state + ' mode=' + (views.get(id)?.meta.mode));
   const v = views.get(id);
   if (!v) return;
   v.state = state;
+  // The backend has acted on the reconnect request (it always reports a state after a spawn), so
+  // release the in-flight guard and let the control be clicked again.
+  if (state !== 'connecting') clearReconnect(id);
   if (id === activeId) { setStatus(statusLine(v, state)); updateConsoleGate(); }
   renderSidebar();
 });
@@ -800,15 +1191,25 @@ function renderTabs(v) {
   for (const wid of tabDisplayOrder(v)) {
     const tab = v.tabs.get(wid);
     const el = document.createElement('div');
-    el.className = 'tab' + (wid === v.activeWindow ? ' active' : '');
+    el.className = 'tab' + (wid === v.activeWindow ? ' active' : '') + (tab.closing ? ' closing' : '');
     const color = v.tabColors[wid];
     if (color) { el.style.setProperty('--tab-color', color); el.classList.add('has-color'); }
     el.innerHTML = `<span class="tlabel" title="double-click to rename">${escapeHtml(tab.title || wid)}</span><span class="tclose" title="close">×</span>`;
     const label = el.querySelector('.tlabel');
-    label.onclick = () => switchTab(v, wid);
+    // Editor rebuilt from tab state each render, so it survives the double-click's own re-renders.
+    if (tab.renaming) mountTabRenameInput(v, wid, label);
+    label.onclick = (e) => {
+      // The second click of a double-click is the rename gesture, not a tab switch (switchTab's
+      // renderTabs is what used to destroy the editor). Belt-and-braces: switchTab's own
+      // `activeWindow === winId` early-out also swallows the second click here, since the first one
+      // just made this tab active — either guard alone is enough (mutation-tested), but the intent is
+      // clearer stated at the gesture than inferred from a downstream no-op.
+      if (tab.renaming || e.detail >= 2) return;
+      switchTab(v, wid);
+    };
     // Double-click a real tmux-window tab to rename it. A manual rename sticks (tmux disables
     // automatic-rename for that window); clearing it re-enables auto-rename.
-    if (isWindowTab(wid)) label.ondblclick = (e) => { e.stopPropagation(); startTabRename(v, wid, label); };
+    if (isWindowTab(wid)) label.ondblclick = (e) => { e.stopPropagation(); startTabRename(v, wid); };
     el.querySelector('.tclose').onclick = (e) => { e.stopPropagation(); closeTab(v, wid); };
     // §20: right-click a tab -> color palette; drag to reorder within the strip.
     el.oncontextmenu = (e) => { e.preventDefault(); openColorMenu(e, v.tabColors[wid], (c) => setTabColor(v, wid, c)); };
@@ -828,33 +1229,20 @@ function setTabColor(v, wid, color) {
   api.setTabPrefs(v.meta.id, null, [wid, color || null]).catch(() => {});
 }
 
-// §20: tab drag-and-drop reorder (horizontal). Persists the custom order for this project.
-let _dragTab = null;
+// §20/§24: tab reorder (horizontal), same pointer-drag mechanism as the sidebar — HTML5 DnD is
+// unavailable in this webview (see wirePointerDrag). `:not(.plus)` keeps the trailing "+" button out
+// of the reorderable set: it isn't a tab and must not be displaced or landed on.
 function wireTabDnD(el, v, wid) {
-  el.draggable = true;
-  el.ondragstart = (e) => { _dragTab = wid; el.classList.add('dragging'); try { e.dataTransfer.effectAllowed = 'move'; } catch (_) {} };
-  el.ondragend = () => { _dragTab = null; el.classList.remove('dragging'); tabsEl.querySelectorAll('.drop-before,.drop-after').forEach((n) => n.classList.remove('drop-before', 'drop-after')); };
-  el.ondragover = (e) => {
-    if (_dragTab == null || _dragTab === wid) return;
-    e.preventDefault();
-    const r = el.getBoundingClientRect();
-    const after = e.clientX > r.left + r.width / 2;
-    el.classList.toggle('drop-after', after);
-    el.classList.toggle('drop-before', !after);
-  };
-  el.ondragleave = () => el.classList.remove('drop-before', 'drop-after');
-  el.ondrop = (e) => {
-    e.preventDefault();
-    const after = el.classList.contains('drop-after');
-    el.classList.remove('drop-before', 'drop-after');
-    if (_dragTab != null && _dragTab !== wid) reorderTab(v, _dragTab, wid, after);
-  };
+  wirePointerDrag(el, tabsEl, '.tab:not(.plus)', 'x', (from, to) => reorderTabByIndex(v, from, to));
 }
 
-function reorderTab(v, dragWid, targetWid, after) {
-  const order = tabDisplayOrder(v).filter((w) => w !== dragWid);
-  const at = order.indexOf(targetWid) + (after ? 1 : 0);
-  order.splice(at, 0, dragWid);
+// Move the tab at display index `from` to index `to`, then persist. Indexes are over
+// tabDisplayOrder(v), which is exactly the DOM order wirePointerDrag measured.
+function reorderTabByIndex(v, from, to) {
+  const order = tabDisplayOrder(v);
+  if (from < 0 || from >= order.length || to < 0 || to >= order.length) return;  // strip changed mid-drag
+  const [moved] = order.splice(from, 1);
+  order.splice(to, 0, moved);
   // Persist + track only real tmux-window ids (viewer tabs are app-local, never restored), so the
   // in-memory savedTabOrder can't diverge from what's stored.
   const windowOrder = order.filter(isWindowTab);
@@ -884,7 +1272,18 @@ function rememberLastTab(v, winId) {
 // Close a tab. Terminal tabs -> tmux kill-window (backend removes it, emits close). Viewer tabs
 // are app-local -> dispose locally, no tmux command, and re-focus a remaining tab.
 function closeTab(v, winId) {
-  if (isWindowTab(winId)) { api.tabClose(v.meta.id, winId); return; }
+  if (isWindowTab(winId)) {
+    // The tab disappears only when tmux confirms via the window-close event, so give immediate
+    // feedback and ignore repeat clicks — otherwise the unchanged tab invites a second kill-window.
+    const t = v.tabs.get(winId);
+    if (t) {
+      if (t.closing) return;
+      t.closing = true;
+      if (v.meta.id === activeId) renderTabs(v);   // reflect the pending close in the strip
+    }
+    api.tabClose(v.meta.id, winId);
+    return;
+  }
   const t = v.tabs.get(winId);
   if (t) { try { t.content.dispose(); } catch (_) {} v.tabs.delete(winId); }
   if (v.activeWindow === winId) {
@@ -894,15 +1293,6 @@ function closeTab(v, winId) {
   }
   if (v.meta.id === activeId) renderTabs(v);
 }
-api.onError(({ id, error }) => {
-  setStatus(`⚠ ${error}`);
-  statusEl.style.color = '#f38ba8';
-  // also write it into the active terminal so it's unmissable
-  const v = views.get(id) || views.get(activeId);
-  const tab = v && activeTab(v);
-  if (tab && tab.mounted && tab.content.term) tab.content.term.writeln(`\r\n\x1b[31m[error] ${error}\x1b[0m`);
-  else alert(error);
-});
 api.onIntentionalExit(({ id }) => { setStatus('session closed (detached)'); });
 api.onReady(({ id }) => {
   dbg('onReady id=' + id + ' activeId=' + activeId);
@@ -919,13 +1309,6 @@ api.onTunnels(({ id, tunnels }) => {
   const v = views.get(id);
   if (!v) return;
   v.tunnels = Array.isArray(tunnels) ? tunnels : [];
-  renderSidebar();
-});
-api.onInfo(({ id, info, tmuxVersion }) => {
-  const v = views.get(id);
-  if (v && tmuxVersion) { v.tmuxVersion = tmuxVersion; v.meta.tmuxVersion = tmuxVersion; }
-  setStatus(info);
-  statusEl.style.color = 'var(--muted)';
   renderSidebar();
 });
 
@@ -967,7 +1350,14 @@ const hostHistoryEl = document.getElementById('host-history');
 function setNative(on) { fControl.classList.toggle('on', !!on); fControl.setAttribute('aria-checked', on ? 'true' : 'false'); }
 fControl.onclick = () => setNative(!fControl.classList.contains('on'));
 
-const updateFields = () => { remoteFields.style.display = fKind.value === 'remote' ? 'block' : 'none'; };
+const localHint = document.getElementById('local-hint');
+const updateFields = () => {
+  const remote = fKind.value === 'remote';
+  remoteFields.style.display = remote ? 'block' : 'none';
+  // The local blurb replaces the ssh one; the Native-tabs toggle sits outside both and applies to
+  // either kind, since a local session runs a real tmux too.
+  if (localHint) localHint.style.display = remote ? 'none' : 'block';
+};
 fKind.onchange = updateFields;
 
 document.getElementById('new').addEventListener('click', () => {
@@ -1014,15 +1404,23 @@ document.getElementById('form').addEventListener('submit', async (e) => {
   }
   const meta = {
     kind,
-    transport: 'ssh',   // ssh is the only remote transport
+    // ssh is the only REMOTE transport; a local session's tmux is exec'd directly (no ssh).
+    transport: kind === 'local' ? 'local' : 'ssh',
     mode: fControl.classList.contains('on') ? 'control' : 'plain',
     title: document.getElementById('f-title').value.trim() || (kind === 'local' ? 'local' : host),
     host,
     // NOTE: no session name from the user — main.js generates & owns it.
   };
-  const { id, session } = await api.createSession(meta);
+  const res = await api.createSession(meta);
+  const { id, session } = res;
   meta.id = id;
   meta.session = session;   // remember the app-assigned name for the sidebar/label
+  // Adopt what the backend ACTUALLY used. A local session is downgraded control -> plain on tmux
+  // < 3.2, and all the way to mode 'local' (a bare pty, no tabs) when tmux isn't installed; the view
+  // must know that or it would wait for %window events that never arrive.
+  if (res.mode) meta.mode = res.mode;
+  if (res.tmuxPath) meta.tmuxPath = res.tmuxPath;
+  if (res.tmuxVersion) meta.tmuxVersion = res.tmuxVersion;
   const v = makeView(meta);
   v.started = true;         // createSession already ran; mount() must not start it again
   mount(id);
@@ -1041,7 +1439,9 @@ document.getElementById('form').addEventListener('submit', async (e) => {
   dbg('init: ' + persisted.length + ' persisted; lastActive=' + lastActive);
   for (const meta of persisted) {
     // meta already has {id, host, session, transport, title, color, lastTab, tabOrder, tabColors}.
-    const v = makeView({ ...meta, kind: 'remote' });
+    // kind comes from the persisted transport: a 'local' row must NOT be restored as 'remote', or
+    // reconnecting it would build ssh args for an empty host instead of attaching the local tmux.
+    const v = makeView({ ...meta, kind: meta.transport === 'local' ? 'local' : 'remote' });
     v.started = false;   // not connected yet; mount() will start (reattach) on click
   }
   renderSidebar();

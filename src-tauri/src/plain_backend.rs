@@ -9,7 +9,8 @@ use std::thread;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system, MasterPty};
 
 use crate::tmux_socket::socket_name;
-use crate::validation::{self, build_ssh_args};
+use crate::transport::{self, Transport};
+use crate::validation;
 
 /// Events: plain mode has no window tagging — data is a single stream, window is empty.
 #[derive(Debug, Clone)]
@@ -26,6 +27,17 @@ pub struct PlainConfig {
     pub tmux_path: String,
     pub tmux_version: Option<(u32, u32)>,
     pub base_args: Vec<String>,
+    /// ssh to `host`, or tmux on THIS machine (kind:'local'). See transport.rs.
+    pub transport: Transport,
+}
+
+impl Default for PlainConfig {
+    fn default() -> Self {
+        PlainConfig {
+            host: String::new(), session: String::new(), tmux_path: "tmux".into(),
+            tmux_version: None, base_args: vec![], transport: Transport::Ssh,
+        }
+    }
 }
 
 pub struct PlainBackend {
@@ -39,21 +51,19 @@ impl PlainBackend {
         -> Result<Self, validation::ValidationError>
     {
         let socket = socket_name("plain", cfg.tmux_version, &cfg.session);
-        let mut opts: Vec<String> = vec![
-            "-o".into(), "ConnectTimeout=8".into(),
-            "-o".into(), "ServerAliveInterval=15".into(),
-            "-o".into(), "ServerAliveCountMax=3".into(),
-        ];
-        opts.extend(cfg.base_args.iter().cloned());
-        let ssh_args = build_ssh_args(&cfg.host, &cfg.session, &opts, &cfg.tmux_path, &socket)?;
+        let (lc_all, lang) = transport::current_locale();
+        let spec = transport::spawn_spec(
+            cfg.transport, false, &cfg.host, &cfg.session, &cfg.tmux_path, &socket,
+            &cfg.base_args, lc_all.as_deref(), lang.as_deref(),
+        )?;
 
         let pty = native_pty_system();
         let pair = pty.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .expect("openpty failed");
-        let mut cmd = CommandBuilder::new("ssh");
-        cmd.args(&ssh_args);
-        cmd.env("PATH", crate::augmented_path());
-        let child = pair.slave.spawn_command(cmd).expect("ssh spawn failed");
+        let mut cmd = CommandBuilder::new(&spec.program);
+        cmd.args(&spec.args);
+        for (k, v) in &spec.env { cmd.env(k, v); }
+        let child = pair.slave.spawn_command(cmd).expect("tmux client spawn failed");
         drop(pair.slave);
 
         let writer = pair.master.take_writer().expect("pty writer");

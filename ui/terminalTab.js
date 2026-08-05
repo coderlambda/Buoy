@@ -111,14 +111,34 @@ function byteLen(s) { return typeof TextEncoder !== 'undefined' ? new TextEncode
 // selections the same (write to the system clipboard). A "?" data field is a clipboard READ
 // request — we refuse it (returning '') so a remote program can't exfiltrate the clipboard.
 function decodeOsc52(payload) {
-  const semi = String(payload == null ? '' : payload).indexOf(';');
-  const b64 = semi >= 0 ? payload.slice(semi + 1) : payload;
-  if (!b64 || b64 === '?') return '';
-  const b64decode = (s) => (typeof atob === 'function')
-    ? atob(s)
-    : Buffer.from(s, 'base64').toString('binary');
-  try { return decodeURIComponent(escape(b64decode(b64))); }   // base64(binary) -> UTF-8
-  catch (_) { try { return b64decode(b64); } catch (_) { return ''; } }
+  const s = String(payload == null ? '' : payload);
+  const semi = s.indexOf(';');
+  const b64 = semi >= 0 ? s.slice(semi + 1) : s;
+  // Refuse any read request ("?" data field), not just an exact match: a read would let a remote
+  // program exfiltrate the local clipboard.
+  if (!b64 || b64.trim() === '' || b64.indexOf('?') >= 0) return '';
+  // Decode base64 -> BYTES, then strict UTF-8. The old decodeURIComponent(escape(..)) path threw on
+  // any payload that wasn't wholly valid UTF-8 and fell back to the raw binary string, which silently
+  // wrote mojibake to the system clipboard (e.g. valid-UTF-8 "café" mixed with one latin-1 byte came
+  // out as "cafÃ© é"). Strict decoding means we either produce the right text or nothing.
+  let bytes;
+  try {
+    if (typeof atob === 'function') {
+      const bin = atob(b64);
+      bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i) & 0xFF;
+    } else {
+      bytes = new Uint8Array(Buffer.from(b64, 'base64'));
+    }
+  } catch (_) { return ''; }
+  if (!bytes.length) return '';
+  if (typeof TextDecoder === 'function') {
+    try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
+    catch (_) { return ''; }   // not valid UTF-8 -> refuse rather than paste garbage
+  }
+  // No TextDecoder (old runtime): Buffer's toString('utf8') is lossy, so verify by round-trip.
+  const text = Buffer.from(bytes).toString('utf8');
+  return Buffer.from(text, 'utf8').equals(Buffer.from(bytes)) ? text : '';
 }
 
 if (typeof module !== 'undefined' && module.exports) module.exports = { createTerminalTab, decodeOsc52 };

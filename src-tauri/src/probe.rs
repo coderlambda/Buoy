@@ -99,6 +99,55 @@ fn fallback() -> ProbeResult {
     ProbeResult { tmux_path: "tmux".into(), version: None, probed: false }
 }
 
+/// Probe THIS machine for tmux (kind:'local' — DESIGN.md §5.3b). Same selection rule as the ssh
+/// probe (prefer >= 3.2, then highest version) but no ssh and no shell: each candidate is exec'd
+/// directly, so nothing here can be influenced by the user's login-shell config.
+///
+/// Returns `probed: false` with no version when tmux is absent — the caller then falls back to a
+/// raw pty (a local shell with no tmux at all), which is the one case where a local session cannot
+/// be durable.
+pub fn probe_local_tmux() -> ProbeResult {
+    let home = std::env::var("HOME").unwrap_or_default();
+    // PATH first (respects a user's chosen tmux, e.g. a newer one earlier in PATH), then the same
+    // absolute candidates the ssh probe uses, so a Finder-launched app with a bare PATH still finds
+    // Homebrew/MacPorts installs.
+    let mut candidates: Vec<String> = Vec::new();
+    for dir in augmented_path_dirs() {
+        candidates.push(format!("{dir}/tmux"));
+    }
+    for c in ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/opt/local/bin/tmux", "/usr/bin/tmux"] {
+        candidates.push(c.to_string());
+    }
+    if !home.is_empty() { candidates.push(format!("{home}/.local/bin/tmux")); }
+
+    let mut found: Vec<(String, (u32, u32))> = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = Default::default();
+    for path in candidates {
+        if !seen.insert(path.clone()) { continue; }
+        // A path with characters the argv builder would reject is unusable even if it exists, so
+        // skip it here rather than discovering that at spawn time.
+        if !crate::validation::is_safe_tmux_path(&path) { continue; }
+        if !std::path::Path::new(&path).is_file() { continue; }
+        let out = match Command::new(&path).arg("-V").output() {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        if let Some(ver) = parse_version(&text) { found.push((path, ver)); }
+    }
+    if found.is_empty() { return ProbeResult { tmux_path: "tmux".into(), version: None, probed: false }; }
+    let modern: Vec<_> = found.iter().filter(|(_, v)| gte(*v, MIN_MODERN)).cloned().collect();
+    let mut pool = if !modern.is_empty() { modern } else { found };
+    pool.sort_by(|a, b| b.1.cmp(&a.1));
+    let (path, ver) = pool.into_iter().next().unwrap();
+    ProbeResult { tmux_path: path, version: Some(ver), probed: true }
+}
+
+/// PATH entries (already augmented for a Finder-launched app), in order.
+fn augmented_path_dirs() -> Vec<String> {
+    crate::augmented_path().split(':').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,5 +165,27 @@ mod tests {
         assert!(gte((3, 7), (3, 2)));
         assert!(gte((4, 0), (3, 9)));
         assert!(!gte((3, 1), (3, 2)));
+    }
+
+    // TC-P-L1 the local probe finds THIS machine's tmux (when installed) and reports a usable
+    // absolute path + version, with no ssh involved. A machine without tmux is a valid outcome
+    // (probed:false -> the raw-pty fallback), so both branches are asserted rather than requiring
+    // tmux in CI.
+    #[test]
+    fn tc_p_l1_probe_local_tmux() {
+        let r = probe_local_tmux();
+        if r.probed {
+            let v = r.version.expect("a probed local tmux reports its version");
+            assert!(v.0 >= 1, "plausible major version, got {v:?}");
+            assert!(std::path::Path::new(&r.tmux_path).is_file(),
+                "probed path exists: {}", r.tmux_path);
+            assert!(crate::validation::is_safe_tmux_path(&r.tmux_path),
+                "probed path passes the argv charset: {}", r.tmux_path);
+            // it must be the real binary, not the bare-name fallback
+            assert_ne!(r.tmux_path, "tmux", "a successful probe resolves an absolute path");
+        } else {
+            assert_eq!(r.tmux_path, "tmux");
+            assert_eq!(r.version, None);
+        }
     }
 }

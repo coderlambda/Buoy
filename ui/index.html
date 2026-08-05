@@ -22,10 +22,23 @@
     /* §20: project accent bar (left edge), color set per-item via --accent-bar */
     .session.has-color::before { content:''; position:absolute; left:0; top:4px; bottom:4px; width:3px;
       border-radius:2px; background:var(--accent-bar); }
-    /* §20: drag-reorder states */
-    .session.dragging { opacity:.4; }
-    .session.drop-before { box-shadow:inset 0 2px 0 var(--accent); }
-    .session.drop-after { box-shadow:inset 0 -2px 0 var(--accent); }
+    /* §20/§24: pointer-drag reorder. The dragged card is LIFTED (follows the cursor) and the others
+       slide out of its way; the gap they open is the drop placeholder, so no insertion line needed.
+       The shift transition is on the siblings only — the dragged card must track the pointer with
+       zero lag, so it gets `transition:none`. pointer-events:none while dragging keeps the lifted
+       card from swallowing the pointermove stream it depends on. */
+    #sessions.reordering .session { transition:transform .16s ease; }
+    #sessions.reordering { cursor:grabbing; }
+    /* Labels are NOT selectable — and this must be unconditional, not `.reordering`-only. A press
+       places a selection anchor immediately, before the 4px drag threshold has told us it's a drag,
+       and flipping user-select afterwards does not reliably abort a selection drag already in
+       flight (Chromium stops extending; WebKit, which is what ships, keeps going — so dragging a
+       card highlighted the text on the cards it passed over). These are chrome labels; nobody
+       selects them. The rename editors opt back IN below. */
+    #sessions { user-select:none; }
+    #sessions input { user-select:text; }
+    .session.dragging { opacity:.85; z-index:5; transition:none !important; pointer-events:none;
+      background:#313244; box-shadow:0 4px 14px rgba(0,0,0,.45); cursor:grabbing; }
     .dot { width:8px; height:8px; border-radius:50%; background:var(--muted); flex:none; margin-top:4px; }
     .dot.connected { background:#a6e3a1; } .dot.connecting { background:#f9e2af; }
     .dot.reconnecting { background:#fab387; } .dot.dead { background:#f38ba8; }
@@ -53,6 +66,9 @@
     .session .act { flex:none; width:16px; text-align:center; font-size:11px;
       line-height:16px; color:var(--muted); cursor:pointer; }
     .session .act.reconnect:hover { color:var(--accent); }
+    /* A reconnect is in flight: dim the control and swallow clicks so a double-click can't stack
+       two backend spawns (which would evict each other via tmux `new-session -D`). */
+    .session .act.reconnect.busy, .session .retry.busy { opacity:.4; pointer-events:none; }
     .session .act.detach:hover { color:var(--fg); }
     .session .act.kill:hover { color:#f38ba8; }
     /* §18: forwarded-port list under the project name */
@@ -83,11 +99,16 @@
       color:var(--muted); background:var(--bg); border:1px solid #313244; border-bottom:none;
       border-radius:6px 6px 0 0; cursor:pointer; min-width:90px; max-width:180px; }
     #tabs .tab.active { color:var(--fg); background:#313244; }
-    /* §20: tab color (a top accent stripe) + drag-reorder states */
+    /* §20: tab color (a top accent stripe) + §24 pointer-drag reorder (same model as the sidebar) */
     #tabs .tab.has-color { border-top:2px solid var(--tab-color); padding-top:2px; }
-    #tabs .tab.dragging { opacity:.4; }
-    #tabs .tab.drop-before { box-shadow:inset 2px 0 0 var(--accent); }
-    #tabs .tab.drop-after { box-shadow:inset -2px 0 0 var(--accent); }
+    #tabs.reordering .tab { transition:transform .16s ease; }
+    #tabs.reordering { cursor:grabbing; }
+    #tabs { user-select:none; }              /* see #sessions: unconditional, not .reordering-only */
+    #tabs input { user-select:text; }
+    #tabs .tab.dragging { opacity:.85; z-index:5; transition:none !important; pointer-events:none;
+      background:#313244; box-shadow:0 4px 14px rgba(0,0,0,.45); cursor:grabbing; }
+    /* kill-window sent, waiting for tmux to confirm the close: dim and ignore repeat clicks */
+    #tabs .tab.closing { opacity:.45; pointer-events:none; }
     #tabs .tab .tlabel { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:160px; }
     #tabs .tab .tab-rename-input { font:inherit; color:var(--fg); background:var(--bg);
       border:1px solid var(--accent); border-radius:4px; padding:0 4px; width:140px; }
@@ -152,6 +173,12 @@
     .fv-dl { padding:4px 10px; background:var(--accent); color:#11111b; border:none; border-radius:5px;
       cursor:pointer; font-size:12px; }
     .fv-dl:disabled { opacity:.6; cursor:default; }
+    /* "Enable scripts" is a security-relevant opt-in, so it reads as secondary (outlined, not the
+       accent fill of Download) — deliberate action, not the obvious default button to mash. */
+    .fv-scripts { padding:4px 10px; background:transparent; color:var(--muted);
+      border:1px solid #45475a; border-radius:5px; cursor:pointer; font-size:12px; }
+    .fv-scripts:hover { color:var(--fg); border-color:var(--accent); }
+    .fv-scripts:disabled { opacity:.6; cursor:default; }
     .fv-body { flex:1; overflow:auto; padding:12px; min-height:0; }
     .fv-text { margin:0; white-space:pre; font-family:Menlo,Consolas,monospace; font-size:12px;
       color:var(--fg); }
@@ -169,6 +196,12 @@
     .fv-md table.mdtable th, .fv-md table.mdtable td { border:1px solid #45475a; padding:5px 10px; }
     .fv-md table.mdtable th { background:var(--panel); font-weight:600; text-align:left; }
     .fv-md table.mdtable tr:nth-child(even) td { background:rgba(255,255,255,.02); }
+    /* Self-contained HTML preview: the file styles ITSELF, so give it a plain white canvas rather
+       than inheriting the app's dark theme (most exported HTML assumes a light background and
+       would otherwise render dark-on-dark). The iframe owns its scrolling; .fv-body must not
+       double-scroll it, hence the padding reset via .fv-body:has(). */
+    .fv-html { width:100%; height:100%; border:0; background:#fff; display:block; }
+    .fv-body:has(> .fv-html) { padding:0; overflow:hidden; }
     /* URL open chooser (§18) */
     .chooser-back { position:fixed; inset:0; background:rgba(0,0,0,.35); display:flex;
       align-items:center; justify-content:center; z-index:50; }
@@ -211,7 +244,7 @@
       <div><label>Type</label>
         <select id="f-kind">
           <option value="remote" selected>Remote host (ssh + tmux)</option>
-          <option value="local">Local shell</option>
+          <option value="local">Local shell (tmux)</option>
         </select></div>
       <div id="remote-fields">
         <label>Host</label>
@@ -221,12 +254,16 @@
         </div>
         <div class="hint">Connects over ssh and keeps a persistent tmux session that
           reattaches automatically on reconnect.</div>
-        <div class="toggle-row">
-          <button type="button" id="f-control" class="toggle on" role="switch" aria-checked="true">
-            <span class="knob"></span>
-          </button>
-          <span class="toggle-label">Native tabs <span class="opt">(tmux control mode — needs tmux ≥ 3.2)</span></span>
-        </div>
+      </div>
+      <!-- Local sessions run a tmux on THIS machine, so they get native tabs and survive an app
+           restart just like remote ones (§5.3b) — the toggle applies to both and stays visible. -->
+      <div id="local-hint" class="hint">Runs a shell on this machine inside tmux, so the session
+        survives quitting the app and reattaches when you reopen it.</div>
+      <div class="toggle-row">
+        <button type="button" id="f-control" class="toggle on" role="switch" aria-checked="true">
+          <span class="knob"></span>
+        </button>
+        <span class="toggle-label">Native tabs <span class="opt">(tmux control mode — needs tmux ≥ 3.2)</span></span>
       </div>
       <label>Name <span class="opt">(optional)</span></label><input id="f-title" placeholder="defaults to the host" />
       <div class="err" id="f-err"></div>

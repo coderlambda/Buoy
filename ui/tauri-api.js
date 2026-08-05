@@ -27,6 +27,9 @@ window.terminalAPI = {
   // file viewer (§16): fetch a clicked path's bytes; save bytes to a local file via native dialog
   readRemoteFile: (id, path) => invoke('read_remote_file', { id, path }),   // -> { data_b64, size, truncated }
   saveFile: (dataB64, suggestedName) => invoke('save_file', { dataB64, suggestedName }),
+  // §16: opt ONE html document into a scripts-enabled preview -> { url } on the buoyhtml: scheme.
+  // Explicit user action only (the viewer's "Enable scripts" button), never automatic.
+  enableHtmlScripts: (dataB64) => invoke('enable_html_scripts', { dataB64 }),
   // §18: open a remote-loopback URL via an ssh -L tunnel -> { ok, localUrl }
   openForwardedUrl: (id, url) => invoke('open_forwarded_url', { id, url }),
   getConfig: () => invoke('get_config'),   // { loopbackHosts }
@@ -51,8 +54,10 @@ window.terminalAPI = {
   // events main -> renderer
   onData: (cb) => on('session:data', cb),
   onState: (cb) => on('session:state', cb),
-  onError: (cb) => on('session:error', cb),
-  onInfo: (cb) => on('session:info', cb),
+  // NOTE: no onError/onInfo. The Rust backend emits no session:error or session:info — those were
+  // Electron-era events, and subscribing to them left the failure path looking handled when it
+  // wasn't. Spawn failures surface as a createSession REJECTION (see mount()); tmux path/version
+  // come back in the createSession result.
   onIntentionalExit: (cb) => on('session:exit', cb),
   onWindow: (cb) => on('session:window', cb),
   onReady: (cb) => on('session:ready', cb),

@@ -11,10 +11,16 @@
 // show a download-only panel instead of freezing the webview.
 const TEXT_RENDER_CAP = 1 * 1024 * 1024;   // text/markdown -> DOM
 const IMAGE_RENDER_CAP = 5 * 1024 * 1024;  // image -> data: URL decode
+// HTML gets a HIGHER cap than text even though it's also text: it goes to a real browser parser in
+// an iframe (not our hand-rolled markdown -> DOM path), and the whole point of the feature is
+// SELF-CONTAINED files, whose size is dominated by inlined base64 images/fonts. Exported notebooks
+// and plot reports routinely land in the 2-5 MB range and render fine.
+const HTML_RENDER_CAP = 5 * 1024 * 1024;
 
 const IMAGE_EXT = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
   webp: 'image/webp', bmp: 'image/bmp', svg: 'image/svg+xml', ico: 'image/x-icon' };
 const MD_EXT = { md: 1, markdown: 1, mdown: 1, mkd: 1 };
+const HTML_EXT = { html: 1, htm: 1, xhtml: 1 };
 
 function extOf(path) {
   const base = String(path).split('/').pop() || '';
@@ -39,8 +45,8 @@ function looksBinary(bytes) {
 }
 
 // PURE render-decision (unit-tested): given path + reported size + bytes, decide what to render.
-// Returns { mode: 'image'|'markdown'|'text'|'toobig'|'binary', mime? }. mode 'toobig' means the
-// content exceeds its type's render cap -> download-only panel; 'binary' means non-image,
+// Returns { mode: 'image'|'markdown'|'html'|'text'|'toobig'|'binary', mime? }. mode 'toobig' means
+// the content exceeds its type's render cap -> download-only panel; 'binary' means non-image,
 // non-text -> download-only.
 function classify(path, size, bytes) {
   const ext = extOf(path);
@@ -48,6 +54,8 @@ function classify(path, size, bytes) {
     return size > IMAGE_RENDER_CAP ? { mode: 'toobig' } : { mode: 'image', mime: IMAGE_EXT[ext] };
   }
   if (looksBinary(bytes)) return { mode: 'binary' };
+  // HTML is checked before the shared text cap because it has its own, higher one.
+  if (HTML_EXT[ext]) return size > HTML_RENDER_CAP ? { mode: 'toobig' } : { mode: 'html' };
   if (size > TEXT_RENDER_CAP) return { mode: 'toobig' };
   return MD_EXT[ext] ? { mode: 'markdown' } : { mode: 'text' };
 }
@@ -148,6 +156,10 @@ function createFileViewerTab(spec, ctx) {
   let el = null;
   let mounted = false;
   let fetched = null;   // { data_b64, size, truncated } once loaded
+  // Scripted-HTML opt-in (§16), per TAB and per SESSION — never persisted, so reopening a file
+  // starts static again and the choice can't silently carry over to a different file.
+  let scripted = false;
+  let scriptedUrl = null;
 
   function h(tag, attrs, ...kids) {
     const e = document.createElement(tag);
@@ -160,11 +172,35 @@ function createFileViewerTab(spec, ctx) {
     return e;
   }
 
-  function toolbar(size, note) {
+  function toolbar(size, note, mode) {
     const bar = h('div', { class: 'fv-bar' });
     bar.appendChild(h('span', { class: 'fv-name' }, baseName(path)));
     const meta = h('span', { class: 'fv-meta' }, fmtSize(size) + (note ? ' · ' + note : ''));
     bar.appendChild(meta);
+    // "Enable scripts" — opt THIS document into a scripted preview. Only offered for html, and only
+    // while still static: running a remote file's JS is a per-file decision, so there is no
+    // remembered preference and no auto-enable. See the fv-html branch for the isolation.
+    if (mode === 'html' && !scripted && api.enableHtmlScripts) {
+      const en = h('button', { class: 'fv-scripts', title:
+        'Run this file\'s scripts in an isolated frame (it will be able to load code from the network)' },
+        'Enable scripts');
+      en.onclick = async () => {
+        if (!fetched) return;
+        en.disabled = true; en.textContent = 'Enabling…';
+        try {
+          const res = await api.enableHtmlScripts(fetched.data_b64);
+          if (!res || !res.url) throw new Error('no preview url');
+          scriptedUrl = res.url;
+          scripted = true;
+          ctx.setStatus('scripts enabled for ' + baseName(path));
+          if (el) renderInto(el);   // re-render into the scripted frame
+        } catch (e) {
+          ctx.setStatus('enable scripts failed: ' + (e && e.message || e));
+          en.disabled = false; en.textContent = 'Enable scripts';
+        }
+      };
+      bar.appendChild(en);
+    }
     const dl = h('button', { class: 'fv-dl' }, 'Download to local');
     dl.onclick = async () => {
       if (!fetched) return;
@@ -191,10 +227,15 @@ function createFileViewerTab(spec, ctx) {
     if (!fetched) { body.appendChild(h('div', { class: 'fv-msg' }, 'Loading…')); container.appendChild(body); return; }
 
     const bytes = b64ToBytes(fetched.data_b64);
-    const truncNote = fetched.truncated ? 'truncated' : '';
-    container.appendChild(toolbar(fetched.size, truncNote));
-
     const c = classify(path, fetched.size, bytes);
+    // Classify BEFORE building the toolbar: the mode contributes a note and the Enable-scripts button.
+    const notes = [];
+    if (fetched.truncated) notes.push('truncated');
+    // Say which of the two html modes is in effect, so an inert page reads as intended rather than
+    // as a bug, and a scripted one is never silent about it.
+    if (c.mode === 'html') notes.push(scripted ? 'scripts ENABLED' : 'scripts disabled');
+    container.appendChild(toolbar(fetched.size, notes.join(' · '), c.mode));
+
     if (c.mode === 'image') {
       const img = h('img', { class: 'fv-img' });
       img.src = `data:${c.mime};base64,${fetched.data_b64}`;
@@ -203,6 +244,44 @@ function createFileViewerTab(spec, ctx) {
       body.appendChild(h('div', { class: 'fv-msg' }, `File is ${fmtSize(fetched.size)} — too large to preview. Use Download.`));
     } else if (c.mode === 'binary') {
       body.appendChild(h('div', { class: 'fv-msg' }, `Binary file (${fmtSize(fetched.size)}) — no preview. Use Download.`));
+    } else if (c.mode === 'html') {
+      // HTML preview. Unlike markdown (which we transpile to escaped HTML ourselves), here the
+      // file's own markup IS the render, so it goes to the browser parser. Two modes:
+      //
+      // STATIC (default): sandbox="" + srcdoc. Renders the file's own CSS and embedded data:
+      // images; runs nothing. Two INDEPENDENT layers, each measured sufficient alone in a real
+      // WKWebView:
+      //   1. sandbox="" — no allow-scripts (no JS), no allow-same-origin (opaque origin: no access
+      //      to our DOM/localStorage, no reach to window.__TAURI__ / the invoke bridge), no
+      //      allow-popups, no allow-top-navigation, no allow-forms.
+      //   2. The app CSP (script-src 'self') is INHERITED by the srcdoc document, so inline
+      //      <script> and inline handlers (onerror=/onload=) are blocked even if the sandbox
+      //      attribute were loosened later by mistake.
+      // srcdoc rather than a blob: URL because blob: is a separate origin that default-src 'self'
+      // refuses to load as a frame — measured: the frame stays blank.
+      //
+      // SCRIPTED (after the user clicks "Enable scripts" for this one file): the document is served
+      // from the buoyhtml: scheme — a SEPARATE ORIGIN with its own per-response CSP that permits
+      // inline script and https: subresources. This is why it's a custom protocol and not just a
+      // looser attribute: a srcdoc child can only ever INTERSECT the parent CSP, so making srcdoc
+      // scriptable would require 'unsafe-inline' on the APP's script-src — and the app renders
+      // untrusted terminal output, so that would trade a contained problem for app-origin XSS.
+      // The frame gets allow-scripts but still NOT allow-same-origin, so the origin stays opaque
+      // and wry's main-frame-only IPC injection never reaches it: __TAURI__, __TAURI_INTERNALS__
+      // and window.ipc are all undefined there, parent/top access throws, and a direct invoke()
+      // attempt fails — all measured against a hostile page. See src-tauri/src/html_preview.rs.
+      const frame = h('iframe', {
+        class: 'fv-html',
+        // Scripts, and nothing else: still no allow-same-origin (opaque origin), no
+        // allow-popups, no allow-top-navigation, no allow-forms, no allow-modals.
+        sandbox: scripted ? 'allow-scripts' : '',
+        referrerpolicy: 'no-referrer',
+        // Empty allow-list: no camera/mic/geolocation/etc even in scripted mode.
+        allow: '',
+      });
+      if (scripted) frame.src = scriptedUrl;
+      else frame.srcdoc = new TextDecoder('utf-8').decode(bytes);
+      body.appendChild(frame);
     } else if (c.mode === 'markdown') {
       const md = h('div', { class: 'fv-md' });
       md.innerHTML = renderMarkdown(new TextDecoder('utf-8').decode(bytes));  // renderMarkdown escapes all content
@@ -249,5 +328,5 @@ function createFileViewerTab(spec, ctx) {
   };
 }
 
-if (typeof module !== 'undefined' && module.exports) module.exports = { createFileViewerTab, renderMarkdown, extOf, classify, TEXT_RENDER_CAP, IMAGE_RENDER_CAP };
+if (typeof module !== 'undefined' && module.exports) module.exports = { createFileViewerTab, renderMarkdown, extOf, classify, TEXT_RENDER_CAP, IMAGE_RENDER_CAP, HTML_RENDER_CAP };
 if (typeof window !== 'undefined') window.DTFileViewerTab = { createFileViewerTab, renderMarkdown, extOf, classify };

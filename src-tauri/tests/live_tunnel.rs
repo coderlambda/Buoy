@@ -144,3 +144,84 @@ fn live_tunnel_reused_across_restart() {
     let _ = std::fs::remove_file(&store);
     eprintln!("LIVE OK: tunnel adopted + reused across restart, then cleanly closed ({} host)", host);
 }
+
+// STICKY LOCAL PORT across a connection BREAK (§18/§23b). Distinct from the adopt-across-restart case
+// above: there the ssh is still alive and gets reused. Here it DIES — the network-drop case — and the
+// point is that the re-opened forward comes back on the SAME local port, so a browser tab already
+// pointing at http://localhost:<local>/ keeps working instead of 404ing on a fresh random port.
+// Also covers reestablish(), the hook the supervisor calls when the session reconnects.
+#[test]
+#[ignore]
+fn live_tunnel_keeps_local_port_across_a_break() {
+    let host = match env("DT_LIVE_HOST") { Some(h) => h, None => { eprintln!("SKIP: set DT_LIVE_HOST"); return; } };
+    let tmux = env("DT_TMUX").unwrap_or_else(|| "tmux".into());
+    let (rport_a, rport_b) = (18055u16, 18056u16);
+    let store = std::env::temp_dir().join(format!("dt_tun_sticky_{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&store);
+    let sh = |cmd: &str| { let _ = std::process::Command::new("ssh")
+        .args(["-o", "BatchMode=yes", "--", &host, cmd]).status(); };
+
+    // Two remote servers, so we can prove per-port stickiness (not just "some port came back").
+    sh(&format!("{t} -L tunsticky kill-server 2>/dev/null; \
+                 mkdir -p /tmp/dt_stickA /tmp/dt_stickB && \
+                 printf 'STICKY_A' > /tmp/dt_stickA/index.html && \
+                 printf 'STICKY_B' > /tmp/dt_stickB/index.html && \
+                 {t} -L tunsticky new-session -d -s a 'cd /tmp/dt_stickA && python3 -m http.server {pa} --bind 127.0.0.1' && \
+                 {t} -L tunsticky new-window -t a 'cd /tmp/dt_stickB && python3 -m http.server {pb} --bind 127.0.0.1'",
+                t = tmux, pa = rport_a, pb = rport_b));
+    // Wait for BOTH remote servers to answer on the remote's own loopback.
+    for _ in 0..24 { sleep_ms(500);
+        let ok = std::process::Command::new("ssh").args(["-o","BatchMode=yes","--",&host,
+            &format!("curl -s -o /dev/null --max-time 2 http://127.0.0.1:{}/ && \
+                      curl -s -o /dev/null --max-time 2 http://127.0.0.1:{}/", rport_a, rport_b)])
+            .status().ok().map(|s| s.success()).unwrap_or(false);
+        if ok { break; } }
+
+    let reg = TunnelRegistry::with_store(store.clone());
+    let serves = |local: u16, marker: &str| {
+        let mut ok = false;
+        for _ in 0..16 { sleep_ms(500);
+            if curl(&format!("http://localhost:{}/", local)).contains(marker) { ok = true; break; } }
+        ok
+    };
+
+    // Open both forwards; remember the local ports the user's browser now knows about.
+    let a1 = reg.ensure("s", &host, rport_a, &[]).expect("ensure A");
+    let b1 = reg.ensure("s", &host, rport_b, &[]).expect("ensure B");
+    assert!(serves(a1, "STICKY_A"), "A serves on local {}", a1);
+    assert!(serves(b1, "STICKY_B"), "B serves on local {}", b1);
+    assert_ne!(a1, b1, "two remote ports get two distinct local ports");
+
+    // BREAK the connection the way the network does: kill the tunnels (session survives remotely).
+    // close_session is exactly what lib.rs runs on a drop/detach — it clears pids, keeps the ports.
+    reg.close_session("s");
+    sleep_ms(1000);
+    assert!(!curl(&format!("http://localhost:{}/", a1)).contains("STICKY_A"), "A really stopped forwarding");
+    assert!(!curl(&format!("http://localhost:{}/", b1)).contains("STICKY_B"), "B really stopped forwarding");
+    // The rows survive the break, greyed (this is what the sidebar shows while disconnected).
+    let during = reg.status("s");
+    assert_eq!(during.iter().map(|s| s.remote).collect::<Vec<_>>(), vec![rport_a, rport_b]);
+    assert!(during.iter().all(|s| !s.active), "no forward is active during the break");
+
+    // RECONNECT: exactly what the supervisor's state sink now calls on Connected.
+    let restored = reg.reestablish("s", &host, &[]);
+    assert_eq!(restored, vec![(rport_a, a1), (rport_b, b1)],
+        "both forwards came back on their ORIGINAL local ports (was: a new random port each time)");
+    // And the URLs the browser already had still work — the whole point.
+    assert!(serves(a1, "STICKY_A"), "the pre-break URL localhost:{} still serves A after reconnect", a1);
+    assert!(serves(b1, "STICKY_B"), "the pre-break URL localhost:{} still serves B after reconnect", b1);
+    let after = reg.status("s");
+    assert!(after.iter().all(|s| s.active), "both rows are live again after the reconnect");
+
+    // A port the user explicitly dismissed must NOT be resurrected by a later reconnect.
+    reg.close("s", rport_a);
+    sleep_ms(600);
+    let restored2 = reg.reestablish("s", &host, &[]);
+    assert_eq!(restored2, vec![(rport_b, b1)], "a closed port stays closed across reconnects");
+
+    reg.forget_session("s");
+    sleep_ms(600);
+    sh(&format!("{t} -L tunsticky kill-server 2>/dev/null; rm -rf /tmp/dt_stickA /tmp/dt_stickB", t = tmux));
+    let _ = std::fs::remove_file(&store);
+    eprintln!("LIVE OK: local ports A={} B={} survived a break and reconnect ({} host)", a1, b1, host);
+}

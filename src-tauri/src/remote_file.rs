@@ -111,6 +111,33 @@ pub fn read_remote_file(host: &str, path: &str, cap: usize, ctx: &TmuxCtx, base_
     }
 }
 
+/// Resolve a clicked path for a LOCAL session (§17), the local twin of `resolve_snippet`: absolute
+/// stays, `~`/`~/…` expands to $HOME, and anything else joins onto the session's active-pane cwd
+/// queried from the LOCAL tmux. Done in Rust rather than via an sh snippet because there is no remote
+/// shell in the picture — which also means no quoting surface for the path to escape through.
+///
+/// `ctx` with an empty socket/session (the no-tmux fallback session) skips cwd resolution, leaving a
+/// relative path relative to the app's cwd, as before.
+pub fn resolve_local_path(path: &str, ctx: &TmuxCtx) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if path.starts_with('/') { return path.to_string(); }
+    if path == "~" && !home.is_empty() { return home; }
+    if let Some(rest) = path.strip_prefix("~/") {
+        if !home.is_empty() { return format!("{home}/{rest}"); }
+    }
+    if ctx.socket.is_empty() || ctx.session.is_empty() { return path.to_string(); }
+    let tmux = if ctx.tmux_path.is_empty() { "tmux" } else { ctx.tmux_path.as_str() };
+    let out = std::process::Command::new(tmux)
+        .args(["-L", &ctx.socket, "display-message", "-p", "-t", &ctx.session, "#{pane_current_path}"])
+        .env("PATH", crate::augmented_path())
+        .output();
+    if let Ok(o) = out {
+        let cwd = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        if !cwd.is_empty() { return format!("{cwd}/{path}"); }
+    }
+    path.to_string()
+}
+
 /// Read a LOCAL file (for local shell sessions). Same cap/truncation contract.
 pub fn read_local_file(path: &str, cap: usize) -> Result<RemoteFile, String> {
     use std::io::Read;
@@ -139,6 +166,48 @@ fn host_token(parts: &HostParts) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // TC-RF-L1 local path resolution (§17 for kind:'local'): absolute untouched, ~ expanded, and a
+    // relative path joined onto the LOCAL tmux pane's cwd. The tmux branch runs against a real local
+    // tmux server so the query itself is exercised, not mocked.
+    #[test]
+    fn tc_rf_l1_resolve_local_path() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let none = TmuxCtx::default();
+        // absolute is returned verbatim
+        assert_eq!(resolve_local_path("/etc/hosts", &none), "/etc/hosts");
+        // ~ expansion
+        if !home.is_empty() {
+            assert_eq!(resolve_local_path("~", &none), home);
+            assert_eq!(resolve_local_path("~/notes.md", &none), format!("{home}/notes.md"));
+        }
+        // no tmux ctx -> relative stays relative (no cwd query attempted)
+        assert_eq!(resolve_local_path("notes.md", &none), "notes.md");
+
+        // With a REAL local tmux session, a relative path resolves against the pane cwd.
+        let probe = crate::probe::probe_local_tmux();
+        if !probe.probed { eprintln!("SKIP tmux half: no local tmux"); return; }
+        let tmux = probe.tmux_path;
+        let session = "buoyrfl1";
+        let socket = crate::tmux_socket::socket_name("plain", probe.version, session);
+        let _ = std::process::Command::new(&tmux).args(["-L", &socket, "kill-server"])
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+        let started = std::process::Command::new(&tmux)
+            .args(["-L", &socket, "new-session", "-d", "-s", session, "-c", "/tmp"])
+            .status().map(|s| s.success()).unwrap_or(false);
+        assert!(started, "local tmux session starts");
+
+        let ctx = TmuxCtx { tmux_path: tmux.clone(), socket: socket.clone(), session: session.into() };
+        let got = resolve_local_path("notes.md", &ctx);
+        assert!(got.ends_with("/notes.md") && got.starts_with('/'),
+            "relative path joined onto the pane cwd (absolute): {got}");
+        assert!(got.contains("tmp"), "resolved against the pane's cwd (/tmp): {got}");
+        // absolute/~ still bypass the tmux query even when a ctx is present
+        assert_eq!(resolve_local_path("/etc/hosts", &ctx), "/etc/hosts");
+
+        let _ = std::process::Command::new(&tmux).args(["-L", &socket, "kill-server"])
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+    }
 
     #[test]
     fn read_local_file_and_truncation() {

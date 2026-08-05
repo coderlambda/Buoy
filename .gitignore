@@ -1,6 +1,7 @@
 node_modules/
 *.log
 .DS_Store
+._*
 
 # Rust / Tauri build artifacts
 src-tauri/target/

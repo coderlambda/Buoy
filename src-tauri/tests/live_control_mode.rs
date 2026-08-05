@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use buoy_lib::control_backend::{BackendConfig, BackendEvent, ControlBackend};
 
+use buoy_lib::transport::Transport;
 fn env(k: &str) -> Option<String> {
     std::env::var(k).ok().filter(|s| !s.is_empty())
 }
@@ -65,6 +66,7 @@ fn live_tab_isolation_and_revisit() {
         BackendConfig {
             host: host.clone(), session: session.into(),
             tmux_path: tmux.clone(), tmux_version: Some((3, 7)), base_args: vec![],
+            transport: Transport::Ssh,
         },
         sink(rec.clone()), 90, 30,
     ).expect("spawn");
@@ -143,6 +145,7 @@ fn live_reattach_existing_session() {
     let cfg = || BackendConfig {
         host: host.clone(), session: session.into(),
         tmux_path: tmux.clone(), tmux_version: Some((3, 7)), base_args: vec![],
+        transport: Transport::Ssh,
     };
 
     // First connection: create + write a durable marker.
@@ -190,7 +193,8 @@ fn live_multibyte_utf8_not_corrupted() {
     let rec = Arc::new(Mutex::new(Recorder::default()));
     let backend = ControlBackend::spawn(
         BackendConfig { host: host.clone(), session: session.into(),
-            tmux_path: tmux.clone(), tmux_version: Some((3, 7)), base_args: vec![] },
+            tmux_path: tmux.clone(), tmux_version: Some((3, 7)), base_args: vec![],
+            transport: Transport::Ssh },
         sink(rec.clone()), 200, 50,
     ).expect("spawn");
     for _ in 0..40 { if rec.lock().unwrap().ready { break; } sleep_ms(250); }
@@ -250,7 +254,8 @@ fn live_sustained_output_survives() {
 
     let backend = ControlBackend::spawn(
         BackendConfig { host: host.clone(), session: session.into(),
-            tmux_path: tmux.clone(), tmux_version: Some((3, 7)), base_args: vec![] },
+            tmux_path: tmux.clone(), tmux_version: Some((3, 7)), base_args: vec![],
+            transport: Transport::Ssh },
         sink, 200, 50,
     ).expect("spawn");
     for _ in 0..40 { if ready.load(std::sync::atomic::Ordering::Relaxed) { break; } sleep_ms(250); }
@@ -308,7 +313,8 @@ fn live_resize_reaches_tmux() {
     let rec = Arc::new(Mutex::new(Recorder::default()));
     let backend = ControlBackend::spawn(
         BackendConfig { host: host.clone(), session: session.into(),
-            tmux_path: tmux.clone(), tmux_version: Some((3, 7)), base_args: vec![] },
+            tmux_path: tmux.clone(), tmux_version: Some((3, 7)), base_args: vec![],
+            transport: Transport::Ssh },
         sink(rec.clone()), 80, 24,
     ).expect("spawn");
     for _ in 0..40 { if rec.lock().unwrap().ready { break; } sleep_ms(250); }

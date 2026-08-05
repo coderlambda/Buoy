@@ -13,6 +13,7 @@ use std::thread;
 use std::time::Duration;
 
 use buoy_lib::control_backend::{BackendConfig, BackendEvent};
+use buoy_lib::transport::Transport;
 use buoy_lib::supervisor::{real_backend_factory, State, StateSink, Supervisor, SupervisorOpts};
 
 fn sleep_ms(ms: u64) { thread::sleep(Duration::from_millis(ms)); }
@@ -67,7 +68,8 @@ fn force_reconnect_does_not_loop() {
 
     let sup = Supervisor::new(
         BackendConfig { host: "localhost".into(), session: session.into(),
-            tmux_path: tmux.clone(), tmux_version: Some((3, 6)), base_args: vec![] },
+            tmux_path: tmux.clone(), tmux_version: Some((3, 6)), base_args: vec![],
+            transport: Transport::Ssh },
         SupervisorOpts::default(),
         real_backend_factory(),
         app_sink, state_sink,

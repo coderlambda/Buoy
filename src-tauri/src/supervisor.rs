@@ -176,7 +176,13 @@ impl Supervisor {
         let gen = self.shared.generation.fetch_add(1, Ordering::Relaxed) + 1;
         // Tear down any previous backend (so an old ssh can't keep streaming — the doubled-output
         // guard from the JS version). Its late exit is now gen-stale and ignored.
-        if let Some(old) = self.shared.backend.lock().unwrap().take() {
+        //
+        // Take the backend out in its OWN scope so the mutex guard is released before kill() runs.
+        // `if let Some(x) = lock().take() { .. }` would hold the guard for the whole body (edition
+        // 2021 temporary lifetime), and kill() joins threads / runs sink callbacks — any of which
+        // touching shared.backend (e.g. with_backend) would deadlock.
+        let old = self.shared.backend.lock().unwrap().take();
+        if let Some(old) = old {
             old.kill();
         }
         self.shared.connected_at_ms.store(0, Ordering::Relaxed);   // this attempt hasn't reached Ready yet
@@ -202,6 +208,15 @@ impl Supervisor {
         // the %exit+EOF pair from the CURRENT backend into exactly one reconnect.
         let exited = Arc::new(AtomicBool::new(false));
         let wrapped: BackendSink = Arc::new(move |ev: BackendEvent| {
+            // EVERY event is generation-gated, not just Exit. A replaced backend can still emit after
+            // it was killed — its uncancellable 5s ready-fallback timer fires Ready, and a topology
+            // reply parsed just before the kill emits WindowAdd/WindowActive. Applying those to the
+            // live session flipped Dead -> Connected (bricking Reconnect, which requires Dead) and
+            // injected phantom tabs from the dead connection's topology.
+            if gen != me.shared.generation.load(Ordering::Relaxed) {
+                crate::dlog!("supervisor: dropping stale gen-{} event {:?}", gen, ev);
+                return;
+            }
             match ev {
                 BackendEvent::Ready => {
                     me.shared.connected_at_ms.store((me.now_ms)().max(1), Ordering::Relaxed);
@@ -209,10 +224,9 @@ impl Supervisor {
                     app_sink(BackendEvent::Ready);
                 }
                 BackendEvent::Exit => {
-                    // Only the current generation's FIRST exit drives reconnect (idempotent per death).
-                    if gen == me.shared.generation.load(Ordering::Relaxed)
-                        && !exited.swap(true, Ordering::Relaxed)
-                    {
+                    // Only the FIRST exit drives reconnect (idempotent per death: one backend death
+                    // surfaces as both tmux `%exit` and the reader-thread EOF).
+                    if !exited.swap(true, Ordering::Relaxed) {
                         me.on_exit();
                     }
                 }
@@ -223,7 +237,22 @@ impl Supervisor {
         let cols = self.shared.cols.load(Ordering::Relaxed) as u16;
         let rows = self.shared.rows.load(Ordering::Relaxed) as u16;
         match (self.factory)(self.cfg.clone(), wrapped, cols, rows) {
-            Ok(b) => { *self.shared.backend.lock().unwrap() = Some(b); }
+            Ok(b) => {
+                // Install the new backend, and if a concurrent spawn() already put one there, KILL the
+                // displaced one — a plain assignment would just drop it. There is no Drop impl on
+                // ControlBackend, so a dropped backend leaks its ssh child: that orphan keeps its tmux
+                // control client attached and, because it ran `new-session -D`, mutually evicts the
+                // surviving client (the connect/break flap loop). Same scope discipline as above:
+                // release the guard before kill().
+                let displaced = {
+                    let mut slot = self.shared.backend.lock().unwrap();
+                    slot.replace(b)
+                };
+                if let Some(orphan) = displaced {
+                    crate::dlog!("supervisor: killing backend displaced by a concurrent spawn");
+                    orphan.kill();
+                }
+            }
             Err(e) => { crate::dlog!("supervisor: spawn failed: {}", e); self.on_exit(); }
         }
     }
@@ -238,10 +267,19 @@ impl Supervisor {
         // attempts. A flap that never reached that threshold does NOT reset, so repeated flaps
         // accumulate toward the cap and eventually go Dead instead of looping forever.
         let connected_at = self.shared.connected_at_ms.swap(0, Ordering::Relaxed);
-        if connected_at != 0 && (self.now_ms)().saturating_sub(connected_at) >= self.opts.stable_after_ms {
-            self.shared.attempts.store(0, Ordering::Relaxed);
-        }
-        let attempts = self.shared.attempts.fetch_add(1, Ordering::Relaxed) + 1;
+        let was_stable = connected_at != 0
+            && (self.now_ms)().saturating_sub(connected_at) >= self.opts.stable_after_ms;
+        // Single atomic RMW: a stable drop resets the budget to 1 (this attempt), otherwise increment.
+        // Doing this as store(0) followed by fetch_add left a window where a concurrent exit's
+        // increment could be lost, letting the supervisor retry past its cap instead of going Dead.
+        let prev = self
+            .shared
+            .attempts
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |a| {
+                Some(if was_stable { 1 } else { a.saturating_add(1) })
+            })
+            .unwrap_or(0);   // closure always returns Some, so this never fires
+        let attempts = if was_stable { 1 } else { prev.saturating_add(1) };
         if attempts > self.opts.lifetime_attempt_cap {
             crate::dlog!("supervisor: attempt cap reached -> dead");
             self.set_state(State::Dead);   // stop; no hot-loop / auth storm
@@ -255,9 +293,19 @@ impl Supervisor {
         crate::dlog!("supervisor: reconnect attempt {} in {}ms", attempts, delay);
         let me = Arc::clone(self);
         let sleep = self.sleep.clone();
+        // Tag this timer with the generation that was current when it was scheduled. The timer thread
+        // is detached and cannot be interrupted, so on wake it must check whether it is still the
+        // relevant one: any spawn() since (a user force_reconnect / retry that already reconnected
+        // successfully) bumped the generation, and this timer firing anyway would kill that healthy
+        // backend and reconnect on top of it — the user's manual reconnect breaking seconds later.
+        let scheduled_gen = self.shared.generation.load(Ordering::Relaxed);
         thread::spawn(move || {
             sleep(Duration::from_millis(delay));
             if me.shared.intentional.load(Ordering::Relaxed) { return; }
+            if scheduled_gen != me.shared.generation.load(Ordering::Relaxed) {
+                crate::dlog!("supervisor: backoff timer for gen {} superseded, not respawning", scheduled_gen);
+                return;
+            }
             me.spawn();
         });
     }
@@ -283,7 +331,9 @@ impl Supervisor {
     /// Intentional close: stop respawning and tear the backend down.
     pub fn close(&self) {
         self.shared.intentional.store(true, Ordering::Relaxed);
-        if let Some(b) = self.shared.backend.lock().unwrap().take() { b.kill(); }
+        // Release the guard before kill() (see spawn()): kill() runs foreign code that may re-enter.
+        let b = self.shared.backend.lock().unwrap().take();
+        if let Some(b) = b { b.kill(); }
         self.set_state(State::Closed);
     }
 
@@ -323,9 +373,11 @@ mod tests {
         fn kill(&self) { self.killed.store(true, Ordering::Relaxed); }
     }
 
+    use crate::transport::Transport;
+
     fn cfg() -> BackendConfig {
         BackendConfig { host: "h".into(), session: "s".into(), tmux_path: "t".into(),
-            tmux_version: Some((3, 7)), base_args: vec![] }
+            tmux_version: Some((3, 7)), base_args: vec![], transport: Transport::Ssh }
     }
 
     // Immediate sleep so backoff doesn't slow tests (policy, not timing, is under test).

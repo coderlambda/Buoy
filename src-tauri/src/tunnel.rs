@@ -23,7 +23,6 @@ pub struct TunnelStatus {
     pub local: Option<u16>,
     pub active: bool,
 }
-
 /// A parsed loopback URL: the remote port to reach and the path (incl. query) to open.
 #[derive(Debug, PartialEq)]
 pub struct LoopbackUrl {
@@ -68,6 +67,55 @@ pub fn classify_loopback(url: &str, loopback_hosts: &[String]) -> Option<(String
 pub fn free_local_port() -> std::io::Result<u16> {
     let l = TcpListener::bind("127.0.0.1:0")?;
     Ok(l.local_addr()?.port())
+}
+
+/// Is this local port bindable right now? The same check ssh's own listener makes, surfaced early so
+/// we can fall back instead of spawning an `ssh -L` that immediately dies on
+/// `ExitOnForwardFailure=yes`.
+fn local_port_free(port: u16) -> bool {
+    port != 0 && TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// Choose the LOCAL port for a forward, PREFERRING the port this (session, remote port) was last
+/// forwarded on. Stickiness is the point: a forwarded URL the user already has open in a browser tab
+/// — or bookmarked, or pasted into a config — names one specific `localhost:<local>`, so handing out
+/// a fresh random port after every reconnect silently breaks every page pointing at the old one.
+/// The remembered port is abandoned only if something else now holds it.
+fn pick_local_port(sticky: Option<u16>) -> std::io::Result<u16> {
+    if let Some(p) = sticky.filter(|p| *p != 0) {
+        if local_port_free(p) { return Ok(p); }
+        crate::dlog!("tunnel: sticky local port {} is taken, falling back to a fresh one", p);
+    }
+    free_local_port()
+}
+
+/// Build the `ssh` argv for a forward. Split out from `spawn_tunnel` so the flag that actually
+/// decides the user-visible URL — `-L 127.0.0.1:<local>:localhost:<remote>` — can be asserted without
+/// spawning ssh. Returning the right local port from `ensure()` means nothing if the argv that gets
+/// executed carries a different one.
+fn tunnel_argv(host: &str, local_port: u16, remote_port: u16, base_args: &[String])
+    -> Result<Vec<String>, String>
+{
+    let parts = parse_host(host).map_err(|e: ValidationError| e.to_string())?;
+    let target = match &parts.user {
+        Some(u) => format!("{}@{}", u, parts.host),
+        None => parts.host.clone(),
+    };
+
+    let mut args: Vec<String> = Vec::new();
+    if let Some(p) = parts.port { args.push("-p".into()); args.push(p.to_string()); }
+    args.extend([
+        "-o".into(), "BatchMode=yes".into(),
+        "-o".into(), "ExitOnForwardFailure=yes".into(),
+        "-o".into(), "ServerAliveInterval=30".into(),
+        "-N".into(),
+        // bind the LOCAL side to 127.0.0.1 so only this machine can use the forward.
+        "-L".into(), format!("127.0.0.1:{}:localhost:{}", local_port, remote_port),
+    ]);
+    args.extend(base_args.iter().cloned());
+    args.push("--".into());
+    args.push(target);
+    Ok(args)
 }
 
 struct Tunnel {
@@ -203,6 +251,15 @@ impl TunnelRegistry {
         self.save_persisted(&snapshot);
     }
 
+    /// The LOCAL port this (session, remote port) was last forwarded on, if we've ever forwarded it.
+    /// Survives both a reconnect (the record outlives the ssh child) and an app restart (it's on
+    /// disk), which is what makes the local port stable rather than per-connection.
+    fn remembered_local(&self, session_id: &str, remote_port: u16) -> Option<u16> {
+        self.persisted.lock().unwrap().get(session_id)
+            .and_then(|recs| recs.iter().find(|r| r.remote == remote_port))
+            .map(|r| r.local).filter(|l| *l != 0)
+    }
+
     fn forget(&self, session_id: &str, remote_port: u16) {
         let mut p = self.persisted.lock().unwrap();
         if let Some(recs) = p.get_mut(session_id) {
@@ -235,8 +292,9 @@ impl TunnelRegistry {
         }).collect()
     }
 
-    /// Ensure a tunnel exists for (session, remote_port); return the LOCAL port. Reuses a live one,
-    /// else opens one on a random free local port.
+    /// Ensure a tunnel exists for (session, remote_port); return the LOCAL port. Reuses a live one;
+    /// otherwise re-opens on the SAME local port this remote port was last forwarded on (see
+    /// `pick_local_port`), falling back to a fresh one only if that port is now taken.
     pub fn ensure(&self, session_id: &str, host: &str, remote_port: u16, base_args: &[String])
         -> Result<u16, String>
     {
@@ -250,8 +308,38 @@ impl TunnelRegistry {
                 }
             }
         }
-        let local_port = free_local_port().map_err(|e| e.to_string())?;
+        // Re-open on the remembered local port so URLs already handed to the browser keep working.
+        // NOTE: the dead tunnel above was just killed, so its old local port is free again — this is
+        // exactly the reconnect case, and re-picking randomly here was the bug.
+        let sticky = self.remembered_local(session_id, remote_port);
+        let local_port = pick_local_port(sticky).map_err(|e| e.to_string())?;
         self.spawn_tunnel(session_id, host, local_port, remote_port, base_args)
+    }
+
+    /// Re-establish every tunnel this session is supposed to have, on their ORIGINAL local ports.
+    /// Called when the session's connection comes back (§18): the tunnels are separate ssh processes
+    /// that die with the network, and nothing else would bring them back — the user would be left
+    /// with greyed-out rows and dead browser tabs until they clicked each port again.
+    ///
+    /// Driven off the PERSISTED record, not the live map, precisely because the live entries are the
+    /// ones that just died. Already-alive tunnels are left alone (`ensure` reuses them), so this is
+    /// safe to call on every reconnect. Returns the (remote, local) pairs now forwarding.
+    pub fn reestablish(&self, session_id: &str, host: &str, base_args: &[String]) -> Vec<(u16, u16)> {
+        let wanted: Vec<u16> = self.persisted.lock().unwrap()
+            .get(session_id).map(|recs| recs.iter().map(|r| r.remote).collect()).unwrap_or_default();
+        let mut out = Vec::new();
+        for remote in wanted {
+            match self.ensure(session_id, host, remote, base_args) {
+                Ok(local) => {
+                    crate::dlog!("tunnel: reestablished remote {} on local {} for {}", remote, local, session_id);
+                    out.push((remote, local));
+                }
+                // One port failing (remote server gone, local port stolen) must not stop the others.
+                Err(e) => crate::dlog!("tunnel: reestablish remote {} for {} failed: {}", remote, session_id, e),
+            }
+        }
+        out.sort_by_key(|(r, _)| *r);
+        out
     }
 
     /// FORCE a tunnel that binds the LOCAL side to the SAME port number as the remote (so a remote
@@ -280,25 +368,7 @@ impl TunnelRegistry {
     fn spawn_tunnel(&self, session_id: &str, host: &str, local_port: u16, remote_port: u16, base_args: &[String])
         -> Result<u16, String>
     {
-        let parts = parse_host(host).map_err(|e: ValidationError| e.to_string())?;
-        let target = match &parts.user {
-            Some(u) => format!("{}@{}", u, parts.host),
-            None => parts.host.clone(),
-        };
-
-        let mut args: Vec<String> = Vec::new();
-        if let Some(p) = parts.port { args.push("-p".into()); args.push(p.to_string()); }
-        args.extend([
-            "-o".into(), "BatchMode=yes".into(),
-            "-o".into(), "ExitOnForwardFailure=yes".into(),
-            "-o".into(), "ServerAliveInterval=30".into(),
-            "-N".into(),
-            // bind the LOCAL side to 127.0.0.1 so only this machine can use the forward.
-            "-L".into(), format!("127.0.0.1:{}:localhost:{}", local_port, remote_port),
-        ]);
-        args.extend(base_args.iter().cloned());
-        args.push("--".into());
-        args.push(target);
+        let args = tunnel_argv(host, local_port, remote_port, base_args)?;
 
         let child = Command::new("ssh")
             .args(&args)
@@ -363,6 +433,8 @@ impl TunnelRegistry {
             }
         }
         let mut p = self.persisted.lock().unwrap();
+        // Clear the pid only — `local` is deliberately KEPT so a reattach re-opens on the same local
+        // port (see pick_local_port), rather than inventing a new one and breaking open browser tabs.
         if let Some(recs) = p.get_mut(session_id) { for r in recs.iter_mut() { r.pid = 0; } }
         let snapshot = p.clone();
         drop(p);
@@ -521,5 +593,181 @@ mod tests {
         assert!(!is_our_ssh_pid(1), "pid 1 is not our ssh -L");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- §18 sticky local ports (TC-TP) ------------------------------------------------------
+    // A forwarded URL names ONE `localhost:<local>`. Once it's in a browser tab, re-picking a random
+    // local port on the next connect silently breaks that tab, which is the reported bug.
+
+    fn tmp_store(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("dt_tun_{}_{}.json", tag, std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    // TC-TP1 pick_local_port is the whole policy: prefer the remembered port, fall back only when
+    // it's genuinely unavailable. Tested directly because the ensure() path needs a real ssh spawn.
+    #[test]
+    fn tc_tp1_pick_local_port_prefers_the_remembered_port() {
+        // A port nobody holds -> handed straight back, unchanged.
+        //
+        // Getting a port that is STILL free when pick_local_port re-checks it is a race: cargo runs
+        // these tests as threads in one process, several of them bind 127.0.0.1:0, and the kernel can
+        // hand a sibling the port `free_local_port` just released. That made this assert fail roughly
+        // 1 run in 5. So retry a few times rather than trusting a single draw — the property under
+        // test ("a free port is reused verbatim") is unaffected, and a genuine regression still fails
+        // every attempt.
+        let mut reused = None;
+        for _ in 0..20 {
+            let free = free_local_port().unwrap();
+            if pick_local_port(Some(free)).unwrap() == free { reused = Some(free); break; }
+        }
+        assert!(reused.is_some(), "a free sticky port is reused verbatim");
+
+        // A port something else now holds -> fall back rather than spawn an ssh doomed to fail on
+        // ExitOnForwardFailure=yes.
+        let held = TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = held.local_addr().unwrap().port();
+        let got = pick_local_port(Some(taken)).unwrap();
+        assert_ne!(got, taken, "a taken sticky port is not handed out");
+        assert!(got != 0);
+
+        // No memory of this port yet (first-ever open, or a record written before `local` existed) ->
+        // just pick something free. 0 is the serde default and must never be treated as sticky.
+        assert!(pick_local_port(None).unwrap() != 0);
+        assert!(pick_local_port(Some(0)).unwrap() != 0, "local:0 means 'unknown', not port 0");
+    }
+
+    // TC-TP2 the remembered local port survives the events that used to lose it: the ssh dying
+    // (pid cleared) and an app restart (reload from disk).
+    #[test]
+    fn tc_tp2_local_port_is_remembered_across_death_and_restart() {
+        let path = tmp_store("sticky");
+        let reg = TunnelRegistry::with_store(path.clone());
+        reg.remember("sess", 3000, 45001, 12345);
+        assert_eq!(reg.remembered_local("sess", 3000), Some(45001));
+
+        // close_session = detach/drop: kills the children and clears pids, but the local port must
+        // stay so the reattach reuses it.
+        reg.close_session("sess");
+        assert_eq!(reg.remembered_local("sess", 3000), Some(45001),
+            "detach must not forget the local port");
+
+        // Restart: a fresh registry over the same file still knows the port.
+        let reg2 = TunnelRegistry::with_store(path.clone());
+        assert_eq!(reg2.remembered_local("sess", 3000), Some(45001),
+            "the local port survives an app restart");
+        // …and the row reads inactive-but-known (local:None, since no tunnel is live).
+        let st = reg2.status("sess");
+        assert_eq!(st.len(), 1);
+        assert!(st[0].local.is_none() && !st[0].active);
+
+        // Explicitly closing the row DOES forget it (the user dismissed that port).
+        reg2.close("sess", 3000);
+        assert_eq!(reg2.remembered_local("sess", 3000), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // TC-TP3 ensure() re-opens on the SAME local port after the previous tunnel died. This is the
+    // reported bug end-to-end, minus a live remote: the host is unresolvable so each ssh exits
+    // immediately, which is precisely the "connection broke" state — and the port must not move.
+    #[test]
+    fn tc_tp3_ensure_reuses_the_local_port_after_the_tunnel_dies() {
+        let path = tmp_store("ensure_sticky");
+        let reg = TunnelRegistry::with_store(path.clone());
+        // Unresolvable by RFC 6761: ssh spawns, fails to resolve, exits — no network dependency.
+        let host = "me@dt-sticky-test.invalid";
+
+        let first = reg.ensure("sess", host, 3000, &[]).unwrap();
+        assert!(first != 0);
+        assert_eq!(reg.remembered_local("sess", 3000), Some(first), "the chosen port is recorded");
+
+        // Let the doomed ssh exit so the live entry is dead — the reconnect case.
+        std::thread::sleep(Duration::from_millis(900));
+        let second = reg.ensure("sess", host, 3000, &[]).unwrap();
+        assert_eq!(second, first,
+            "a re-opened tunnel keeps its local port (was: a new random port every reconnect)");
+
+        // A DIFFERENT remote port gets its own local port; stickiness is per (session, remote).
+        let other = reg.ensure("sess", host, 5173, &[]).unwrap();
+        assert_ne!(other, first, "different remote ports don't share a local port");
+
+        reg.forget_session("sess");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // TC-TP4 reestablish() re-opens every persisted port for a session — the reconnect hook. It reads
+    // the PERSISTED list, not the live map, precisely because the live tunnels are the ones that just
+    // died with the network.
+    #[test]
+    fn tc_tp4_reestablish_reopens_all_persisted_ports_on_their_own_local_ports() {
+        let path = tmp_store("reestablish");
+        let reg = TunnelRegistry::with_store(path.clone());
+        let host = "me@dt-sticky-test.invalid";
+
+        // Two ports the user had opened, then a drop (pids cleared, local ports kept).
+        let p3000 = reg.ensure("sess", host, 3000, &[]).unwrap();
+        let p5173 = reg.ensure("sess", host, 5173, &[]).unwrap();
+        reg.close_session("sess");
+        std::thread::sleep(Duration::from_millis(300));
+
+        let restored = reg.reestablish("sess", host, &[]);
+        assert_eq!(restored, vec![(3000, p3000), (5173, p5173)],
+            "both ports come back on the SAME local ports they had before the drop");
+
+        // Nothing persisted -> nothing to do (a session that never forwarded anything).
+        assert!(reg.reestablish("no-such-session", host, &[]).is_empty());
+
+        reg.forget_session("sess");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // TC-TP5 a port the user explicitly closed must NOT come back on reconnect — reestablish is
+    // driven by the persisted list, and close() removes the row from it.
+    #[test]
+    fn tc_tp5_reestablish_skips_explicitly_closed_ports() {
+        let path = tmp_store("reestablish_closed");
+        let reg = TunnelRegistry::with_store(path.clone());
+        let host = "me@dt-sticky-test.invalid";
+
+        reg.ensure("sess", host, 3000, &[]).unwrap();
+        let keep = reg.ensure("sess", host, 5173, &[]).unwrap();
+        reg.close("sess", 3000);          // user dismissed this row
+        std::thread::sleep(Duration::from_millis(300));
+
+        let restored = reg.reestablish("sess", host, &[]);
+        assert_eq!(restored, vec![(5173, keep)], "the dismissed port stays gone after a reconnect");
+
+        reg.forget_session("sess");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // TC-TP6 the chosen local port must land in the ssh argv that's actually executed. Returning the
+    // right number from ensure() is worthless if `-L` carries a different one — the browser talks to
+    // the flag, not to our bookkeeping.
+    #[test]
+    fn tc_tp6_the_local_port_reaches_the_ssh_forward_flag() {
+        let args = tunnel_argv("me@host", 45123, 3000, &[]).unwrap();
+        let i = args.iter().position(|a| a == "-L").expect("-L present");
+        assert_eq!(args[i + 1], "127.0.0.1:45123:localhost:3000",
+            "the forward binds the chosen LOCAL port to the remote's loopback port");
+        // Local side pinned to loopback (not 0.0.0.0): only this machine can use the forward.
+        assert!(args[i + 1].starts_with("127.0.0.1:"));
+        // A collision must fail the spawn rather than silently forward a different port.
+        assert!(args.windows(2).any(|w| w[0] == "-o" && w[1] == "ExitOnForwardFailure=yes"));
+        // `--` before the target so a host that looks like a flag can't inject one.
+        assert_eq!(args[args.len() - 2], "--");
+        assert_eq!(args[args.len() - 1], "me@host");
+
+        // A non-default ssh port rides along without disturbing the -L mapping.
+        let args2 = tunnel_argv("me@host:2222", 45124, 8080, &[]).unwrap();
+        assert_eq!(args2[0], "-p");
+        assert_eq!(args2[1], "2222");
+        let j = args2.iter().position(|a| a == "-L").unwrap();
+        assert_eq!(args2[j + 1], "127.0.0.1:45124:localhost:8080");
+        assert_eq!(args2[args2.len() - 1], "me@host", "the :port is stripped from the target");
+
+        // Flag-injection guard (§6.1): a hostile host string is rejected, not forwarded.
+        assert!(tunnel_argv("-oProxyCommand=x", 45125, 3000, &[]).is_err());
     }
 }

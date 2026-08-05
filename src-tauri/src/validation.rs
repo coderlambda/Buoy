@@ -18,6 +18,14 @@ impl ValidationError {
     fn new(field: &str, why: &str) -> Self {
         ValidationError { field: field.into(), why: why.into() }
     }
+
+    /// A non-validation failure surfaced through the same error type, so fallible spawn steps
+    /// (openpty, ssh exec, pty handles) can return Err instead of panicking. A panic inside
+    /// ControlBackend::spawn unwinds the supervisor's detached backoff thread BEFORE its
+    /// Ok/Err match runs, so on_exit() never fires and the session wedges in Connecting forever.
+    pub fn spawn(field: &str, why: impl fmt::Display) -> Self {
+        ValidationError { field: field.into(), why: why.to_string() }
+    }
 }
 
 impl fmt::Display for ValidationError {
@@ -72,6 +80,10 @@ fn matches_ipv6(s: &str) -> bool {
 fn matches_tmux_path(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| is_alnum(c) || matches!(c, '.' | '_' | '/' | '-'))
 }
+
+/// Public view of the tmuxPath charset, so the local probe can skip a candidate the argv builders
+/// would reject anyway (e.g. a PATH entry with a space) instead of failing later at spawn.
+pub fn is_safe_tmux_path(s: &str) -> bool { matches_tmux_path(s) }
 // tmuxPath charset for kill (also allows '$'): ^[A-Za-z0-9._/$-]+$
 fn matches_tmux_path_kill(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| is_alnum(c) || matches!(c, '.' | '_' | '/' | '$' | '-'))
@@ -218,6 +230,71 @@ pub fn build_ssh_args(
         session,
     ]);
     Ok(args)
+}
+
+/// Build argv for a LOCAL tmux client (kind:'local' — DESIGN.md §5.3b): no ssh, no host, the tmux
+/// binary is exec'd directly:
+///   <tmuxPath> -L <socket> new-session -A -s <name>
+///
+/// The session/socket/path charsets are validated exactly as on the ssh path. The remote builder's
+/// `env LC_ALL=C.UTF-8` prefix is deliberately NOT here: locally we control the child's environment
+/// directly (see local_tmux_env), so there is no login shell in between to mangle quoting.
+pub fn build_local_tmux_args(raw_session: &str, tmux_path: &str, socket: &str) -> Result<Vec<String>> {
+    let session = validate_session(raw_session)?;
+    if !matches_tmux_path(tmux_path) {
+        return Err(ValidationError::new("tmuxPath", "invalid path"));
+    }
+    if !matches_socket(socket) {
+        return Err(ValidationError::new("socket", "invalid socket name"));
+    }
+    Ok(vec![
+        "-L".into(), socket.to_string(),
+        "new-session".into(), "-A".into(), "-s".into(), session,
+    ])
+}
+
+/// Local control-mode (-CC) argv: same shape as build_local_tmux_args with -CC before -L and -D on
+/// new-session (so a second client takes over rather than sharing, matching the ssh path).
+pub fn build_local_control_mode_args(raw_session: &str, tmux_path: &str, socket: &str) -> Result<Vec<String>> {
+    let mut args = build_local_tmux_args(raw_session, tmux_path, socket)?;
+    args.insert(0, "-CC".into());
+    if let Some(ns) = args.iter().position(|a| a == "new-session") {
+        args.insert(ns + 1, "-D".into());
+    }
+    Ok(args)
+}
+
+/// Local `tmux -L <socket> kill-session -t <name>` argv (the local twin of build_kill_args, which
+/// wraps the command for a remote login shell). No shell is involved here, so no base64 wrapper.
+pub fn build_local_kill_args(raw_session: &str, socket: &str) -> Result<Vec<String>> {
+    let session = validate_session(raw_session)?;
+    if !matches_socket(socket) {
+        return Err(ValidationError::new("socket", "invalid socket name"));
+    }
+    Ok(vec!["-L".into(), socket.to_string(), "kill-session".into(), "-t".into(), session])
+}
+
+/// LC_ALL to force on a LOCAL tmux server, or None to inherit the user's locale untouched.
+///
+/// tmux only enables UTF-8 when its OWN process locale is UTF-8; otherwise it replaces every
+/// non-ASCII byte with '_' everywhere it stores text (pane titles, window names), which is what
+/// turned agent tab titles like "✳ task" into "_ task". The ssh path forces LC_ALL=C.UTF-8
+/// unconditionally because a remote dev host commonly logs in with LANG unset.
+///
+/// Locally we can see the real environment, so only override when it is NOT already UTF-8 — forcing
+/// C.UTF-8 over a user's own en_US.UTF-8 would change collation and date formatting inside their
+/// shell for no benefit.
+pub fn local_tmux_lc_all(lc_all: Option<&str>, lang: Option<&str>) -> Option<&'static str> {
+    let utf8 = |v: Option<&str>| v.is_some_and(|s| {
+        let s = s.to_ascii_lowercase();
+        s.contains("utf-8") || s.contains("utf8")
+    });
+    // LC_ALL wins over LANG when set (POSIX precedence), so only consult LANG if LC_ALL is unset.
+    let effective_is_utf8 = match lc_all.filter(|s| !s.is_empty()) {
+        Some(v) => utf8(Some(v)),
+        None => utf8(lang.filter(|s| !s.is_empty())),
+    };
+    if effective_is_utf8 { None } else { Some("C.UTF-8") }
 }
 
 /// Build the ssh argv for a control-mode (-CC) attach, inserting -CC after the tmux binary and
@@ -383,6 +460,59 @@ mod tests {
         // new-session -D -A -s dev
         let tail: Vec<&str> = a.iter().rev().take(5).rev().map(|s| s.as_str()).collect();
         assert_eq!(tail, ["new-session", "-D", "-A", "-s", "dev"]);
+    }
+
+    // TC-V-L1 local tmux argv: no ssh, no host, no `--`/env prefix — just the tmux flags.
+    #[test]
+    fn tc_v_local_tmux_args() {
+        let a = build_local_tmux_args("dt-x", "/opt/homebrew/bin/tmux", "dtapp3-6").unwrap();
+        assert_eq!(a, ["-L", "dtapp3-6", "new-session", "-A", "-s", "dt-x"]);
+        // no ssh-isms leak into the local argv
+        assert!(!a.iter().any(|x| x == "--" || x == "-tt" || x == "env"),
+            "local argv has no ssh/env scaffolding: {a:?}");
+        // the same charset gates as the ssh builder still apply
+        assert!(build_local_tmux_args("a;b", "tmux", "s").is_err(), "session metachars rejected");
+        assert!(build_local_tmux_args("-x", "tmux", "s").is_err(), "leading-dash session rejected");
+        assert!(build_local_tmux_args("dt-x", "tm ux", "s").is_err(), "bad tmux path rejected");
+        assert!(build_local_tmux_args("dt-x", "tmux", "so;ck").is_err(), "bad socket rejected");
+    }
+
+    // TC-V-L2 local control mode: -CC precedes -L, new-session takes -D (take over, don't share).
+    #[test]
+    fn tc_v_local_control_mode_args() {
+        let a = build_local_control_mode_args("dt-x", "tmux", "dtcc3-6-dt-x").unwrap();
+        assert_eq!(a, ["-CC", "-L", "dtcc3-6-dt-x", "new-session", "-D", "-A", "-s", "dt-x"]);
+    }
+
+    // TC-V-L3 local kill needs no shell wrapper (contrast build_kill_args, which base64-wraps for a
+    // remote login shell).
+    #[test]
+    fn tc_v_local_kill_args() {
+        let a = build_local_kill_args("dt-x", "dtcc3-6-dt-x").unwrap();
+        assert_eq!(a, ["-L", "dtcc3-6-dt-x", "kill-session", "-t", "dt-x"]);
+        assert!(build_local_kill_args("a b", "s").is_err());
+    }
+
+    // TC-V-L4 locale: only override a NON-UTF-8 environment. Forcing C.UTF-8 over the user's own
+    // UTF-8 locale would change their collation/date formatting for no benefit; leaving a non-UTF-8
+    // one alone would reintroduce tmux's '_'-for-every-non-ASCII-byte mangling of window names.
+    #[test]
+    fn tc_v_local_tmux_lc_all() {
+        // already UTF-8 -> leave alone
+        assert_eq!(local_tmux_lc_all(None, Some("en_US.UTF-8")), None);
+        assert_eq!(local_tmux_lc_all(Some("en_US.UTF-8"), None), None);
+        assert_eq!(local_tmux_lc_all(None, Some("en_US.utf8")), None);   // case/spelling variant
+        // not UTF-8, or unset entirely -> force it
+        assert_eq!(local_tmux_lc_all(None, None), Some("C.UTF-8"));
+        assert_eq!(local_tmux_lc_all(None, Some("C")), Some("C.UTF-8"));
+        assert_eq!(local_tmux_lc_all(Some("POSIX"), None), Some("C.UTF-8"));
+        // LC_ALL outranks LANG (POSIX precedence): a non-UTF-8 LC_ALL is what tmux will actually
+        // see, so a UTF-8 LANG behind it must NOT be treated as good enough.
+        assert_eq!(local_tmux_lc_all(Some("C"), Some("en_US.UTF-8")), Some("C.UTF-8"));
+        assert_eq!(local_tmux_lc_all(Some("en_US.UTF-8"), Some("C")), None);
+        // empty string is unset, not a value
+        assert_eq!(local_tmux_lc_all(Some(""), Some("en_US.UTF-8")), None);
+        assert_eq!(local_tmux_lc_all(Some(""), Some("")), Some("C.UTF-8"));
     }
 
     #[test]

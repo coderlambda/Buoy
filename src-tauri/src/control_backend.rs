@@ -18,7 +18,8 @@ use crate::control_parser::{ControlEvent, ControlModeParser};
 use crate::reply_channel::{ReplyChannel, ReplyKind};
 use crate::tmux_keys::encode_send_keys;
 use crate::tmux_socket::socket_name;
-use crate::validation::{self, build_control_mode_ssh_args};
+use crate::transport::{self, Transport};
+use crate::validation;
 use crate::window_registry::{PaneRow, WindowRegistry};
 
 const LIST_FMT: &str = "#{window_id} #{pane_id} #{pane_active} #{window_active} #{window_name}";
@@ -47,6 +48,18 @@ pub struct BackendConfig {
     pub tmux_path: String,
     pub tmux_version: Option<(u32, u32)>,
     pub base_args: Vec<String>,
+    /// ssh to `host`, or a tmux on THIS machine (kind:'local'). Everything downstream — parser,
+    /// registry, supervisor, reattach — is identical either way; see transport.rs.
+    pub transport: Transport,
+}
+
+impl Default for BackendConfig {
+    fn default() -> Self {
+        BackendConfig {
+            host: String::new(), session: String::new(), tmux_path: "tmux".into(),
+            tmux_version: None, base_args: vec![], transport: Transport::Ssh,
+        }
+    }
 }
 
 struct Inner {
@@ -86,34 +99,32 @@ impl ControlBackend {
         -> Result<Self, validation::ValidationError>
     {
         let socket = socket_name("control", cfg.tmux_version, &cfg.session);
-        let mut default_opts: Vec<String> = vec![
-            "-o".into(), "ConnectTimeout=8".into(),
-            "-o".into(), "ServerAliveInterval=15".into(),
-            "-o".into(), "ServerAliveCountMax=3".into(),
-        ];
-        default_opts.extend(cfg.base_args.iter().cloned());
-        let ssh_args = build_control_mode_ssh_args(
-            &cfg.host, &cfg.session, &default_opts, &cfg.tmux_path, &socket,
+        let (lc_all, lang) = transport::current_locale();
+        let spec = transport::spawn_spec(
+            cfg.transport, true, &cfg.host, &cfg.session, &cfg.tmux_path, &socket,
+            &cfg.base_args, lc_all.as_deref(), lang.as_deref(),
         )?;
-        crate::dlog!("ControlBackend.spawn: socket={} ssh {}", socket, ssh_args.join(" "));
+        crate::dlog!("ControlBackend.spawn: socket={} {} {}", socket, spec.program, spec.args.join(" "));
 
+        // Every fallible step below returns Err rather than panicking: this runs on the supervisor's
+        // detached backoff thread, where a panic would skip the Ok/Err match that schedules the next
+        // retry — wedging the session in Connecting with no error and no working Reconnect button.
         let pty = native_pty_system();
         let pair = pty.openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
-            .expect("openpty failed");
+            .map_err(|e| validation::ValidationError::spawn("openpty", e))?;
 
-        // The ssh binary is overridable via BUOY_SSH_BIN so a test can inject a fake transport that
-        // execs a LOCAL tmux (no network/sshd) and exercise the real backend + supervisor end to end.
-        let ssh_bin = std::env::var("BUOY_SSH_BIN").unwrap_or_else(|_| "ssh".into());
-        let mut cmd = CommandBuilder::new(&ssh_bin);
-        cmd.args(&ssh_args);
-        // Augment PATH so a Finder-launched app still finds ssh/tmux (mirrors env.js).
-        cmd.env("PATH", crate::augmented_path());
+        let mut cmd = CommandBuilder::new(&spec.program);
+        cmd.args(&spec.args);
+        for (k, v) in &spec.env { cmd.env(k, v); }
 
-        let child = pair.slave.spawn_command(cmd).expect("ssh spawn failed");
+        let child = pair.slave.spawn_command(cmd)
+            .map_err(|e| validation::ValidationError::spawn("tmux client spawn", e))?;
         drop(pair.slave);
 
-        let writer = pair.master.take_writer().expect("pty writer");
-        let mut reader = pair.master.try_clone_reader().expect("pty reader");
+        let writer = pair.master.take_writer()
+            .map_err(|e| validation::ValidationError::spawn("pty writer", e))?;
+        let mut reader = pair.master.try_clone_reader()
+            .map_err(|e| validation::ValidationError::spawn("pty reader", e))?;
 
         let mut reply = ReplyChannel::new();
         reply.start(); // seed handshake handler
@@ -286,8 +297,16 @@ impl Inner {
     fn handle_event(inner: &Arc<Mutex<Inner>>, ev: ControlEvent) {
         match ev {
             ControlEvent::Output { pane, data } => {
-                let mut g = inner.lock().unwrap();
-                g.route_output(pane, data);
+                let need_refresh = {
+                    let mut g = inner.lock().unwrap();
+                    g.route_output(pane, data)
+                };
+                // Output from a pane we have no window mapping for: schedule a topology refresh to
+                // learn it. Done HERE, outside the lock, so it can go through the coalescing
+                // queue_refresh (which needs the lock to arm its timer) instead of firing a
+                // synchronous list-panes per event — an unmapped pane redrawing at ~750 events/sec
+                // used to send ~750 list-panes commands, one per event.
+                if need_refresh { Inner::queue_refresh(inner); }
             }
             ControlEvent::WindowAdd { .. }
             | ControlEvent::WindowClose { .. }
@@ -308,16 +327,26 @@ impl Inner {
             }
             ControlEvent::Reply { ok, body, .. } => {
                 crate::dlog!("event: Reply ok={} bodyLines={}", ok, body.len());
-                Inner::on_reply(inner, body);
+                Inner::on_reply(inner, ok, body);
             }
             ControlEvent::Begin { .. } => {}
             other => { crate::dlog!("event: unhandled {:?}", other); }
         }
     }
 
-    fn on_reply(inner: &Arc<Mutex<Inner>>, body: Vec<String>) {
+    /// Consume one reply block. `ok` is false for a tmux `%error` block, whose body is a DIAGNOSTIC
+    /// ("can't find window: @9"), not command output. We must still `take()` the queued kind to keep
+    /// the FIFO aligned with the commands we sent (tmux emits exactly one block per command, error or
+    /// not), but the body must NOT be interpreted: routing an error body to paint_capture used to
+    /// clear-screen the terminal and paint the tmux diagnostic as counterfeit scrollback, and routing
+    /// it to apply_topology would parse it as pane rows.
+    fn on_reply(inner: &Arc<Mutex<Inner>>, ok: bool, body: Vec<String>) {
         let kind = { inner.lock().unwrap().reply.take() };
-        crate::dlog!("on_reply: kind={:?} bodyLines={}", kind, body.len());
+        crate::dlog!("on_reply: kind={:?} ok={} bodyLines={}", kind, ok, body.len());
+        if !ok {
+            crate::dlog!("on_reply: %error for kind={:?}, body discarded: {:?}", kind, body);
+            return;
+        }
         match kind {
             Some(ReplyKind::Topology) => {
                 let lines: Vec<String> = body.into_iter().filter(|l| !l.trim().is_empty()).collect();
@@ -361,7 +390,13 @@ impl Inner {
             }
         }
         crate::dlog!("apply_topology: {} rows parsed from {} lines", rows.len(), lines.len());
-        if rows.is_empty() { return; }
+        if rows.is_empty() {
+            // Nothing to reconcile, but still drain buffered input: this early return used to skip
+            // the flush_pending_input() at the end of this fn, which is the documented safety net for
+            // "mark_ready raced ahead of topology". An empty/unparseable reply must not strand keys.
+            g.flush_pending_input();
+            return;
+        }
         let diff = g.reg.reconcile(&rows);
         let order = g.reg.order();
         crate::dlog!("apply_topology: added={:?} removed={:?} active={:?}", diff.added, diff.removed, diff.active);
@@ -399,7 +434,10 @@ impl Inner {
         g.flush_pending_input();
     }
 
-    fn route_output(&mut self, pane: String, data: String) {
+    /// Returns true if the pane has no window mapping yet, meaning the CALLER should schedule a
+    /// topology refresh (see handle_event). We can't do it here: queue_refresh takes the same lock
+    /// this method is already holding.
+    fn route_output(&mut self, pane: String, data: String) -> bool {
         // `data` is LATIN1 (one char per raw byte, from the reader + octal unescape). Convert back
         // to bytes, prepend this pane's carried incomplete UTF-8 tail, decode the valid prefix, and
         // stash any new incomplete tail. This is where a char split across two %output events for
@@ -409,21 +447,16 @@ impl Inner {
         bytes.extend(data.chars().map(|c| c as u8));
         let (text, tail) = decode_utf8_prefix(&bytes);
         if !tail.is_empty() { self.utf8_carry.insert(pane.clone(), tail); }
-        if text.is_empty() { return; }
+        if text.is_empty() { return false; }
 
         match self.reg.win_for_pane(&pane) {
             // Buffer into out_buf; the flush thread emits one coalesced message per window ~60fps.
-            Some(win) => { self.out_buf.entry(win).or_default().push_str(&text); }
+            Some(win) => { self.out_buf.entry(win).or_default().push_str(&text); false }
             None => {
                 let buf = self.pending_output.entry(pane).or_default();
                 if buf.len() >= MAX_BUFFER { buf.remove(0); }
                 buf.push(text);
-                // trigger a refresh so the mapping is learned (inline, avoids nested lock)
-                if !self.refresh_queued {
-                    self.refresh_queued = true;
-                    self.refresh_now();
-                    self.refresh_queued = false;
-                }
+                true
             }
         }
     }
@@ -485,7 +518,11 @@ impl Inner {
 
     fn mark_ready(inner: &Arc<Mutex<Inner>>) {
         let mut g = inner.lock().unwrap();
-        if g.ready { return; }
+        // A killed/dead backend must never announce Ready. The 5s spawn-time fallback timer is
+        // detached and uncancellable, so without this check a backend killed at t=1s still emits
+        // Ready at t=5s — and the supervisor would apply it to whatever session is live by then
+        // (flipping Dead -> Connected and bricking the Reconnect button, which requires Dead).
+        if g.stopped || g.ready { return; }
         g.ready = true;
         crate::dlog!("mark_ready: active={:?} pending_input={}", g.reg.active_window, g.pending_input.len());
         g.flush_pending_input();
@@ -589,8 +626,16 @@ fn latin1_to_utf8(s: &str) -> String {
 /// strip control chars (incl. newlines) and the two chars that break the double-quoted argument
 /// (`"` and `\`), collapse whitespace, and cap the length. Keeps everything else (spaces, `*`,
 /// unicode) so titles like "* Building widget" survive intact.
+///
+/// `#` is DOUBLED (`##`), which is tmux's literal escape for it. Left bare, tmux expands the title
+/// as a format string: a remote program setting its pane title to `#{pane_current_path}` would put
+/// the resolved path in the tab label instead of the literal text (verified against tmux 3.6a;
+/// `#()` did not execute there, but doubling closes the whole class rather than betting on version
+/// behaviour). Length is capped on the INPUT chars so doubling can't push the result past tmux's
+/// limits.
 fn sanitize_window_name(s: &str) -> String {
     let mut out = String::new();
+    let mut kept = 0usize;
     let mut prev_space = false;
     for c in s.chars() {
         if c.is_control() || c == '"' || c == '\\' { continue; }
@@ -600,9 +645,12 @@ fn sanitize_window_name(s: &str) -> String {
         } else {
             prev_space = false;
         }
+        if c == '#' { out.push('#'); }   // tmux literal escape: '#' -> '##'
         out.push(c);
-        if out.chars().count() >= 100 { break; }
+        kept += 1;
+        if kept >= 100 { break; }
     }
+    // Trailing '#' would be a dangling escape; it can only appear as a complete '##' pair here.
     out.trim().to_string()
 }
 
@@ -611,24 +659,33 @@ fn sanitize_window_name(s: &str) -> String {
 /// next read. Genuinely invalid bytes (not just truncated) are passed through lossily so we never
 /// stall. This is what stops box-drawing/other multi-byte chars from being corrupted to U+FFFD
 /// when they straddle a read boundary.
+/// ITERATIVE, not recursive: a pane spewing binary (`cat some.jpg`) delivers a long run of invalid
+/// bytes, and one stack frame per bad byte overflows the reader thread's 2 MiB stack and ABORTS the
+/// process (SIGABRT — not a catchable panic, so it takes every session down with it). Measured
+/// thresholds before this was a loop: ~2–4k invalid bytes in debug, ~10–100k in release, against
+/// 8192-byte reads. Keep this loop-shaped.
 fn decode_utf8_prefix(bytes: &[u8]) -> (String, Vec<u8>) {
-    match std::str::from_utf8(bytes) {
-        Ok(s) => (s.to_string(), Vec::new()),
-        Err(e) => {
-            let valid = e.valid_up_to();
-            // SAFETY: bytes[..valid] is valid UTF-8 by definition of valid_up_to().
-            let good = unsafe { std::str::from_utf8_unchecked(&bytes[..valid]) }.to_string();
-            match e.error_len() {
-                // None => the tail is a truncated-but-valid sequence: carry it for the next read.
-                None => (good, bytes[valid..].to_vec()),
-                // Some(len) => genuinely invalid bytes: emit the replacement char and skip them,
-                // then keep decoding the remainder (so one bad byte can't wedge the stream).
-                Some(len) => {
-                    let mut out = good;
-                    out.push('\u{FFFD}');
-                    let (rest_str, rest_carry) = decode_utf8_prefix(&bytes[valid + len..]);
-                    out.push_str(&rest_str);
-                    (out, rest_carry)
+    let mut out = String::new();
+    let mut rest = bytes;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(s) => {
+                out.push_str(s);
+                return (out, Vec::new());
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                // SAFETY: rest[..valid] is valid UTF-8 by definition of valid_up_to().
+                out.push_str(unsafe { std::str::from_utf8_unchecked(&rest[..valid]) });
+                match e.error_len() {
+                    // None => the tail is a truncated-but-valid sequence: carry it for the next read.
+                    None => return (out, rest[valid..].to_vec()),
+                    // Some(len) => genuinely invalid bytes: emit the replacement char and skip them,
+                    // then keep decoding the remainder (so one bad byte can't wedge the stream).
+                    Some(len) => {
+                        out.push('\u{FFFD}');
+                        rest = &rest[valid + len..];
+                    }
                 }
             }
         }
@@ -753,6 +810,14 @@ mod tests {
         assert_eq!(sanitize_window_name("   "), "");
         // length cap
         assert!(sanitize_window_name(&"x".repeat(500)).chars().count() <= 100);
+        // '#' is doubled so tmux treats it literally instead of expanding a format. Verified against
+        // tmux 3.6a: bare '#{pane_current_path}' renames the window to the resolved path; '##{...}'
+        // renders the literal text.
+        assert_eq!(sanitize_window_name("#{pane_current_path}"), "##{pane_current_path}");
+        assert_eq!(sanitize_window_name("#(echo hi)"), "##(echo hi)");
+        assert_eq!(sanitize_window_name("C# builds"), "C## builds");
+        // the cap counts INPUT chars, so a title of all '#' can at most double in length
+        assert!(sanitize_window_name(&"#".repeat(500)).chars().count() <= 200);
     }
 
     #[test]
@@ -793,5 +858,47 @@ mod tests {
         let (s, carry) = decode_utf8_prefix(&[b'a', 0xFF, b'b']);
         assert_eq!(s, "a\u{FFFD}b");
         assert!(carry.is_empty());
+    }
+
+    // Output from an UNMAPPED pane must ask for ONE coalesced topology refresh, not one list-panes
+    // per event. route_output used to call refresh_now() inline with a same-call-scope guard that
+    // could never coalesce anything, so a redrawing unmapped pane (~750 %output/sec) sent ~750
+    // list-panes commands. It now reports "needs refresh" and handle_event routes that through
+    // queue_refresh's 10ms coalescing window.
+    #[test]
+    fn tc_cb_unmapped_pane_output_does_not_flood_list_panes() {
+        let (inner, sent) = test_inner();
+        sent.lock().unwrap().clear();
+
+        // 50 events from a pane with no window mapping, through the real event path.
+        for i in 0..50 {
+            Inner::handle_event(&inner, ControlEvent::Output {
+                pane: "%9".into(), data: format!("line{}\r\n", i),
+            });
+        }
+        // Nothing is sent synchronously: queue_refresh arms a timer thread instead.
+        let immediate = sent_str(&sent).matches("list-panes").count();
+        assert_eq!(immediate, 0, "no synchronous list-panes per output event, got {}", immediate);
+
+        // After the coalescing window, exactly ONE list-panes has gone out for the whole burst.
+        std::thread::sleep(Duration::from_millis(80));
+        let total = sent_str(&sent).matches("list-panes").count();
+        assert_eq!(total, 1, "burst of 50 unmapped-pane events must coalesce to 1 refresh, got {}", total);
+
+        // The output itself is still buffered for replay once the mapping is learned.
+        assert_eq!(inner.lock().unwrap().pending_output.get("%9").map(|b| b.len()), Some(50));
+    }
+
+    // A MAPPED pane's output must not request a refresh at all — the mapping is already known.
+    #[test]
+    fn tc_cb_mapped_pane_output_requests_no_refresh() {
+        let (inner, sent) = test_inner();
+        Inner::apply_topology(&inner, vec!["@0 %0 1 1 zsh".to_string()]);
+        sent.lock().unwrap().clear();
+
+        let needs = inner.lock().unwrap().route_output("%0".into(), "hello".into());
+        assert!(!needs, "mapped pane must not ask for a topology refresh");
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(sent_str(&sent).matches("list-panes").count(), 0, "no refresh for a mapped pane");
     }
 }

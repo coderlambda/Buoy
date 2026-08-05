@@ -1,7 +1,7 @@
 'use strict';
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { PluginRegistry } = require('../src/shared/plugins');
+const { PluginRegistry } = require('../ui/plugins');
 // The Tauri app serves ui/ ; that's the live copy of the link plugins.
 const { builtinLinkPlugins, parseFileUri, extractOsc8FileLinks, URL_RE, PATH_RE } = require('../ui/builtinPlugins');
 

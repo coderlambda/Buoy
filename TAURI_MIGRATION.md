@@ -3,6 +3,12 @@
 Ports the durable terminal from **Electron + Node main process** to **Tauri v2 + a Rust
 backend**, keeping the exact same UX and the xterm.js renderer.
 
+> **The migration is complete and the Electron app has been deleted from this branch**
+> (`src/` and its tests; recoverable from git history or the `main` branch). `electron`
+> survives only as a devDependency because `test/gui-*.js` use it as a scriptable headless
+> browser to drive the real `ui/` frontend. This file is kept as the record of what moved
+> where; the tables below use the old `src/` paths as historical references.
+
 ## Why xterm.js stays
 
 Tauri renders in the OS webview (WKWebView / WebView2 / WebKitGTK), so the terminal UI is still
@@ -46,7 +52,7 @@ Prereqs: Rust (rustup) + `cargo install tauri-cli`.
 ```
 npm run tauri:dev      # run the app (compiles Rust, opens the webview)
 npm run tauri:build    # release bundle
-npm run tauri:test     # Rust unit tests (39)
+npm run tauri:test     # Rust unit tests
 # live end-to-end (opt-in, needs a reachable host with tmux >= 3.2):
 DT_LIVE_HOST=user@host DT_TMUX=/home/u/.local/bin/tmux \
   (cd src-tauri && cargo test --test live_control_mode -- --ignored --nocapture)
@@ -54,16 +60,21 @@ DT_LIVE_HOST=user@host DT_TMUX=/home/u/.local/bin/tmux \
 
 ## Status / verification
 
-- **39 Rust unit tests pass** (parser, registry, reply channel, tmux keys, socket, validation,
-  probe) — direct ports of the JS suites.
-- **Live control-mode integration test passes** against a real dev-dsk: connect, open a 2nd tab,
-  per-window output isolation, and the re-visit case (a re-selected tab keeps its own screen).
-- App builds and launches (webview boots, no panic).
+- **114 Rust unit tests pass** (parser, registry, reply channel, tmux keys, socket, validation,
+  probe, supervisor, session store, local backend, tunnels, PATH augmentation) — ports of the
+  JS suites plus the features added since (see DESIGN.md §16–§24).
+- **Live suites** (`#[ignore]`d, opt-in with `DT_LIVE_HOST`): control-mode end-to-end,
+  reconnect, force-reconnect, remote file, relative paths, tunnels; `live_local_tmux` runs
+  unconditionally (needs only a local tmux).
+- Release bundle builds, launches, and quits cleanly (`Buoy.app` + `.dmg`, DESIGN.md §24 era).
 
-## Not yet ported (deferred; tracked for follow-up)
+## Since ported (originally deferred)
 
-- `supervisor.rs` (reconnect/backoff state machine) — the backend currently spawns once; the
-  reconnect supervisor + `retry` command are stubbed (`retry` is a no-op in `tauri-api.js`).
-- `backpressure` ACK flow — `ack` is a no-op in the shim (webview keeps up for interactive use).
-- Local-shell backend, mosh/et transports.
-- The Electron implementation remains on `main`; this branch is additive.
+- `supervisor.rs` — reconnect/backoff state machine, including `retry`/`force_reconnect`.
+- `local_backend.rs` — local tmux sessions (§5.3b).
+
+## Still not ported (deferred)
+
+- `backpressure` ACK flow — `ack` is a no-op in `ui/tauri-api.js` (webview keeps up for
+  interactive use). The Electron implementation is in git history (`src/shared/backpressure.js`).
+- mosh/et transports — ssh only for now (argv-verified JS backends are in git history).

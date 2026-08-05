@@ -5,6 +5,11 @@
 
 **Status:** Draft · **Date:** 2026-07-09
 
+> **Code layout note (2026-08-04):** the app is now Tauri + Rust (`src-tauri/` + `ui/`);
+> the Electron MVP this doc's earlier sections were written against has been deleted
+> (git history and `main` have it). Where a section cites an old `src/…/*.js` path, the
+> module lives on as its Rust port — see the table in `TAURI_MIGRATION.md`.
+
 ---
 
 ## 1. Motivation
@@ -424,6 +429,93 @@ supervisor:
 | `dead` | Retry cap reached | `connecting` on user "retry" (subject to ≥30s floor, §5.1) |
 | `closed` | Clean exit 0 / user close | `connecting` on user reconnect |
 | `lost` (flag) | Reattach found a freshly-created session (§5.2) | overlays `connected`; cleared on ack |
+
+### 5.3b Local sessions (`kind:'local'`) — tmux-backed, durable like remote
+
+The new-session dialog offers **Local shell** alongside a remote host: a shell on *this* machine —
+but run **inside tmux**, exactly as a remote session is. There is no separate local session
+architecture; local is one value of a `Transport` enum, and everything downstream (control-mode
+parser, window registry, reconnect supervisor, session store) is shared verbatim.
+
+- **Why tmux locally, when there is no network to drop?** Durability is not only about the network.
+  A tmux server outlives the app, so quitting Buoy (or crashing it, or updating it) no longer kills
+  the work in a local shell — reopening the project reattaches to the running shell with scrollback
+  and jobs intact. Local sessions also get **native tabs** for free, because control mode is the same
+  protocol locally: verified empirically that `tmux -CC new-session -A -D` on the local machine emits
+  the same `%begin` / `%window-add` / `%output` stream as over ssh. Reusing one implementation is the
+  point: a parallel local path would drift from the remote one it is supposed to mirror.
+- **Transport is the only axis of difference** (`transport.rs`). `spawn_spec(transport, control, …)`
+  returns a `SpawnSpec { program, args, env }`: for `Ssh` the program is `ssh` with the tmux command
+  as a remote argv; for `Local` the program *is* tmux, with no ssh scaffolding and no host. Both
+  backends (`control_backend.rs`, `plain_backend.rs`) build their child from that spec, so neither
+  contains a local special case. TC-T1 is a regression guard that the remote spec is byte-identical
+  to before this change.
+- **Three modes, chosen by `choose_mode()`** — extracted as a pure function because `create_session`
+  needs a live `AppHandle` and can't be unit-tested (TC-CM1/TC-CM2 cover the full matrix):
+
+  | condition | `mode` | tabs | durable |
+  |---|---|---|---|
+  | local, tmux ≥ 3.2, Native tabs on | `"control"` | native (tmux windows) | yes |
+  | local, tmux < 3.2 **or** Native tabs off | `"plain"` | one implicit tab | yes (tmux holds it) |
+  | local, **no tmux installed** | `"local"` | one implicit tab | **no** |
+
+  The raw-pty `LocalBackend` is now a **fallback only**, for a machine without tmux — the single
+  remaining non-durable session type. Installing tmux upgrades a local session to the durable path
+  with no other change. "Native tabs off" downgrades to `plain`, not to the raw pty: the user opted
+  out of tabs, not out of durability.
+- **Persisted** (`persist = !no_local_tmux`), because the tmux server outlives the app and the store
+  row is the only way back to it. Two guards in `session_store.rs` had to be relaxed for this and had
+  silently dropped local rows: `load()` ran `parse_host` on every row (a local row's host is
+  legitimately **empty**), and load/save clamped `mode` to `control|plain` (rewriting the no-tmux
+  `"local"` mode). A local row **with** a host is still rejected as malformed — local mode must not
+  become a hole that smuggles an unvalidated host into argv construction (TC-SS-L1/L2). Only the
+  no-tmux fallback session is skipped, since there is nothing to reattach to.
+- **The renderer keys off `mode`, never `kind`** — so `makeView`/`statusLine`/`isConsoleLive` needed
+  no local branches. On restore, a `transport:"local"` row must be rebuilt as `kind:'local'`; treating
+  it as remote would build ssh args for an empty host. The Native-tabs toggle moved **out** of
+  `#remote-fields` (it now applies to both kinds), and the sidebar subtitle shows `local shell` plus
+  the tmux-version badge — its absence is the signal that this session is the non-durable fallback.
+- **Version-tagged, per-mode sockets** (`socket_name`): control → `dtcc<maj>-<min>-<session>`
+  (per-session, because two `-CC` clients on one server detach each other); plain → `dtapp<maj>-<min>`
+  (shared). `session_kill` tears a local server down directly via `build_local_kill_args`
+  (`tmux -L <sock> kill-session -t <name>`) instead of the ssh kill path.
+- **Local probing re-runs every time**, unlike the ssh probe. `probe_local_tmux()` walks the augmented
+  PATH then absolute candidates (`/opt/homebrew/bin`, `/usr/local/bin`, `/opt/local/bin`, `/usr/bin`,
+  `$HOME/.local/bin`), execs each `-V` directly (no shell), skips paths failing the tmuxPath charset,
+  and prefers ≥3.2 then highest. It's safe to redo because it costs one local exec — no network, no 8s
+  timeout — and a local socket is always reachable, so a re-probe can't strand a server we can't reach.
+  The ssh path must stay cached behind `attach_ok` precisely because the version tags the socket.
+- **Locale (the `_`-mangling bug).** tmux only stores UTF-8 when its own process locale is UTF-8;
+  otherwise every non-ASCII byte becomes `_` (agent tab titles like `✳ task` arrived as `_ task`). The
+  ssh path forces `LC_ALL=C.UTF-8` unconditionally, since a remote login often has `LANG` unset. Local
+  is different because we can *see* the environment: `local_tmux_lc_all` overrides only when the
+  effective locale is **not** already UTF-8 (POSIX precedence: `LC_ALL` outranks `LANG`) — forcing
+  `C.UTF-8` over a user's own `en_US.UTF-8` would change their collation and date formatting for no
+  benefit. There is deliberately no `env LC_ALL=…` argv prefix locally: with no login shell in
+  between, the env goes straight on the child. `TERM=xterm-256color` is also set explicitly, because
+  `portable_pty` does not reliably inherit it and an unset `TERM` yields a colorless shell with broken
+  full-screen editors.
+- **Relative clicked paths** (§17) resolve through `resolve_local_path`: absolute verbatim, `~`/`~/…`
+  → `$HOME`, else query the local tmux for `#{pane_current_path}` and join — in Rust rather than an sh
+  snippet, since there is no remote shell, which also removes the quoting surface (TC-RF-L1).
+- **Bug this fixed: a local session was stuck on "connecting" forever.** A local session had no
+  supervisor, so no `session:state` event was ever emitted; `v.state` stayed `'idle'` from `makeView`
+  and the "connecting …" status set before `await api.createSession(...)` was never superseded. Routing
+  local through the same supervisor fixes it *structurally* rather than by patching the status line —
+  the session reports `connected` because it genuinely is. TC-LT3 asserts a local session reaches
+  `State::Connected` and emits it.
+- **Earlier bug (Tauri migration gap).** The Electron build had `backends/localBackend.js`, never
+  ported — so `kind:'local'` fell through to the **ssh** backend, where `build_ssh_args("")` rejects
+  the empty host and the UI showed *"failed to connect local: host"*. TC-LB5 pins that root cause so
+  nothing routes local back through the ssh builder.
+- **Fallback shell/cwd** (no-tmux path only): explicit override → `$SHELL` → `/bin/bash`, started as a
+  **login shell** (`-l`) in `$HOME`.
+- **Tests are deliberately NOT `#[ignore]`d** (`tests/live_local_tmux.rs`): they need no remote host or
+  credentials and skip cleanly when tmux is absent, so local durability is checkable in CI. TC-LT1
+  attach/Ready/topology, **TC-LT2 the durability property** (write a marker, kill the client as if the
+  app quit, reattach a *new* backend, marker replays), TC-LT3 the stuck-connecting fix, TC-LT4 plain
+  mode really runs under tmux, TC-LT5 a unicode window name survives intact. Mutation-verified:
+  dropping `-CC` fails LT1/LT2/LT5; dropping `new-session -A` fails LT2.
 
 ### 5.4 Resize correctness & reattach ordering
 
@@ -979,15 +1071,19 @@ URLs are handled separately (§13 url plugin → browser); this section is about
 - **Presentation:** a **new tab** (reuses the §15 polymorphic tab machinery), not a split. Split
   view is a possible follow-up.
 - **Day-one types:** **text**, **markdown** (rendered), **image**. Others → download-only panel.
+  **Added later: HTML** (`.html`/`.htm`/`.xhtml`) — static by default, with an explicit per-file
+  opt-in to run its scripts. See *HTML preview* and *Scripts* below.
 - **Type detection:** by **extension** first (`.md`/`.markdown` → markdown; image exts → image;
-  else text), with a **binary sniff** fallback (invalid-UTF-8 / NUL bytes → not text → treated as
-  a downloadable blob, not rendered).
+  html exts → html; else text), with a **binary sniff** fallback (invalid-UTF-8 / NUL bytes → not
+  text → treated as a downloadable blob, not rendered). The sniff runs **before** the html branch,
+  so a binary blob named `.html` is never handed to the parser.
 - **Size caps are TIERED by what happens to the bytes** (a single cap is wrong — the bottleneck
   is webview rendering, not the network):
   | Path | Cap | Why |
   |---|---|---|
   | text / markdown **render** | **1 MB** | DOM + markdown cost; larger stalls WKWebView |
   | image **decode** | **5 MB** | one decode to a `data:` URL |
+  | **html render** | **5 MB** | native parser, not our MD path; self-contained files inline their images |
   | **download-to-local** | **50 MB** | bytes → disk, no rendering |
   Over the render cap → **don't render**; show "file is N MB, too large to preview" with the
   Download button still enabled. The remote fetch is bounded with `head -c <downloadCap>`.
@@ -1035,11 +1131,96 @@ Today it copies + status. It becomes: call `ctx.openViewer(meta.id, text)`. For 
 (no remote host) the same command path still works (ssh not needed → read the file directly; a
 `kind:'local'` branch). Falls back to copy+status if the fetch fails (unreachable, not a file).
 
+### HTML preview — self-contained files (added after the first cut)
+Clicking a `.html`/`.htm`/`.xhtml` path previews the page itself. This is different in kind from
+every other mode: markdown/text are *transpiled or escaped by us*, but here **the file's own markup
+is the render**, so it goes to the browser parser. The whole design is therefore about containing it.
+
+There are two modes. **Static is the default and is what a click gets you**; scripts are a separate,
+explicit, per-file opt-in (next subsection). The toolbar always says which is in effect
+(`scripts disabled` / `scripts ENABLED`) so an inert page reads as intended rather than as a bug.
+
+- **Static: `<iframe class="fv-html" sandbox="" srcdoc="…">`.** Two INDEPENDENT layers, each
+  measured to be sufficient on its own in a real WKWebView:
+  1. `sandbox=""` — no `allow-scripts` (no JS), no `allow-same-origin` (opaque origin: no access to
+     our DOM/`localStorage`, no reach to `window.__TAURI__` / the `invoke` bridge), no
+     `allow-popups`, no `allow-top-navigation`, no `allow-forms`.
+  2. The app CSP (`script-src 'self'`) is **inherited by the srcdoc document**, so inline `<script>`
+     and inline event handlers (`onerror=`, `onload=`) are blocked even if the sandbox attribute were
+     loosened later by mistake.
+- **`srcdoc`, not a `blob:` URL.** `blob:` is a separate origin that `default-src 'self'` refuses to
+  load as a frame — measured: the frame stays blank. `srcdoc` also means nothing is fetched by URL.
+- **Static covers the target case fully.** Static exports — pandoc, `jupyter nbconvert --to html`,
+  coverage/plot reports with inlined images — render completely (own `<style>`, embedded `data:`
+  images, tables) with nothing executing.
+- **CSP addition this required:** `img-src 'self' data:` and `font-src 'self' data:`. Note the
+  original CSP (`default-src 'self'` only) **blocked `data:` images outright**, so the pre-existing
+  `.png`/`.jpg` image preview never actually displayed; this fixes that too.
+- **No relative subresources.** A self-contained file is the contract: `<img src="./logo.png">`
+  won't resolve (no base URL, and fetching siblings would mean more remote round-trips per asset).
+  Files that depend on adjacent assets render without them — Download still gets the raw bytes.
+- **Sizing: the iframe fills the tab, and that depends on a tab-machinery contract.** `.fv-root` is a
+  `display:flex` column (toolbar `flex:none`, `.fv-body { flex:1 }`, `.fv-html { height:100% }`), so
+  the preview stretches with the window and the file scrolls *inside* the frame. This only works if
+  nothing forces an inline `display` on the tab element: `showActiveTab` therefore reveals a tab by
+  **clearing** the inline value (`display = ''`), not by setting `'block'`. An inline `display:block`
+  outranks the stylesheet, which destroys the flex column and collapses the iframe to the CSS default
+  **150px** no matter how tall the tab is (measured: 150px inside a 618px tab). Terminal tabs are
+  plain divs, so `''` resolves to the block they already had. TC-FV16 guards the viewer's half of the
+  contract (no inline `display` on the root/body/iframe).
+
+### Scripts: an explicit per-file opt-in on a separate origin
+Real-world "HTML report" files are often not static at all — the motivating example was a data-model
+doc whose single inline `<script type="module">` pulls eight packages from `esm.sh` (React, mermaid,
+`@xyflow/react`, …) and builds the entire page at runtime. Statically it renders as an empty shell.
+So the viewer offers an **`Enable scripts` button**, and only that button — never a click on the
+path, never a remembered preference — turns scripts on, for **that one document, in that one tab**.
+
+- **Why a custom `buoyhtml:` protocol and not a looser iframe attribute.** A `srcdoc` child
+  **inherits** the parent document's CSP, and a child can only ever **intersect** a CSP, never relax
+  it. Making srcdoc content scriptable would therefore require `'unsafe-inline'` on the **app's own**
+  `script-src` — and the app renders untrusted terminal output, so that trades a contained problem
+  for app-origin XSS. Instead `enable_html_scripts` stashes the bytes under a random 128-bit token
+  and returns `buoyhtml://localhost/<token>`; `register_uri_scheme_protocol` serves it as its **own
+  origin** with its own per-response `Content-Security-Policy`, so the permission applies to that
+  document alone. See `src-tauri/src/html_preview.rs`.
+- **What the preview CSP grants** (and nothing else): `default-src 'none'` as the base, then
+  `script-src 'unsafe-inline' 'unsafe-eval' https:`, `style-src`/`font-src`/`img-src`/`media-src`/
+  `connect-src` over `https:` (+ `data:`/`blob:` where relevant). No `'self'`, no plaintext `http:`,
+  `frame-src 'none'`, `form-action 'none'`, `base-uri 'none'`. Responses also carry
+  `Referrer-Policy: no-referrer` (nothing about the user leaks to the CDNs) and `nosniff`.
+  Any-HTTPS rather than a CDN allowlist was a deliberate call: an allowlist is unmaintainable and
+  gives a false sense of safety, since the granted capability (fetch code from the internet) is the
+  same either way.
+- **Still cross-origin, still no IPC.** The frame gets `allow-scripts` but **not**
+  `allow-same-origin`, so its origin stays opaque — and wry injects the Tauri bootstrap into the
+  **main frame only**, so the bridge simply isn't there. Measured against a deliberately hostile
+  file driven through the same opt-in path: `__TAURI__`/`__TAURI_INTERNALS__`/`window.ipc` all
+  `undefined`, `invoke` throws, `parent.document` / `top.location` / `localStorage` all
+  `SecurityError`, `document.origin === "null"`, a fetch of the app origin is blocked, and a planted
+  `secret_command` was never reached. `https:` fetches do succeed — that is the capability granted.
+- **One live scripted document at a time.** `PreviewStore::put` clears previous entries, so a long
+  session can't accumulate multi-MB documents and a closed tab's URL stops resolving (404).
+- **Not persisted, not inherited.** Reopening the same path starts static again (TC-FV14). The app's
+  own `script-src 'self'` is unchanged; the only app-CSP edit is `frame-src 'self' buoyhtml:`.
+- **Verified on the motivating file end-to-end** in a real WKWebView, driving the shipped
+  `fileViewerTab.js` under the shipped CSP: static → 0 scripts ran; after the click → inline script
+  ran, the 8 `esm.sh` imports resolved, and the page built **9198 DOM nodes / 24 React-Flow nodes /
+  33 SVGs** with its real title.
+
 ### Security
 - Path is base64-wrapped end-to-end → no shell injection via the clicked text.
 - Rendered text is inserted as `textContent`; markdown renderer escapes and never passes raw HTML;
   images are `data:` URLs — so hostile file *contents* can't script the webview (CSP stays
   `script-src 'self'`).
+- HTML previews are double-contained (sandboxed opaque iframe + inherited CSP) — see above. The
+  iframe's isolation attributes are asserted in CI (TC-FV11), including that hostile markup never
+  reaches an app-origin `innerHTML`.
+- Script execution for an HTML preview requires an explicit per-file click and runs on a **separate
+  origin** (`buoyhtml:`) with its own CSP — the app's `script-src 'self'` is never loosened. The
+  frame keeps `allow-scripts` **without** `allow-same-origin`, so it cannot reach the `invoke`
+  bridge. CI asserts the opt-in cannot happen implicitly (TC-FV12), that the scripted frame stays
+  cross-origin (TC-FV13), and that the choice does not leak to another tab (TC-FV14).
 - Connection params come from the validated store, not the renderer.
 - Size caps bound memory/DOM blowups from huge or hostile files.
 
@@ -1053,7 +1234,8 @@ Today it copies + status. It becomes: call `ctx.openViewer(meta.id, text)`. For 
 
 ### Deferred (explicitly not in the first cut)
 Split-pane layout, syntax highlighting, rich/large markdown libs, **upload-to-override**
-(`write_remote_file`), diffing, and re-fetch/watch.
+(`write_remote_file`), diffing, and re-fetch/watch. (JS-enabled HTML preview *was* deferred; it now
+exists as the opt-in above.)
 
 ---
 
@@ -1107,12 +1289,352 @@ the local browser as-is — it would hit the Mac's port 3000. Like cmux, we open
 - ssh argv is built from validated store fields; the local port is app-chosen (not user text).
 - Tunnels bind to `127.0.0.1` locally (not `0.0.0.0`) so only this machine can use them.
 
+### Sticky local ports + reconnect restore (shipped bug, reported)
+> "Keep the ssh -L ports, don't pick a new port every time. now every time if the connection broke,
+> the system will pick a new port, this will cause the old page not working anymore, also, when the
+> main session reconnected, reconnect the kept ssh -L tunnel as well"
+
+Two separate defects, both in the reconnect path:
+
+**1. The local port moved on every re-open.** `PortRec.local` was already persisted, but `ensure()`
+never read it back — it called `free_local_port()` unconditionally. That's invisible while a tunnel
+lives and fatal the moment one dies: **a forwarded URL names exactly one `localhost:<local>`**, and
+once the user has it in a browser tab (or a bookmark, or a config file, or a curl in their history),
+handing out a fresh random port on the next connect silently breaks every one of them. The page
+doesn't error usefully — it just stops loading, pointing at a port nothing is listening on.
+
+The fix is `pick_local_port(sticky)`: prefer the port this `(session, remote)` was last forwarded
+on, and abandon it **only** if something else now holds it (checked with a real
+`TcpListener::bind` — the same check ssh's own listener makes, surfaced early so we fall back
+instead of spawning an `ssh -L` doomed to die on `ExitOnForwardFailure=yes`). `local: 0` is serde's
+default and means "unknown", never "port 0".
+
+Two lifecycle rules make the memory actually last:
+- `close_session` (detach / drop / network death) **kills the children and clears `pid`, but keeps
+  `local`.** That asymmetry is the whole feature: the record has to outlive the ssh process, because
+  the ssh process is what dies.
+- `close()` — the user explicitly dismissing a port row — **removes the row entirely.** Dismissed
+  means dismissed; it must not resurrect on the next reconnect.
+- The record is on disk, so the port also survives an app restart.
+
+**2. Nothing re-opened the tunnels after a reconnect.** The forwards are deliberately separate ssh
+processes (never the `-CC` channel), so a network drop kills them while the supervisor quietly
+reconnects the control channel. Previously nothing noticed: the user was left with greyed-out port
+rows and dead browser tabs until they re-clicked every port by hand.
+
+`TunnelRegistry::reestablish(session, host, base_args)` re-opens them. It is driven off the
+**persisted list, not the live map** — precisely because the live entries are the ones that just
+died with the network; reading the live map would find nothing to restore. Already-alive tunnels are
+left alone (`ensure` reuses them), so it's safe to call on every reconnect. One port failing (remote
+server gone, local port stolen by another app) is logged and skipped, never allowed to abort the
+rest.
+
+Wired in `create_session`'s state sink, gated by `should_restore_tunnels(state, seen, host)` —
+extracted next to `choose_mode` so the *policy* is unit-testable even though the sink closes over a
+live `AppHandle` and isn't. Three conditions, each load-bearing:
+- **`Connected` only.** `Connecting`/`Reconnecting` have no usable link yet; spawning then would
+  just fail.
+- **NOT the first `Connected`.** The initial attach must leave persisted-but-closed ports *inactive
+  and re-openable*, not silently spawn an ssh per remembered port at startup. `seen.swap(true)`
+  latches the first one — and must run for **every** `Connected`, so it stays ahead of the host
+  check rather than short-circuiting past it.
+- **Non-empty host.** A local session has no remote to forward from.
+
+The restore runs on its own thread (each forward spawns an ssh child; the sink runs on the
+supervisor's thread and blocking it would stall the state machine it reports for), and that thread
+uses `try_state`, not `state()` — it's detached and can outlive app teardown, where `state()`
+panics. Same precedent as the `buoyhtml` scheme handler. It finishes with `emit_tunnels` so the
+sidebar repaints grey → live immediately instead of waiting for the 5s probe tick. No renderer
+change was needed: `api.onTunnels` already re-renders.
+
 ### Testing
 - Unit: URL classification (plain vs loopback + port/path parse); free-port pick; registry
   reuse/teardown.
+- Unit (sticky ports, TC-TP1–6 in `tunnel.rs`): `pick_local_port` prefers/abandons correctly;
+  `local` survives death + restart but not an explicit `close()`; `ensure()` returns the SAME port
+  after the previous tunnel died; `reestablish` restores all persisted ports on their original local
+  ports and skips dismissed ones; and the chosen port actually reaches the `-L` flag — asserted via
+  `tunnel_argv`, split out of `spawn_tunnel` for exactly this reason, since returning the right
+  number from `ensure()` is worthless if the argv carries a different one.
+  TC-TP3/4/5 use `dt-sticky-test.invalid` (unresolvable per RFC 6761) so each ssh spawns and dies
+  instantly — a deterministic stand-in for "the connection broke", with no network dependency.
+- Unit (restore policy, TC-TR1 in `lib.rs`): `should_restore_tunnels` fires on the 2nd+ `Connected`
+  only, never on `Connecting`/`Reconnecting`/`Closed`, never for an empty host.
 - Live: start a server on the remote loopback, click its `localhost:PORT` URL, assert the tunnel
   opens and the local URL serves the same content; second click reuses the tunnel; session close
   tears it down.
+- Live (`live_tunnel_keeps_local_port_across_a_break`, `#[ignore]`): two remote servers, break the
+  connection, `reestablish`, assert both come back on their pre-break local ports and the pre-break
+  URLs still serve — plus that a `close()`d port is not resurrected.
+
+Mutation-verified (deliberately break the product code, confirm a test fails):
+
+| Mutation | Caught by |
+|---|---|
+| `ensure` picks a random local port again | TC-TP3, TC-TP4, TC-TP5 |
+| `close_session` clears `local` along with `pid` | TC-TP2, TC-TP4 |
+| `reestablish` reads the live map instead of the persisted list | TC-TP4, TC-TP5 |
+| no first-connect latch (restore on the initial attach too) | TC-TR1 |
+| restore also fires on `Reconnecting` | TC-TR1 |
+| `-L` built with a different port than `ensure` returned | TC-TP6 |
 
 ### Deferred
 Tunnels-list UI, idle timeout, `0.0.0.0` default, HTTPS-to-remote, and non-HTTP forwards.
+
+## 23. Inline rename — state-driven editors, because click precedes dblclick
+
+### The bug (shipped and reported: "when double click, the rename not enabled")
+Both rename affordances — double-click a sidebar project name, double-click a tmux-window tab label —
+appeared wired correctly and did nothing. The `ondblclick` handler *did* fire; the editor simply never
+became usable.
+
+The cause is event **ordering**, not wiring. A double-click delivers three events in order:
+
+```
+click (detail=1) → click (detail=2) → dblclick
+```
+
+The row's `onclick` calls `mount()` → `renderSidebar()`, which rebuilds the list with
+`sessionsEl.innerHTML = ''`. So both clicks land *before* `dblclick`, and each one discards every row
+node. By the time `dblclick` ran, the `nameEl` its handler had closed over was an orphan. The old
+`startRename(id, nameEl)` then did exactly what it was written to do — created an `<input>`, appended
+it to `nameEl`, called `.focus()` — into a subtree no longer in the document. Result: an input that
+exists, reports itself focused, and is invisible and untypable. The same applies to the tab strip,
+where `switchTab()` → `renderTabs()` rebuilds the strip.
+
+Measured in a real Chromium (`A dblclick fired on gen=2 (current gen=3)`,
+`input.isConnected=false visible=false focused=false`).
+
+### Why this survived to a user report
+A synthetic `el.dispatchEvent(new MouseEvent('dblclick'))` **passes against the broken code**: it
+skips the two `click` events entirely, so nothing re-renders and the closed-over node is still live.
+Only a real click sequence — `sendInputEvent` with `clickCount` 1 then 2, as the OS delivers — can
+observe the defect. Any test for this class of bug must drive real input events.
+
+### The fix: the edit is view state, not a DOM node a handler mutates
+The rename *intent* lives on the view (`v.renaming` / `v.renameDraft` / `v.renameSel` /
+`v.renameFocus`; `tab.*` for tabs), and `renderSidebar`/`renderTabs` **rebuild** the editor from that
+state on every render. Inverting ownership this way turns a re-render from the thing that destroys the
+editor into the thing that re-materializes it in the live row:
+
+- `startRename(id)` sets state and re-renders. It no longer receives, or touches, a node.
+- `mountRenameInput(v, nameEl, id)` is called *from the render path*, so it runs again on every
+  subsequent render while the edit is open.
+- `commitRename(id, save)` clears state, re-renders, then sends. It early-returns unless
+  `v.renaming` — `blur` fires after Enter/Escape already committed, and without that guard a
+  committed rename is sent twice.
+
+This matters beyond the double-click: `renderSidebar()` also runs on things the user didn't do — a
+`session:state` event (§5.1), the 5s tunnel refresh (§18), a reconnect. Under the old design any of
+those would silently destroy an open editor mid-typing. So the draft **and the caret** are mirrored
+into the view on `input`/`keyup`/`select`, and a rebuilt input restores value, selection, and focus.
+Without the caret half, a re-render would jump the cursor to the end of what the user was typing.
+
+Focus is applied in a `requestAnimationFrame`: the node is in the tree synchronously, but a rAF also
+survives the *second* click of the double-click re-rendering the row underneath it.
+
+### Two deliberate behaviors, not oversights
+- **The first click of a double-click still mounts the project** (ordinary single-click behavior), so
+  renaming an inactive row also switches to it. Suppressing that would mean delaying **every** row
+  click by the double-click threshold to see whether a second arrives — a latency cost on the common
+  gesture to save a click on the rare one. Documented and asserted, not silently accepted.
+- **The second click must not mount again.** `li.onclick` returns early on
+  `e.detail >= 2 && nameEl.contains(e.target)`; without it, one double-click issues two `mount()`
+  calls — a duplicate `setLastActive` round-trip and, on an unconnected project, a duplicate connect.
+  Measured: `["s2","s2"]` instead of `["s2"]`. The tab strip has the same guard; there it is
+  redundant with `switchTab`'s `activeWindow === winId` early-out (either alone suffices — verified by
+  mutating both), but the intent reads better stated at the gesture than inferred from a downstream
+  no-op.
+
+### Empty value means different things in the two editors
+Project rename treats empty as **cancel** (a project must keep a label). Tab rename treats empty as
+**meaningful** — it clears the manual name so tmux resumes `automatic-rename` for that window — so it
+sends on any change from current, including to `""`.
+
+### Testing (`test/gui-rename.js`, real Electron, 41 checks)
+Loads the **real** `ui/index.html` (minus the `tauri-api.js` tag, which needs `window.__TAURI__`) and
+the **real** `ui/renderer.js` against a preload stub of `window.terminalAPI`, then drives genuine
+OS-level double-clicks. Not in the `npm test` glob (`test/*.test.js`) because it needs an Electron
+binary; run it directly:
+
+```
+node_modules/.bin/electron test/gui-rename.js
+```
+
+- **TC-R1** the active row's editor is present, **connected**, visible, seeded, focused. `connected`
+  is the assertion that pins the actual bug.
+- **TC-R2** type + Enter commits exactly once and repaints the label.
+- **TC-R3** Escape closes the editor and sends nothing.
+- **TC-R4** an inactive row renames too; the editor and the commit target the double-clicked row
+  (not the previously-active one); the gesture mounts that row exactly **once**.
+- **TC-R5** the tab strip: editor live/visible/focused; the tab is selected exactly once.
+- **TC-R6** Enter reaches tmux (`rename-window`) and closes the editor.
+- **TC-R7** a `session:state` event for the *other* project arriving mid-typing leaves the draft, the
+  caret, and focus intact, and the edit still commits.
+
+Mutation-verified — each piece of the fix was deliberately broken and the suite failed:
+
+| Mutation | Result |
+|---|---|
+| drop `mountRenameInput` call from `renderSidebar` | 16 FAIL |
+| drop `mountTabRenameInput` call from `renderTabs` | 5 FAIL |
+| drop `e.detail >= 2` guard in `li.onclick` | 1 FAIL (TC-R4 double mount) |
+| drop **both** tab guards (`e.detail >= 2` + `switchTab` early-out) | 1 FAIL (TC-R5 double select) |
+| seed the input from `meta.title` instead of the mirrored draft | 2 FAIL (TC-R7) |
+| stop mirroring the caret (`renameSel`) | 1 FAIL (TC-R7 caret jumped 4 → 10) |
+
+## 24. Drag-to-reorder — pointer events, because native DnD never reaches the page
+
+### The bug (shipped and reported)
+> "Fix the reorder of the sessions. now when drag the session card, it shows a "+" icon below the
+> mouse, and the card not movable,. it should be when drag the card, the ui ether show a placeholder
+> of the target slot or move other cards damatically"
+
+Three symptoms, one cause: a `+` (copy) badge under the cursor, a card that doesn't move, and — the
+part that identifies the culprit — `dragover`/`drop` **never firing in JS at all**. §20 had
+implemented reordering with HTML5 drag-and-drop (`li.draggable = true` plus `dragstart` /
+`dragover` / `drop` handlers painting a `.drop-before` / `.drop-after` insertion line). Those
+handlers were never reached.
+
+### Root cause: the drag is answered by the native view, above us
+`wry` subclasses `WKWebView` to implement Tauri's file-drop feature and overrides the
+`NSDraggingDestination` methods (`wry-0.55.1/src/wkwebview/drag_drop.rs:53`). Its `dragging_updated`
+calls the registered handler and, **if that returns true, returns `NSDragOperation::Copy` without
+ever forwarding to `super`'s `draggingUpdated`** (`drag_drop.rs:76`) — and Tauri's handler ends in a
+bare `true` (`tauri-runtime-wry-2.11.4/src/lib.rs:4895`). So **every** drag over the webview, from
+anywhere including the page itself, is answered "copy" and never forwarded on to WebKit's own drag
+machinery. (The `false` branch does call `super` and preserves WebKit's answer — but nothing ever
+takes it.)
+
+That is precisely the reported triad. The `+` is `NSDragOperationCopy` rendered by AppKit; the card
+can't move because WebKit never runs a drag session for it; and no DOM drag event fires because the
+native destination consumed the sequence. **No arrangement of frontend code can fix that path** — the
+interception sits above the page. (`"dragDropEnabled": false` in `tauri.conf.json` is the documented
+workaround, but it is a global capability switch that would disable file-drop app-wide; the frontend
+rewrite below costs nothing and leaves native config and capabilities untouched.)
+
+### The fix: implement dragging on pointer events
+Pointer events are ordinary input; the native drag machinery never sees them. So `wirePointerDrag`
+in `ui/renderer.js` drives the gesture directly, shared by the project list (`axis: 'y'`) and the tab
+strip (`axis: 'x'`):
+
+```
+pointerdown  -> arm; remember the origin. Do NOT start — a click must stay a click.
+pointermove  -> past DRAG_THRESHOLD (4px): lift the element, snapshot geometry, follow the pointer,
+                shift the siblings out of the way
+pointerup    -> commit(from, to); or, if never started, fall through to the click handler
+pointercancel-> abandon, restoring the strip; persist nothing
+```
+
+This also answers the second half of the request directly, and better than the old path could: the
+dragged card lifts and tracks the cursor while the items between its old and new slot slide by
+exactly one slot. **The gap they open IS the placeholder** — no insertion line needed (which is all
+HTML5 DnD could ever have drawn; it has no way to express "move the other cards").
+
+### Load-bearing details, each measured rather than assumed
+- **Move/up/cancel are on `window`, not the element**, installed per gesture and removed together in
+  `endDrag`. Two reasons, both probed in this webview: the lifted card must have
+  `pointer-events:none` (or it hit-tests itself while sitting under the cursor), and that stops
+  element-level `pointermove` **completely** (element-moves 2 → 0 once lifted); and
+  `setPointerCapture` does not hold here — `hasPointerCapture` reads back false in all four
+  capture × lift combinations. Window listeners got every move in every combination. They also
+  survive the element being replaced by a re-render mid-gesture.
+- **`dropIndexAt` counts midpoints, not slot arithmetic**, because sidebar rows genuinely differ in
+  height (a project with forwarded ports is taller).
+- **It is fed rects snapshotted at drag start.** We shift siblings with CSS transforms and
+  `getBoundingClientRect` reports transformed boxes, so live reads would measure the layout our own
+  feedback just changed, mid-transition. Measured honestly: for one- and two-slot drags live rects
+  happen to give the *same* landing index, because displaced items move away from the pointer. The
+  snapshot is the version whose correctness doesn't depend on that coincidence — not a fix for an
+  observed failure.
+- **`slotSize` measures the gap edge-to-edge** from a neighbour's snapshotted rect
+  (`next.top - me.bottom`), so unequal row heights still yield the true gap, with a fallback to the
+  bare extent if the layout gives a nonsense one.
+- **`DRAG_THRESHOLD`** is what keeps a click a click: below it `d.started` stays false and `endDrag`
+  returns early, leaving the row's `onclick` to select the project.
+- **`pointercancel` abandons.** `clearDragStyles` is what makes that actually restore the strip,
+  since a cancelled drag never re-renders.
+- **The tab strip's reorderable set is `.tab:not(.plus)`** — the trailing `+` is an affordance, not a
+  tab, and must neither shift nor be a drop target.
+- **Commits are index-based** (`reorderProjectByIndex`, `reorderTabByIndex`, replacing §20's
+  id-relative pair) because the landing slot may be one past the last item, which no
+  "before/after this id" form can name. Both bounds-check against a list that changed mid-drag.
+- **The press is exempt on `input, .controls, .tunnel, .tclose, .plus`** and on any row with a live
+  rename editor (`el.querySelector('input')`). The second guard was found by probing §23 against
+  §24: pressing a renaming row's *sub-line* — outside the editor, so not covered by the first
+  guard — used to lift and reorder it, even though `li.onclick` already ignores clicks while
+  renaming. The two paths should agree.
+- **`li.draggable = true` is deliberately gone**, with a comment saying why: setting it hands the
+  gesture straight back to the native machinery that swallows it.
+- **The post-drag click-swallow is insurance, not a proven fix.** A completed drag can still be
+  followed by a `click`, which would also switch project. It's swallowed at the window in the capture
+  phase, because that's where the click lands — measured in Chromium, the post-drag click targets the
+  *container*, since the lifted card's `pointer-events:none` keeps it from being the mouseup target
+  and puts the down/up common ancestor at the container. On that same measurement the guard is
+  **redundant in Chromium**: no row handler receives the click either way, and removing it fails no
+  test. It is kept for the shipping engine, WKWebView, which is not Chromium and which nothing in
+  this repo can exercise. The code comment says so explicitly so nobody later reads the passing
+  tests as proof it's load-bearing.
+
+### No text selection while dragging (second report, after the reorder itself worked)
+> "the reorder works, but whhile moving, the text on other cards will be selected. we should avoid
+> selection."
+
+Press-and-move over text is *also* the native gesture for extending a selection, so the drag has to
+suppress it. The first cut did this reactively — `user-select:none` under `.reordering` — and that is
+**too late**: a `pointerdown` places a selection anchor immediately (measured: `type: "Caret"`, one
+range, at mouseDown), while `.reordering` only appears after the 4px threshold has classified the
+gesture. Flipping `user-select` mid-gesture does not reliably abort a selection drag already in
+flight — Chromium stops extending, which is why the local suite didn't catch it, but WKWebView is
+what ships and it kept going.
+
+So the rule is **unconditional** on both strips (`#sessions`, `#tabs`), with the rename editors opting
+back in (`input { user-select:text; }`) so §23 doesn't regress. These are chrome labels; nobody
+selects them.
+
+`onDragMove` additionally clears an anchor the press may have left, but **scoped to `d.container`** —
+not a bare `removeAllRanges()`. The unscoped version was written first and probing caught it wiping a
+selection planted in the terminal area: a reorder must not throw away output the user had selected.
+On the same measurement the clear is redundant in Chromium (no caret is set at all once
+`user-select:none` is unconditional) and is kept only as WKWebView insurance; the comment says so.
+
+### Testing (`test/gui-reorder.js`, real Electron, 48 checks)
+Same shape as §23's suite and for the same reason: a synthetic `dispatchEvent` proves nothing about
+a gesture whose whole difficulty is event sequencing and hit-testing. This drives real OS-level
+`mouseDown` / `mouseMove` × 8 / `mouseUp` through `webContents.sendInputEvent` against the real
+`ui/index.html` + `ui/renderer.js`. Not in the `npm test` glob:
+
+```
+node_modules/.bin/electron test/gui-reorder.js
+```
+
+Cases: TC-D0 (rows are not HTML5-draggable — the bug's own fingerprint) through TC-D10; see
+TEST_PLAN.md for the list.
+
+Every drag travels `pitch + 6`px, not exactly one pitch. `dropIndexAt` compares strictly
+(`coord > mid`), so travelling *exactly* one pitch lands the pointer exactly ON the neighbour's
+midpoint and nothing moves. Real drags aren't pixel-exact, and that tie shouldn't be what decides a
+test — the sidebar happened to pass on it only because its 43px pitch is odd, while the tab strip's
+92px pitch did not.
+
+Mutation-verified — each piece was deliberately broken:
+
+| Mutation | Result |
+|---|---|
+| revert to HTML5 DnD (`draggable=true` + `dragover`/`drop`) | 11 FAIL |
+| window listeners → element listeners | 9 FAIL |
+| cancel commits instead of abandoning | 5 FAIL |
+| remove `DRAG_THRESHOLD` | 2 FAIL |
+| don't shift the siblings (no placeholder gap) | 2 FAIL (TC-D3) |
+| drop the rename-in-progress guard | 2 FAIL (TC-D9) |
+| `user-select:none` reactive (`.reordering`-only) instead of unconditional | 2 FAIL (TC-D10) |
+| unscope the anchor clear to a bare `removeAllRanges()` | 1 FAIL (TC-D10 — wipes a selection made elsewhere) |
+| include `.plus` in the reorderable set | 1 FAIL (TC-D8) |
+| drop the post-drag click-swallow | all ok — proven dead code in Chromium (see above); kept as WKWebView insurance, and the comment says so |
+| feed live rects to `dropIndexAt` | all ok — probed; the comment claims only what's measured |
+| drop the in-drag anchor clear | all ok — `user-select:none` alone suffices in Chromium; kept for WKWebView |
+
+The three "all ok" rows are recorded rather than hidden. Each was investigated instead of waved away,
+and in each case the outcome was to **correct the code comment** to claim only what the tests actually
+prove. The anchor-clear mutation is also what exposed the unscoped-`removeAllRanges` regression: asking
+"why doesn't this matter?" is what surfaced that the first version mattered in the wrong direction.
