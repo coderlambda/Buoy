@@ -72,13 +72,3 @@ a file you (or a helper) can read after reproducing an issue:
 - **Reproduce workflow:** `rm -f /tmp/dt-debug.log`, launch with `DT_DEBUG=1`, trigger the
   issue, then read
   `/tmp/dt-debug.log`. It shows attach, pane resolution, capture size, and what's painted.
-
-## Deferred (designed, not built — see DESIGN.md)
-
-- OOB control channel (forwarded tmux socket) for precise connect + lost-session detection.
-- Backpressure watermarks (the Electron MVP had them; the Tauri port defers them — the
-  `ack` bridge call is a no-op).
-- RSS watchdog / OOM backstop and the `throttled` state.
-- Cross-platform (Windows lacks a local tmux; macOS/Linux first — CI builds all three).
-- mosh / Eternal Terminal transports (the Electron MVP had argv-verified backends; the
-  Tauri port ships ssh only for now).
