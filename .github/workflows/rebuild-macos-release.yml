@@ -1,0 +1,186 @@
+name: Rebuild macOS release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag whose macOS assets will be replaced
+        required: true
+        default: v0.1.0
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  rebuild:
+    name: Build, verify, and replace macOS assets
+    runs-on: macos-latest
+    steps:
+      # Build the exact source referenced by the release rather than moving or rewriting
+      # the published tag. The workflow itself is dispatched from main.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache cargo
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+          key: macos-universal-release
+
+      - name: Import Apple Developer ID certificate
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$APPLE_CERTIFICATE" || -z "$APPLE_CERTIFICATE_PASSWORD" ]]; then
+            echo "::error::APPLE_CERTIFICATE and APPLE_CERTIFICATE_PASSWORD secrets are required"
+            exit 1
+          fi
+
+          certificate_path="$RUNNER_TEMP/apple-signing-certificate.p12"
+          keychain_path="$RUNNER_TEMP/apple-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+
+          printf '%s' "$APPLE_CERTIFICATE" \
+            | openssl base64 -d -A -out "$certificate_path"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security default-keychain -s "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -t 3600 -u "$keychain_path"
+          security import "$certificate_path" \
+            -k "$keychain_path" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain_path"
+          security find-identity -v -p codesigning "$keychain_path" \
+            | grep -F 'Developer ID Application: Yitong Jiang (P8MQ54R68J)'
+
+      - name: Build signed and notarized universal bundles
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: 'Developer ID Application: Yitong Jiang (P8MQ54R68J)'
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: P8MQ54R68J
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$APPLE_ID" || -z "$APPLE_PASSWORD" ]]; then
+            echo "::error::APPLE_ID and APPLE_PASSWORD secrets are required for notarization"
+            exit 1
+          fi
+
+          npx --yes @tauri-apps/cli@2 build \
+            --target universal-apple-darwin \
+            --bundles app,dmg
+
+      - name: Verify architectures, signature, and notarization
+        id: verify
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          app_path="$GITHUB_WORKSPACE/src-tauri/target/universal-apple-darwin/release/bundle/macos/Buoy.app"
+          binary_path="$app_path/Contents/MacOS/buoy"
+          dmg_path="$(find "$GITHUB_WORKSPACE/src-tauri/target/universal-apple-darwin/release/bundle/dmg" -maxdepth 1 -name '*.dmg' -print -quit)"
+
+          test -d "$app_path"
+          test -f "$binary_path"
+          test -n "$dmg_path"
+
+          architectures="$(lipo -archs "$binary_path")"
+          [[ "$architectures" == *arm64* ]]
+          [[ "$architectures" == *x86_64* ]]
+
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          codesign -dv --verbose=4 "$app_path" 2>&1 \
+            | grep -F 'Authority=Developer ID Application: Yitong Jiang (P8MQ54R68J)'
+          codesign -dv --verbose=4 "$app_path" 2>&1 \
+            | grep -F 'TeamIdentifier=P8MQ54R68J'
+          xcrun stapler validate "$app_path"
+          spctl --assess --type execute --verbose=4 "$app_path"
+
+          echo "app_path=$app_path" >> "$GITHUB_OUTPUT"
+          echo "dmg_path=$dmg_path" >> "$GITHUB_OUTPUT"
+
+      - name: Package verified release assets
+        id: package
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          APP_PATH: ${{ steps.verify.outputs.app_path }}
+          DMG_PATH: ${{ steps.verify.outputs.dmg_path }}
+        run: |
+          set -euo pipefail
+
+          version="${RELEASE_TAG#v}"
+          upload_dir="$RUNNER_TEMP/release-assets"
+          dmg_upload="$upload_dir/Buoy-$version-macOS-Universal.dmg"
+          app_upload="$upload_dir/Buoy-$version-macOS-Universal.app.tar.gz"
+
+          mkdir -p "$upload_dir"
+          cp "$DMG_PATH" "$dmg_upload"
+          tar -C "$(dirname "$APP_PATH")" -czf "$app_upload" "$(basename "$APP_PATH")"
+
+          shasum -a 256 "$dmg_upload" "$app_upload"
+          echo "dmg_upload=$dmg_upload" >> "$GITHUB_OUTPUT"
+          echo "app_upload=$app_upload" >> "$GITHUB_OUTPUT"
+
+      # Replacement occurs only after the new artifacts have built and passed every check.
+      - name: Replace macOS assets and update release notes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          DMG_UPLOAD: ${{ steps.package.outputs.dmg_upload }}
+          APP_UPLOAD: ${{ steps.package.outputs.app_upload }}
+        run: |
+          set -euo pipefail
+
+          version="${RELEASE_TAG#v}"
+          gh release upload "$RELEASE_TAG" \
+            "$DMG_UPLOAD#macOS - Apple Silicon and Intel (signed and notarized)" \
+            "$APP_UPLOAD#macOS app bundle - Apple Silicon and Intel (signed and notarized)" \
+            --clobber \
+            --repo "$GITHUB_REPOSITORY"
+
+          gh release delete-asset "$RELEASE_TAG" \
+            "Buoy-$version-macOS-Apple-Silicon.dmg" \
+            --yes \
+            --repo "$GITHUB_REPOSITORY" \
+            || true
+
+          release_notes="$(printf '%s\n' \
+            'Initial Tauri release of Buoy.' \
+            '' \
+            '## macOS' \
+            '' \
+            '- Apple Silicon or Intel: download the universal DMG.' \
+            '- The universal app is Developer ID signed and notarized by Apple.' \
+            '' \
+            '## Windows' \
+            '' \
+            '- Windows installers are currently unsigned and may show a SmartScreen warning.' \
+            '' \
+            'Remote sessions require SSH access and tmux on the remote host. Local durable sessions require tmux on the Mac.')"
+          gh release edit "$RELEASE_TAG" \
+            --notes "$release_notes" \
+            --repo "$GITHUB_REPOSITORY"
