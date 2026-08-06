@@ -3,6 +3,12 @@ node_modules/
 .DS_Store
 ._*
 
+# Code-signing credentials must never be committed.
+*.p12
+*.pfx
+AuthKey_*.p8
+certificate-base64.txt
+
 # Rust / Tauri build artifacts
 src-tauri/target/
 src-tauri/gen/schemas/

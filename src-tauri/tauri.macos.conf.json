@@ -1,0 +1,7 @@
+{
+  "bundle": {
+    "macOS": {
+      "signingIdentity": "Developer ID Application: Yitong Jiang (P8MQ54R68J)"
+    }
+  }
+}

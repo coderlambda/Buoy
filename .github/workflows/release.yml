@@ -59,6 +59,45 @@ jobs:
           workspaces: './src-tauri -> target'
           key: ${{ matrix.platform }}
 
+      # GitHub runners cannot access the certificate installed in the developer's local
+      # Keychain. Import the exported identity into an ephemeral keychain. The job fails
+      # instead of publishing an unsigned macOS build when a required secret is missing.
+      - name: Import Apple Developer ID certificate
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$APPLE_CERTIFICATE" || -z "$APPLE_CERTIFICATE_PASSWORD" ]]; then
+            echo "::error::APPLE_CERTIFICATE and APPLE_CERTIFICATE_PASSWORD secrets are required"
+            exit 1
+          fi
+
+          certificate_path="$RUNNER_TEMP/apple-signing-certificate.p12"
+          keychain_path="$RUNNER_TEMP/apple-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+
+          printf '%s' "$APPLE_CERTIFICATE" \
+            | openssl base64 -d -A -out "$certificate_path"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security default-keychain -s "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -t 3600 -u "$keychain_path"
+          security import "$certificate_path" \
+            -k "$keychain_path" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain_path"
+          security find-identity -v -p codesigning "$keychain_path" \
+            | grep -F 'Developer ID Application: Yitong Jiang (P8MQ54R68J)'
+
       # Builds the app and, when a tag triggered the run, creates a GitHub Release and uploads
       # every bundle produced (dmg/app, deb/rpm/AppImage, msi/exe). No npm build step: the
       # frontend is the static ui/ directory (frontendDist), so there's nothing to compile there.
@@ -66,15 +105,21 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # These values are empty on non-macOS matrix jobs. On macOS, the signing
+          # identity is mandatory; the Apple account secrets also enable notarization.
+          APPLE_SIGNING_IDENTITY: "${{ matrix.platform == 'macos-latest' && 'Developer ID Application: Yitong Jiang (P8MQ54R68J)' || '' }}"
+          APPLE_ID: "${{ matrix.platform == 'macos-latest' && secrets.APPLE_ID || '' }}"
+          APPLE_PASSWORD: "${{ matrix.platform == 'macos-latest' && secrets.APPLE_PASSWORD || '' }}"
+          APPLE_TEAM_ID: "${{ matrix.platform == 'macos-latest' && 'P8MQ54R68J' || '' }}"
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'Buoy ${{ github.ref_name }}'
           releaseBody: |
             Buoy ${{ github.ref_name }}.
 
-            Unsigned builds — first launch requires bypassing the OS gatekeeper:
-            - macOS: right-click the app → Open (or `xattr -dr com.apple.quarantine /Applications/Buoy.app`).
-            - Windows: SmartScreen → More info → Run anyway.
+            Platform signing status:
+            - macOS: Developer ID signed; notarized when Apple account secrets are configured.
+            - Windows: unsigned; SmartScreen → More info → Run anyway.
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
