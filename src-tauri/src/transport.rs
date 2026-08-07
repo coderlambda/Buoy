@@ -130,7 +130,10 @@ mod tests {
         let s = spawn_spec(Transport::Local, true, "", "dt-x", "/opt/homebrew/bin/tmux",
                            "dtcc3-6-dt-x", &[], Some("en_US.UTF-8"), None).unwrap();
         assert_eq!(s.program, "/opt/homebrew/bin/tmux");
-        assert_eq!(s.args, ["-CC", "-L", "dtcc3-6-dt-x", "new-session", "-D", "-A", "-s", "dt-x"]);
+        assert_eq!(s.args, [
+            "-CC", "-L", "dtcc3-6-dt-x", "new-session", "-D", "-A", "-s", "dt-x", ";",
+            "set-option", "-g", "focus-events", "on",
+        ]);
         assert!(!s.args.iter().any(|a| a.contains("ssh") || a == "-tt" || a == "--"),
             "no ssh scaffolding: {:?}", s.args);
         // TERM is always set; LC_ALL is not, because the environment is already UTF-8
@@ -143,7 +146,10 @@ mod tests {
     fn tc_t3_local_plain_spec() {
         let s = spawn_spec(Transport::Local, false, "", "dt-x", "tmux", "dtapp3-6", &[], None, None).unwrap();
         assert_eq!(s.program, "tmux");
-        assert_eq!(s.args, ["-L", "dtapp3-6", "new-session", "-A", "-s", "dt-x"]);
+        assert_eq!(s.args, [
+            "-L", "dtapp3-6", "new-session", "-A", "-s", "dt-x", ";", "set-option", "-g",
+            "focus-events", "on",
+        ]);
         // no locale at all -> force C.UTF-8, or tmux mangles every non-ASCII byte to '_'
         assert!(s.env.iter().any(|(k, v)| k == "LC_ALL" && v == "C.UTF-8"), "{:?}", s.env);
     }

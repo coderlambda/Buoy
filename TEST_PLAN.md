@@ -17,7 +17,7 @@ what needs a **live remote** (opt-in `#[ignore]`d suites).
 | Local tmux backend | `src-tauri/src/local_backend.rs` | integration (real pty + real tmux) | ✅ |
 | Tunnels / sticky ports | `src-tauri/src/tunnel.rs` | unit (real sockets, no remote) | ✅ |
 | Frontend modules (clipboard, file viewer, link plugins) | `ui/*.js` | JS unit (`npm test`) | ✅ |
-| Full GUI (rename, drag-to-reorder) | `ui/index.html` + `ui/renderer.js` | real browser, OS-level input | ✅ |
+| Full GUI (rename, drag-to-reorder, OSC/BEL notifications) | `ui/index.html` + `ui/renderer.js` | real browser, OS-level input | ✅ |
 | Real ssh+tmux end-to-end | `src-tauri/tests/live_*.rs` | live host, `#[ignore]`d | ❌ needs `DT_LIVE_HOST` |
 
 Deferred with the feature: backpressure watermarks (the `ack` bridge call is a no-op in the
@@ -30,7 +30,8 @@ Tauri port; the Electron-era module and its TC-B suite are in git history).
 - **clipboard.test.js** — OSC 52 / clipboard handling in `ui/terminalTab.js`.
 - **fileViewer.test.js** — markdown/table/HTML-preview rendering in `ui/fileViewerTab.js` (§16).
 - **plugins.test.js** — `ui/plugins.js` registry + `ui/builtinPlugins.js` link detection
-  (URLs, paths, OSC 8, loopback-URL routing, §17–18).
+  (URLs, paths, OSC 8, loopback-URL routing, §17–18), plus streaming OSC 9/99/777
+  notification parsing (`OSC_NOTIFICATIONS_DESIGN.md`).
 
 ---
 
@@ -151,6 +152,30 @@ pitch lands the pointer on the neighbour's midpoint (see §24).
 
 Mutation-verified — see the table in DESIGN.md §24 for the eleven mutations, including the three that
 passed and what was corrected in response.
+
+### TC-N — terminal notification dots (`test/gui-notifications.js`, `OSC_NOTIFICATIONS_DESIGN.md`)
+```
+node_modules/.bin/electron test/gui-notifications.js
+```
+Loads the real UI with one native-tab session and one plain/single-tab session. Backend events are
+injected through the same `terminalAPI` listener surface used by Tauri.
+
+- **TC-N1** the UI starts with no session or tab notification dots.
+- **TC-N1b** xterm's OSC 10 colour-query reply is tagged with the tmux window that emitted the
+  query, preventing a tab-switch race from injecting `10;rgb:…` text into a neighbouring tab.
+- **TC-N2** an OSC 777 split across data chunks creates no dot until its terminator, then marks only
+  the emitting tab and its session.
+- **TC-N3** two unread tabs roll up to one session dot and survive unrelated rerenders.
+- **TC-N4** clicking one unread tab clears only that tab; the session remains unread while another
+  child is unread.
+- **TC-N5** clicking the last unread tab clears the session rollup.
+- **TC-N6** a new notification after acknowledgement restores the dots; an already-active tab can
+  still be clicked to acknowledge it.
+- **TC-N7** Kitty OSC 99 `d=0` fragments wait for completion, final title/body chunks notify, and
+  close/control traffic does not.
+- **TC-N8** clicking a plain session card acknowledges its sole implicit tab, which has no header.
+- **TC-N9** a standalone BEL (Codex's zero-config `auto` fallback) marks the emitting tab/session
+  through xterm's bell event and can be acknowledged normally.
 
 ---
 

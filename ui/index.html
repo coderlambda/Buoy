@@ -43,11 +43,20 @@
     .dot.connected { background:#a6e3a1; } .dot.connecting { background:#f9e2af; }
     .dot.reconnecting { background:#fab387; } .dot.dead { background:#f38ba8; }
     .dot.closed { background:#6c7086; }
+    /* Keep session state indicators in one narrow left column: connection first, unread beneath.
+       The column retains the old connection-dot top alignment without consuming title width. */
+    .session .status-dots { width:8px; flex:none; display:flex; flex-direction:column;
+      align-items:center; gap:5px; margin-top:4px; }
+    .session .status-dots .dot { margin-top:0; }
+    /* Agent/program notification: one intentionally detail-free unread dot. The session copy is a
+       rollup of its tabs; both use the same visual language. */
+    .notification-dot { width:7px; height:7px; border-radius:50%; background:var(--accent);
+      box-shadow:0 0 0 1px rgba(137,180,250,.18); flex:none; }
     .session .body { flex:1; min-width:0; display:flex; flex-direction:column; }
     /* first row: name uses the FULL width; action icons + retry are absolutely positioned at the
        right edge and only appear on hover / when dead, overlaying the title's (ellipsised) tail.
        This way nothing reserves inline space, so the title is never pre-truncated by a placeholder. */
-    .session .name-row { position:relative; display:flex; align-items:center; min-width:0; }
+    .session .name-row { position:relative; display:flex; align-items:center; gap:6px; min-width:0; }
     .session .name { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .session .sub { font-size:10px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .session .name .rename-input { width:100%; box-sizing:border-box; font:inherit; color:var(--fg);
@@ -109,7 +118,9 @@
       background:#313244; box-shadow:0 4px 14px rgba(0,0,0,.45); cursor:grabbing; }
     /* kill-window sent, waiting for tmux to confirm the close: dim and ignore repeat clicks */
     #tabs .tab.closing { opacity:.45; pointer-events:none; }
-    #tabs .tab .tlabel { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:160px; }
+    #tabs .tab .tlabel { flex:1; min-width:0; display:flex; align-items:center; gap:6px;
+      overflow:hidden; white-space:nowrap; max-width:160px; }
+    #tabs .tab .tlabel .ttext { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     #tabs .tab .tab-rename-input { font:inherit; color:var(--fg); background:var(--bg);
       border:1px solid var(--accent); border-radius:4px; padding:0 4px; width:140px; }
     #tabs .tab .tclose { flex:none; color:var(--muted); font-size:13px; visibility:hidden; }

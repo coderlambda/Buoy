@@ -14,7 +14,11 @@ window.terminalAPI = {
   // session CRUD — the Rust side owns all argv/validation.
   listSessions: () => invoke('list_sessions'),
   createSession: (meta) => invoke('create_session', { meta }),
-  input: (id, data) => invoke('session_input', { id, data }),
+  // `win` identifies the xterm instance that produced the bytes. This matters for terminal
+  // replies (for example OSC 10/11 colour-query responses): during a tab switch tmux's active
+  // window event can lag behind the webview, so routing only by session can feed a reply to the
+  // wrong program and make its payload appear as typed text.
+  input: (id, data, win) => invoke('session_input', { id, data, win }),
   resize: (id, cols, rows) => invoke('session_resize', { id, cols, rows }),
   ack: (_id, _bytes) => {},   // backpressure ACK is a no-op in the Tauri port (deferred)
   close: (id) => invoke('session_close', { id }),   // detach (remote keeps running)

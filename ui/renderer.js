@@ -157,21 +157,36 @@ function makeView(meta) {
 // Create (once) a tab for a window id, backed by a 'terminal' TabContent via the registry.
 function ensureTab(v, winId) {
   if (v.tabs.has(winId)) return v.tabs.get(winId);
+  let tab;
   const { provider: linkProvider, linkHandler } = makeLinkProvider(() => tab.content.term, v.meta);
   const ctx = {
     // Forward keystrokes to the backend, which owns the real input gating (control mode buffers
     // during the initial attach settle and replays on ready). We only DROP input when the link is
     // genuinely broken (reconnecting/dead/closed) — where it would be silently discarded anyway —
     // so the blurred-but-broken console can't swallow keystrokes (§22).
-    input: (data) => { if (!shouldDropInput(v)) api.input(v.meta.id, data); },
+    // Address input to the xterm/tmux window that generated it. Besides keyboard input, xterm's
+    // onData carries protocol replies (OSC colour queries, device attributes, focus events). A
+    // tab switch updates the UI before tmux's echoed active-window event arrives, so relying on
+    // the session-wide active window can deliver those replies to the neighbouring tab.
+    input: (data) => { if (!shouldDropInput(v)) api.input(v.meta.id, data, winId); },
     ack: (bytes) => api.ack(v.meta.id, bytes),
     // Clipboard: xterm ignores OSC 52 by default and there's no built-in Cmd+C, so the terminal
     // tab wires both through here. copyText -> system clipboard; setStatus -> status line feedback.
     copyText: (text) => api.copyText(text),
     setStatus: (m) => setStatus(m),
+    // A standalone terminal BEL is Codex's zero-config fallback when its auto notification backend
+    // does not recognize the terminal. xterm consumes BEL, so receive it through term.onBell.
+    onBell: () => markTabNotification(v, tab),
   };
   const content = registry.createTabContent('terminal', { id: v.meta.id, meta: v.meta, linkProvider, linkHandler }, ctx);
-  const tab = { winId, title: winId, content, mounted: false };
+  tab = {
+    winId, title: winId, content, mounted: false,
+    unreadNotification: false,
+    // Notification OSCs can span PTY chunks, so each terminal/window owns a streaming parser.
+    // Keeping it on the tab also prevents an unfinished OSC in one tmux window from consuming
+    // bytes from another window.
+    notificationParser: DTBuiltinPlugins.createOscNotificationParser(),
+  };
   v.tabs.set(winId, tab);
   return tab;
 }
@@ -193,6 +208,39 @@ function harvestOsc8FileLinks(v, data) {
   }
   // Bound memory on a long-lived session: drop oldest entries past a cap.
   while (v.linkMap.size > 500) { v.linkMap.delete(v.linkMap.keys().next().value); }
+}
+
+// Scan raw output BEFORE xterm consumes it. A notification belongs to the tmux window/tab that
+// emitted it; the session card derives its dot from whether ANY child tab remains unread.
+function harvestOscNotifications(v, tab, data) {
+  if (!v || !tab || !tab.notificationParser) return;
+  if (tab.notificationParser.write(data) < 1) return;
+  markTabNotification(v, tab);
+}
+
+// Common endpoint for explicit notification OSCs and xterm's standalone BEL event. BEL is the
+// standards-based fallback used by Codex in `auto` mode; keeping the state transition here gives it
+// the same per-tab ownership and acknowledgement behavior as OSC 9/99/777.
+function markTabNotification(v, tab) {
+  if (!v || !tab || tab.unreadNotification) return;
+  tab.unreadNotification = true;
+  renderSidebar();
+  if (v.meta.id === activeId) renderTabs(v);
+}
+
+function sessionHasUnreadNotification(v) {
+  for (const [, tab] of v.tabs) if (tab.unreadNotification) return true;
+  return false;
+}
+
+// A read acknowledgement is deliberately user-driven. Merely receiving output, restoring the
+// last active tab, or tmux changing its active window must not clear a dot behind the user's back.
+function clearTabNotification(v, tab) {
+  if (!tab || !tab.unreadNotification) return false;
+  tab.unreadNotification = false;
+  renderSidebar();
+  if (v.meta.id === activeId) renderTabs(v);
+  return true;
 }
 
 // Open a file-viewer tab for a clicked path (§16). App-local tab (no tmux window): synthetic id,
@@ -361,7 +409,7 @@ function makeLinkProvider(getTerm, meta) {
   return { provider, linkHandler };
 }
 
-async function mount(id) {
+async function mount(id, userInitiated = false) {
   const v = views.get(id);
   if (!v) return;
 
@@ -379,6 +427,10 @@ async function mount(id) {
   // during the connect was dropped for UI purposes — the console gate and tab strip stayed stale
   // over a live terminal until some later unrelated event re-rendered them.
   activeId = id;
+  // Non-control sessions have no inner tab strip to click. Treat clicking their session card as
+  // viewing/acknowledging the sole implicit tab. Native-tab sessions keep each dot until that exact
+  // tab header is clicked, so a session-level rollup never clears unrelated child notifications.
+  if (userInitiated && v.meta.mode !== 'control') clearTabNotification(v, activeTab(v));
   // §20: restore-on-open target. Local sessions count too: they run under a local tmux whose server
   // outlives the app (§5.3b), so they are persisted and reopenable exactly like remote ones.
   api.setLastActive(id).catch(() => {});
@@ -498,7 +550,10 @@ function renderSidebar() {
     }).join('');
     // The action icons live INSIDE the first (name) row, so hovering shifts only that row — the
     // sub line and tunnel rows below keep full width.
-    li.innerHTML = `<span class="dot ${v.state}"></span>
+    li.innerHTML = `<span class="status-dots">
+        <span class="dot ${v.state}"></span>
+        ${sessionHasUnreadNotification(v) ? '<span class="notification-dot" aria-label="Unread notification"></span>' : ''}
+      </span>
       <span class="body">
         <span class="name-row">
           <span class="name" title="double-click to rename">${escapeHtml(v.meta.title || v.meta.session || v.meta.kind)}</span>
@@ -558,7 +613,7 @@ function renderSidebar() {
       // click's re-render is what used to destroy the rename editor. detail >= 2 is the second click
       // of a double-click; a single click anywhere in the row still mounts as before.
       if (e.detail >= 2 && nameEl.contains(e.target)) return;
-      mount(id);
+      mount(id, true);
     };
     // §20: right-click opens the color palette for this project.
     li.oncontextmenu = (e) => { e.preventDefault(); openColorMenu(e, v.color, (c) => setProjectColor(id, c)); };
@@ -1076,6 +1131,7 @@ function deliver(v, tab, data) {
   // §21: harvest OSC 8 file:// links from the raw stream into the project's path map BEFORE xterm
   // consumes the data (xterm strips the hyperlink from scrollback, so this is our only capture point).
   harvestOsc8FileLinks(v, data);
+  harvestOscNotifications(v, tab, data);
   if (!tab) { (v.pending = v.pending || []).push(data); return; }
   // If this tab isn't mounted yet but its project is the active one, mount it now so the
   // data (e.g. scrollback back-fill on reattach) is displayed, not just buffered.
@@ -1086,7 +1142,11 @@ function deliver(v, tab, data) {
 
 // --- test hooks (used by test/gui-live.js to drive/inspect the real xterm) ---
 // Forward like a real keystroke; the backend buffers until ready, so tests need no gate here.
-window.__testType = (s) => { if (activeId != null) api.input(activeId, s); };
+window.__testType = (s) => {
+  if (activeId == null) return;
+  const v = views.get(activeId);
+  api.input(activeId, s, v && v.activeWindow);
+};
 window.__testInputReady = () => { const v = views.get(activeId); return !!(v && v.inputReady); };
 window.__testMount = (id) => {
   if (!views.has(id)) makeView({ id, kind: 'remote', mode: 'control' });
@@ -1141,6 +1201,8 @@ api.onWindow(({ id, action, window, name, order }) => {
     const t = v.tabs.get(window);
     if (t) { try { t.content.dispose(); } catch (_) {} v.tabs.delete(window); }
     if (v.activeWindow === window) { const first = v.tabs.keys().next(); v.activeWindow = first.done ? null : first.value; if (id === activeId) showActiveTab(v); }
+    // Closing an unread tab can clear the session-level rollup dot.
+    renderSidebar();
   } else if (action === 'rename') {
     ensureTab(v, window).title = name || window;
   } else if (action === 'active') {
@@ -1194,7 +1256,7 @@ function renderTabs(v) {
     el.className = 'tab' + (wid === v.activeWindow ? ' active' : '') + (tab.closing ? ' closing' : '');
     const color = v.tabColors[wid];
     if (color) { el.style.setProperty('--tab-color', color); el.classList.add('has-color'); }
-    el.innerHTML = `<span class="tlabel" title="double-click to rename">${escapeHtml(tab.title || wid)}</span><span class="tclose" title="close">×</span>`;
+    el.innerHTML = `<span class="tlabel" title="double-click to rename">${tab.unreadNotification ? '<span class="notification-dot" aria-label="Unread notification"></span>' : ''}<span class="ttext">${escapeHtml(tab.title || wid)}</span></span><span class="tclose" title="close">×</span>`;
     const label = el.querySelector('.tlabel');
     // Editor rebuilt from tab state each render, so it survives the double-click's own re-renders.
     if (tab.renaming) mountTabRenameInput(v, wid, label);
@@ -1205,7 +1267,7 @@ function renderTabs(v) {
       // just made this tab active — either guard alone is enough (mutation-tested), but the intent is
       // clearer stated at the gesture than inferred from a downstream no-op.
       if (tab.renaming || e.detail >= 2) return;
-      switchTab(v, wid);
+      switchTab(v, wid, true);
     };
     // Double-click a real tmux-window tab to rename it. A manual rename sticks (tmux disables
     // automatic-rename for that window); clearing it re-enables auto-rename.
@@ -1254,7 +1316,11 @@ function reorderTabByIndex(v, from, to) {
 // Switch the active tab. For a tmux window, tell tmux to select it (its reconcile echoes an
 // 'active' event; we reveal now for responsiveness). A viewer tab is app-local — reveal it WITHOUT
 // any tmux command.
-function switchTab(v, winId) {
+function switchTab(v, winId, userInitiated = false) {
+  const tab = v.tabs.get(winId);
+  // Clicking the already-active tab is still the acknowledgement gesture, so clear before the
+  // same-tab early return. A later, genuinely new OSC will set the flag again.
+  if (userInitiated) clearTabNotification(v, tab);
   if (v.activeWindow === winId) return;
   v.activeWindow = winId;
   if (isWindowTab(winId)) { api.tabSelect(v.meta.id, winId); lazyCapture(v, winId); rememberLastTab(v, winId); }

@@ -7,6 +7,7 @@
     "test": "node --test test/*.test.js",
     "gui-rename": "electron test/gui-rename.js",
     "gui-reorder": "electron test/gui-reorder.js",
+    "gui-notifications": "electron test/gui-notifications.js",
     "tauri": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo tauri",
     "tauri:dev": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo tauri dev",
     "tauri:build": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo tauri build",

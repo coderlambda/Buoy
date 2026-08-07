@@ -6,9 +6,10 @@ by a wave, the connection always pops back up. ssh + tmux control mode for nativ
 clickable paths/URLs, and localhost port-forwarding.
 
 The app is **Tauri v2 + Rust** (`src-tauri/`) with a vanilla-JS frontend (`ui/`). See
-`DESIGN.md` for the full, adversarially-reviewed design, `TAURI_MIGRATION.md` for the
-history of the port from the original Electron MVP (deleted from this branch; it survives
-in git history and on `main`), and `TEST_PLAN.md` for the test matrix.
+`DESIGN.md` for the full, adversarially-reviewed design,
+`OSC_NOTIFICATIONS_DESIGN.md` for terminal notification behavior, `TAURI_MIGRATION.md` for
+the history of the port from the original Electron MVP (deleted from this branch; it
+survives in git history and on `main`), and `TEST_PLAN.md` for the test matrix.
 
 ## What it does
 
@@ -46,16 +47,17 @@ still works, as a plain non-persistent pty). **Remote** sessions need `ssh` acce
 ## Test
 
 ```bash
-npm run tauri:test     # Rust unit tests (114): validation, supervisor state machine,
+npm run tauri:test     # Rust unit tests (116): validation, supervisor state machine,
                        # persistence, control-mode parser + reply routing, window registry,
                        # tunnels/sticky ports, local pty backend
 npm test               # JS unit tests for the ui/ frontend modules (clipboard, file
                        # viewer, link plugins)
 npm run gui-rename     # full-GUI inline-rename suite (real ui/ in a real browser)
 npm run gui-reorder    # full-GUI drag-to-reorder suite (real ui/ in a real browser)
+npm run gui-notifications # full-GUI OSC/BEL notification-dot and acknowledgement suite
 ```
 
-The two `gui-*` suites drive the REAL `ui/index.html` + `ui/renderer.js` with OS-level
+The `gui-*` suites drive the REAL `ui/index.html` + `ui/renderer.js` with browser/OS-level
 input events. They use Electron purely as a scriptable headless browser (that is the only
 reason `electron` remains in devDependencies — the app itself has no Electron in it);
 `cd src-tauri && cargo test` additionally has `#[ignore]`d live-host suites — see

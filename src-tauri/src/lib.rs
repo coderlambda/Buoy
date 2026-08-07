@@ -66,9 +66,9 @@ enum Backend {
 }
 
 impl Backend {
-    fn write(&self, data: &str) {
+    fn write(&self, data: &str, win: Option<&str>) {
         match self {
-            Backend::Supervised(s) => s.write(data),
+            Backend::Supervised(s) => s.write_to(data, win),
             Backend::Plain(b) => b.write(data),
             Backend::Local(b) => b.write(data),
         }
@@ -530,8 +530,10 @@ fn ui_log(msg: String) {
 }
 
 #[tauri::command]
-fn session_input(state: State<AppState>, id: String, data: String) {
-    if let Some(s) = state.sessions.lock().unwrap().get(&id) { s.backend.write(&data); }
+fn session_input(state: State<AppState>, id: String, data: String, win: Option<String>) {
+    if let Some(s) = state.sessions.lock().unwrap().get(&id) {
+        s.backend.write(&data, win.as_deref());
+    }
 }
 
 #[tauri::command]

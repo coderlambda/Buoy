@@ -70,6 +70,9 @@ pub type BackendFactory =
 /// MasterPty is Send-but-not-Sync, so requiring Sync here would exclude it.
 pub trait BackendHandle: Send {
     fn write(&self, data: &str);
+    /// Write to the tmux window that originated the input. Non-windowed/fake backends can keep
+    /// the session-wide behaviour; control mode overrides this to avoid tab-switch routing races.
+    fn write_to(&self, data: &str, _target: Option<&str>) { self.write(data); }
     fn resize(&self, cols: u16, rows: u16);
     fn new_window(&self);
     fn select_window(&self, win: &str);
@@ -81,6 +84,9 @@ pub trait BackendHandle: Send {
 
 impl BackendHandle for ControlBackend {
     fn write(&self, data: &str) { ControlBackend::write(self, data) }
+    fn write_to(&self, data: &str, target: Option<&str>) {
+        ControlBackend::write_to(self, data, target)
+    }
     fn resize(&self, cols: u16, rows: u16) { ControlBackend::resize(self, cols, rows) }
     fn new_window(&self) { ControlBackend::new_window(self) }
     fn select_window(&self, win: &str) { ControlBackend::select_window(self, win) }
@@ -339,6 +345,9 @@ impl Supervisor {
 
     // --- pass-throughs to the current backend ---
     pub fn write(&self, data: &str) { self.with_backend(|b| b.write(data)); }
+    pub fn write_to(&self, data: &str, target: Option<&str>) {
+        self.with_backend(|b| b.write_to(data, target));
+    }
     pub fn resize(&self, cols: u16, rows: u16) {
         self.shared.cols.store(cols as u32, Ordering::Relaxed);
         self.shared.rows.store(rows as u32, Ordering::Relaxed);

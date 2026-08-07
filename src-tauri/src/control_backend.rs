@@ -71,7 +71,10 @@ struct Inner {
     session: String,
     ready: bool,
     attached: bool,
-    pending_input: Vec<String>,
+    // Input can arrive before the control client is ready. Preserve its originating window while
+    // buffering; otherwise a tab switch during startup/reconnect can replay protocol replies into
+    // whichever window happens to be active later.
+    pending_input: Vec<(String, Option<String>)>,
     pending_output: std::collections::BTreeMap<String, Vec<String>>,
     // Per-pane carry of trailing incomplete UTF-8 bytes. tmux can split a multi-byte char across
     // two %output events for the SAME pane; carrying the partial tail here (keyed by pane, since
@@ -223,7 +226,15 @@ impl ControlBackend {
 
     /// Shell input -> send-keys addressed to the active window (buffered until ready).
     pub fn write(&self, data: &str) {
-        self.inner.lock().unwrap().write_input(data);
+        self.write_to(data, None);
+    }
+
+    /// Input from a particular xterm must return to that same tmux window. xterm emits terminal
+    /// protocol replies through the same onData path as keyboard input; the selected-window state
+    /// can be briefly stale while tabs switch.
+    pub fn write_to(&self, data: &str, target: Option<&str>) {
+        let target = target.filter(|w| is_win_id(w)).map(str::to_owned);
+        self.inner.lock().unwrap().write_input(data, target);
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
@@ -539,32 +550,37 @@ impl Inner {
         g.emit(BackendEvent::Ready);
     }
 
-    /// Route shell input: send-keys to the active window when ready, else buffer it (replayed by
-    /// flush_pending_input once BOTH ready and the active window are known). Sending requires an
-    /// active window even when ready, so a Ready that raced ahead of topology still buffers.
-    fn write_input(&mut self, data: &str) {
-        match self.reg.active_window.clone() {
+    /// Route shell/xterm input to its explicit originating window when provided, otherwise to the
+    /// active window. Buffer until ready; an unaddressed item also waits for topology.
+    fn write_input(&mut self, data: &str, target: Option<String>) {
+        match target.clone().or_else(|| self.reg.active_window.clone()) {
             Some(t) if self.ready => {
                 for line in encode_send_keys(data, &t) { self.send(line, ReplyKind::Ignore); }
             }
             _ => {
                 if self.pending_input.len() >= MAX_BUFFER { self.pending_input.remove(0); }
-                self.pending_input.push(data.to_string());
+                self.pending_input.push((data.to_string(), target));
             }
         }
     }
 
-    /// Send any buffered input to the active window. No-op unless we're ready AND know the active
-    /// window (send-keys must target a window). Called from mark_ready and, to cover the race where
-    /// topology lands after we're already ready, from apply_topology.
+    /// Send buffered input to its explicit window, or the active window for legacy/unaddressed
+    /// items. Called from mark_ready and, to cover the race where topology lands after we're
+    /// already ready, from apply_topology.
     fn flush_pending_input(&mut self) {
         if !self.ready || self.pending_input.is_empty() { return; }
-        let Some(target) = self.reg.active_window.clone() else { return };
-        let queued: Vec<String> = std::mem::take(&mut self.pending_input);
-        crate::dlog!("flush_pending_input: {} chunks -> {}", queued.len(), target);
-        for d in queued {
-            for line in encode_send_keys(&d, &target) {
-                self.send(line, ReplyKind::Ignore);
+        let active = self.reg.active_window.clone();
+        let queued = std::mem::take(&mut self.pending_input);
+        crate::dlog!("flush_pending_input: {} chunks active={:?}", queued.len(), active);
+        for (data, explicit) in queued {
+            if let Some(target) = explicit.or_else(|| active.clone()) {
+                for line in encode_send_keys(&data, &target) {
+                    self.send(line, ReplyKind::Ignore);
+                }
+            } else {
+                // Topology is still unknown. Keep only the entries that genuinely need it; an
+                // explicitly addressed item above can already be delivered as soon as ready.
+                self.pending_input.push((data, None));
             }
         }
     }
@@ -749,7 +765,7 @@ mod tests {
 
         // User types while "connected but not yet topologized" -> buffered, nothing sent as input.
         sent.lock().unwrap().clear();
-        inner.lock().unwrap().write_input("echo hi\n");
+        inner.lock().unwrap().write_input("echo hi\n", None);
         assert!(!sent_str(&sent).contains("send-keys"), "input must NOT be sent before topology");
         assert_eq!(inner.lock().unwrap().pending_input.len(), 1, "input buffered");
 
@@ -766,11 +782,46 @@ mod tests {
         let (inner, sent) = test_inner();
         Inner::apply_topology(&inner, vec!["@0 %0 1 1 zsh".to_string()]);
         // Not ready yet: input buffers even though we know the window.
-        inner.lock().unwrap().write_input("ls\n");
+        inner.lock().unwrap().write_input("ls\n", None);
         assert!(!sent_str(&sent).contains("send-keys"), "not sent before ready");
         sent.lock().unwrap().clear();
         Inner::mark_ready(&inner);
         assert!(sent_str(&sent).contains("send-keys"), "flushed on ready");
+        assert!(inner.lock().unwrap().pending_input.is_empty());
+    }
+
+    // REGRESSION: xterm answers terminal queries through onData. While switching tabs, the
+    // registry's active window can still be the tab we just left; the reply must follow the xterm
+    // that produced it rather than that stale active-window value.
+    #[test]
+    fn tc_cb_explicit_input_target_wins_over_active_window() {
+        let (inner, sent) = test_inner();
+        Inner::apply_topology(&inner, vec![
+            "@0 %0 1 1 codex".to_string(),
+            "@1 %1 1 0 codex".to_string(),
+        ]);
+        Inner::mark_ready(&inner);
+        assert_eq!(inner.lock().unwrap().reg.active_window.as_deref(), Some("@0"));
+
+        sent.lock().unwrap().clear();
+        inner.lock().unwrap().write_input("\x1b]10;rgb:cdcd/d6d6/f4f4\x1b\\", Some("@1".into()));
+        let commands = sent_str(&sent);
+        assert!(commands.contains("send-keys -t @1"), "reply routed to its source tab: {commands}");
+        assert!(!commands.contains("send-keys -t @0"), "stale active tab must receive no reply: {commands}");
+    }
+
+    #[test]
+    fn tc_cb_buffer_preserves_explicit_input_target() {
+        let (inner, sent) = test_inner();
+        inner.lock().unwrap().write_input("query reply", Some("@7".into()));
+        assert_eq!(inner.lock().unwrap().pending_input.len(), 1);
+
+        // Ready can precede topology. Explicitly addressed input needs no active-window lookup and
+        // can be delivered immediately without being stranded or redirected.
+        Inner::mark_ready(&inner);
+        let commands = sent_str(&sent);
+        assert!(commands.contains("send-keys -t @7 -l \"query reply\""),
+            "buffer retained explicit target: {commands}");
         assert!(inner.lock().unwrap().pending_input.is_empty());
     }
 

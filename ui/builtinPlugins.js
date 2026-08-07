@@ -81,6 +81,109 @@ function extractOsc8FileLinks(data) {
   return out;
 }
 
+// Notification OSCs are a STREAM protocol: the ESC introducer, payload, and terminator can arrive
+// in separate PTY chunks. Keep the small amount of unfinished protocol state here instead of
+// regexing each renderer chunk independently (which silently misses split notifications).
+//
+// Supported protocols:
+//   OSC 9   — iTerm2 legacy:       ESC ] 9 ; message BEL/ST
+//   OSC 777 — rxvt/simple:         ESC ] 777 ; notify ; title ; body BEL/ST
+//   OSC 99  — Kitty notification:  ESC ] 99 ; metadata ; payload ST
+//
+// `write()` returns how many COMPLETE, user-visible notification requests ended in this chunk.
+// The renderer only needs the count (the product intentionally shows a dot, not notification text).
+function createOscNotificationParser() {
+  const MAX_PENDING = 16 * 1024;   // protocol payloads are small; bound hostile/incomplete OSCs
+  let pending = '';
+
+  function nextOscStart(s, from) {
+    const esc = s.indexOf('\x1b]', from);
+    const c1 = s.indexOf('\x9d', from);   // 8-bit OSC introducer
+    if (esc < 0) return c1;
+    if (c1 < 0) return esc;
+    return Math.min(esc, c1);
+  }
+
+  function terminator(s, from) {
+    const bel = s.indexOf('\x07', from);
+    const st7 = s.indexOf('\x1b\\', from);
+    const st8 = s.indexOf('\x9c', from);  // 8-bit ST
+    let at = -1; let len = 0;
+    for (const [i, n] of [[bel, 1], [st7, 2], [st8, 1]]) {
+      if (i >= 0 && (at < 0 || i < at)) { at = i; len = n; }
+    }
+    return at < 0 ? null : { at, len };
+  }
+
+  return {
+    write(data) {
+      if (data == null || data === '') return 0;
+      pending += String(data);
+      let notifications = 0;
+
+      while (pending) {
+        const start = nextOscStart(pending, 0);
+        if (start < 0) {
+          // Preserve a trailing ESC because the next chunk may begin with `]`.
+          pending = pending.endsWith('\x1b') ? '\x1b' : '';
+          break;
+        }
+        if (start > 0) pending = pending.slice(start);
+
+        const introLen = pending.startsWith('\x1b]') ? 2 : 1;
+        const end = terminator(pending, introLen);
+        const nested = nextOscStart(pending, introLen);
+        // ESC is not legal inside an OSC payload. If another OSC begins before this one terminates,
+        // discard the malformed prefix and recover at the newer sequence.
+        if (nested >= 0 && (!end || nested < end.at)) {
+          pending = pending.slice(nested);
+          continue;
+        }
+        if (!end) {
+          if (pending.length > MAX_PENDING) {
+            // Drop an unterminated/hostile sequence without retaining its payload forever.
+            pending = pending.endsWith('\x1b') ? '\x1b' : '';
+          }
+          break;
+        }
+
+        const payload = pending.slice(introLen, end.at);
+        if (isOscNotification(payload)) notifications++;
+        pending = pending.slice(end.at + end.len);
+      }
+      return notifications;
+    },
+    reset() { pending = ''; },
+  };
+}
+
+// Is one COMPLETE OSC payload a request to present a notification? OSC 99 also carries protocol
+// replies/control messages (close, alive, capability query, buttons/icon chunks); those must not
+// light an unread dot. Multipart notifications light it only on the final `d=1` chunk (`d` defaults
+// to 1), preventing title/body fragments from looking like multiple new notifications.
+function isOscNotification(payload) {
+  const semi = payload.indexOf(';');
+  if (semi < 0) return false;
+  const code = payload.slice(0, semi);
+  const rest = payload.slice(semi + 1);
+
+  if (code === '9') return rest.length > 0;
+  if (code === '777') return rest === 'notify' || rest.startsWith('notify;');
+  if (code !== '99') return false;
+
+  const payloadSep = rest.indexOf(';');
+  if (payloadSep < 0) return false;   // OSC 99 requires both semicolons
+  const metadata = rest.slice(0, payloadSep);
+  const fields = Object.create(null);
+  for (const part of metadata.split(':')) {
+    const eq = part.indexOf('=');
+    if (eq > 0) fields[part.slice(0, eq)] = part.slice(eq + 1);
+  }
+  if (fields.d === '0') return false;
+  const part = fields.p || 'title';
+  return part === 'title' || part === 'body';
+}
+
 function builtinLinkPlugins() {
   return [
     {
@@ -107,5 +210,5 @@ function builtinLinkPlugins() {
 }
 
 // UMD-lite: CommonJS for tests, global for the sandboxed renderer (<script> tag).
-if (typeof module !== 'undefined' && module.exports) module.exports = { builtinLinkPlugins, openUrlSmart, parseFileUri, extractOsc8FileLinks, URL_RE, PATH_RE, KNOWN_NAMES };
-if (typeof window !== 'undefined') window.DTBuiltinPlugins = { builtinLinkPlugins, openUrlSmart, parseFileUri, extractOsc8FileLinks, URL_RE, PATH_RE, KNOWN_NAMES };
+if (typeof module !== 'undefined' && module.exports) module.exports = { builtinLinkPlugins, openUrlSmart, parseFileUri, extractOsc8FileLinks, createOscNotificationParser, isOscNotification, URL_RE, PATH_RE, KNOWN_NAMES };
+if (typeof window !== 'undefined') window.DTBuiltinPlugins = { builtinLinkPlugins, openUrlSmart, parseFileUri, extractOsc8FileLinks, createOscNotificationParser, isOscNotification, URL_RE, PATH_RE, KNOWN_NAMES };

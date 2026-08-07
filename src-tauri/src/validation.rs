@@ -188,7 +188,8 @@ fn host_token(parts: &HostParts) -> String {
 }
 
 /// Build ssh argv for a session (mirrors buildSshArgs):
-///   ssh -tt [-p port] [baseArgs] -- <user@host> <tmuxPath> -L <socket> new-session -A -s <name>
+///   ssh -tt [-p port] [baseArgs] -- <user@host> <tmuxPath> -L <socket>
+///     new-session -A -s <name> \; set-option -g focus-events on
 pub fn build_ssh_args(
     raw_host: &str,
     raw_session: &str,
@@ -228,13 +229,22 @@ pub fn build_ssh_args(
         "-A".into(),
         "-s".into(),
         session,
+        // OpenSSH joins the remote-command argv into a shell command. Escape the separator once so
+        // the login shell passes a literal `;` argument to tmux instead of running `set-option` as
+        // an unrelated shell command. Focus events let terminal apps (including Codex) distinguish
+        // a visible pane from a background one without requiring per-app configuration.
+        "\\;".into(),
+        "set-option".into(),
+        "-g".into(),
+        "focus-events".into(),
+        "on".into(),
     ]);
     Ok(args)
 }
 
 /// Build argv for a LOCAL tmux client (kind:'local' — DESIGN.md §5.3b): no ssh, no host, the tmux
 /// binary is exec'd directly:
-///   <tmuxPath> -L <socket> new-session -A -s <name>
+///   <tmuxPath> -L <socket> new-session -A -s <name> ; set-option -g focus-events on
 ///
 /// The session/socket/path charsets are validated exactly as on the ssh path. The remote builder's
 /// `env LC_ALL=C.UTF-8` prefix is deliberately NOT here: locally we control the child's environment
@@ -250,6 +260,8 @@ pub fn build_local_tmux_args(raw_session: &str, tmux_path: &str, socket: &str) -
     Ok(vec![
         "-L".into(), socket.to_string(),
         "new-session".into(), "-A".into(), "-s".into(), session,
+        // No shell is involved locally, so tmux receives its command separator directly.
+        ";".into(), "set-option".into(), "-g".into(), "focus-events".into(), "on".into(),
     ])
 }
 
@@ -445,7 +457,7 @@ mod tests {
         // remote command is prefixed with `env LC_ALL=C.UTF-8` so the tmux server is UTF-8.
         assert_eq!(&a[dd + 1..], &[
             "me@h", "env", "LC_ALL=C.UTF-8", ".local/bin/tmux", "-L", "dtapp3-7",
-            "new-session", "-A", "-s", "dev"
+            "new-session", "-A", "-s", "dev", "\\;", "set-option", "-g", "focus-events", "on"
         ]);
         assert!(build_ssh_args("me@h", "a;b", &[], "tmux", "s").is_err());
     }
@@ -457,16 +469,23 @@ mod tests {
         // env-prefixed, tmux binary, then -CC right before its -L flag.
         assert_eq!(&a[dd + 1..dd + 6], &["me@h", "env", "LC_ALL=C.UTF-8", "/t", "-CC"]);
         assert_eq!(a[dd + 6], "-L");
-        // new-session -D -A -s dev
-        let tail: Vec<&str> = a.iter().rev().take(5).rev().map(|s| s.as_str()).collect();
-        assert_eq!(tail, ["new-session", "-D", "-A", "-s", "dev"]);
+        // new-session -D -A -s dev, then enable the focus reports Codex uses for its default
+        // unfocused-only terminal notifications.
+        let ns = a.iter().position(|s| s == "new-session").unwrap();
+        assert_eq!(&a[ns..], &[
+            "new-session", "-D", "-A", "-s", "dev", "\\;", "set-option", "-g",
+            "focus-events", "on",
+        ]);
     }
 
     // TC-V-L1 local tmux argv: no ssh, no host, no `--`/env prefix — just the tmux flags.
     #[test]
     fn tc_v_local_tmux_args() {
         let a = build_local_tmux_args("dt-x", "/opt/homebrew/bin/tmux", "dtapp3-6").unwrap();
-        assert_eq!(a, ["-L", "dtapp3-6", "new-session", "-A", "-s", "dt-x"]);
+        assert_eq!(a, [
+            "-L", "dtapp3-6", "new-session", "-A", "-s", "dt-x", ";", "set-option", "-g",
+            "focus-events", "on",
+        ]);
         // no ssh-isms leak into the local argv
         assert!(!a.iter().any(|x| x == "--" || x == "-tt" || x == "env"),
             "local argv has no ssh/env scaffolding: {a:?}");
@@ -481,7 +500,10 @@ mod tests {
     #[test]
     fn tc_v_local_control_mode_args() {
         let a = build_local_control_mode_args("dt-x", "tmux", "dtcc3-6-dt-x").unwrap();
-        assert_eq!(a, ["-CC", "-L", "dtcc3-6-dt-x", "new-session", "-D", "-A", "-s", "dt-x"]);
+        assert_eq!(a, [
+            "-CC", "-L", "dtcc3-6-dt-x", "new-session", "-D", "-A", "-s", "dt-x", ";",
+            "set-option", "-g", "focus-events", "on",
+        ]);
     }
 
     // TC-V-L3 local kill needs no shell wrapper (contrast build_kill_args, which base64-wraps for a

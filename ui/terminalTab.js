@@ -52,6 +52,10 @@ function createTerminalTab(spec, ctx) {
 
   // input up (gating is applied by the caller via ctx.input, which may buffer)
   term.onData((data) => ctx.input(data));
+  // xterm consumes a standalone BEL byte and surfaces it through onBell instead of leaving it in
+  // the rendered data stream. Codex's default notification method falls back to BEL for terminals
+  // it does not recognize, so forward that standard attention signal to the project/tab layer.
+  if (term.onBell) term.onBell(() => { if (ctx.onBell) ctx.onBell(); });
 
   // Local copy shortcuts. Cmd+C (mac) / Ctrl+Shift+C (elsewhere) copy the xterm selection when
   // there IS one; otherwise fall through so the key reaches the shell (Ctrl+C = SIGINT). Attached

@@ -3,7 +3,7 @@ const { test } = require('node:test');
 const assert = require('node:assert');
 const { PluginRegistry } = require('../ui/plugins');
 // The Tauri app serves ui/ ; that's the live copy of the link plugins.
-const { builtinLinkPlugins, parseFileUri, extractOsc8FileLinks, URL_RE, PATH_RE } = require('../ui/builtinPlugins');
+const { builtinLinkPlugins, parseFileUri, extractOsc8FileLinks, createOscNotificationParser, isOscNotification, URL_RE, PATH_RE } = require('../ui/builtinPlugins');
 
 function reg() {
   const r = new PluginRegistry();
@@ -170,6 +170,39 @@ test('TC-PL4g extractOsc8FileLinks', () => {
   assert.deepEqual(extractOsc8FileLinks(http), []);
   // no OSC 8 at all -> empty
   assert.deepEqual(extractOsc8FileLinks('just plain text README.md'), []);
+});
+
+// TC-PL4h notification OSC detection covers the protocols advertised by modern agent terminals.
+test('TC-PL4h recognizes OSC 9/777/99 notification payloads only', () => {
+  assert.equal(isOscNotification('9;Agent needs input'), true);
+  assert.equal(isOscNotification('777;notify;Codex;Task complete'), true);
+  assert.equal(isOscNotification('777;other;Codex;Task complete'), false);
+  assert.equal(isOscNotification('99;;Simple notification'), true);
+  assert.equal(isOscNotification('99;i=one:d=0;p=title;Build'), false, 'unfinished Kitty chunk');
+  assert.equal(isOscNotification('99;i=one:p=body;Done'), true, 'final Kitty body chunk');
+  assert.equal(isOscNotification('99;i=one:p=close;'), false, 'close report/control');
+  assert.equal(isOscNotification('99;i=one:p=alive;'), false, 'alive query/report');
+  assert.equal(isOscNotification('99;i=one:p=?;'), false, 'capability query/report');
+  assert.equal(isOscNotification('8;;https://example.com'), false, 'unrelated OSC');
+});
+
+// TC-PL4i is deliberately chunked at awkward byte boundaries: PTY delivery has no obligation to
+// align with escape-sequence boundaries, and background-tab notifications must still be reliable.
+test('TC-PL4i streaming OSC notification parser handles splits, terminators, and multipart Kitty', () => {
+  const p = createOscNotificationParser();
+  assert.equal(p.write('plain output\x1b'), 0);
+  assert.equal(p.write(']777;notify;Claude;Waiting'), 0);
+  assert.equal(p.write('\x07tail'), 1, 'split OSC 777 with BEL');
+
+  assert.equal(p.write('\x1b]9;Done\x1b\\'), 1, 'OSC 9 with ST');
+  assert.equal(p.write('\x9d9;C1 form\x9c'), 1, '8-bit OSC/ST form');
+
+  assert.equal(p.write('\x1b]99;i=n1:d=0;p=title;Build\x1b\\'), 0, 'multipart title is not complete');
+  assert.equal(p.write('\x1b]99;i=n1:p=body;Finished\x1b\\'), 1, 'multipart final body notifies once');
+  assert.equal(p.write('\x1b]99;i=n1:p=close;\x1b\\'), 0, 'close control does not re-notify');
+
+  assert.equal(p.write('\x1b]9;one\x07noise\x1b]777;notify;two;body\x07'), 2,
+    'multiple complete notifications in one chunk');
 });
 
 // TC-PL5 custom plugin registers and matches; unregister works
