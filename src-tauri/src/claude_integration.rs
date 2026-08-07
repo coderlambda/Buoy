@@ -153,8 +153,8 @@ fn make_executable(_path: &Path) -> io::Result<()> {
 }
 
 /// Remote attach script. Its dynamic fields are validated against shell-safe character sets before
-/// this function is called. The outer ssh command base64-wraps the complete script, so the remote
-/// login shell cannot reinterpret it while forwarding it to `/bin/sh`.
+/// this function is called. The outer ssh command base64-wraps the complete script and passes the
+/// decoded bytes as `/bin/sh -c`'s argument, so tmux inherits ssh's pty stdin rather than a pipe.
 pub fn remote_tmux_script(tmux_path: &str, socket: &str, session: &str, control: bool) -> String {
     let wrapper_b64 = crate::validation::base64_encode(CLAUDE_WRAPPER.as_bytes());
     let cc = if control { " -CC" } else { "" };
@@ -280,5 +280,87 @@ mod tests {
         assert!(script.contains("BUOY_TERMINAL=1"));
         assert!(script.contains("exec .local/bin/tmux -CC -L dtcc3-7 new-session -D -A -s dev"));
         assert!(script.contains("set-environment -g PATH \"$PATH\""));
+        assert!(script.contains("set-environment -g BUOY_TERMINAL 1"));
+    }
+
+    /// Run the production SSH command shape through a real pty. A string-only assertion cannot
+    /// catch the decoder pipeline stealing stdin from tmux: piping the script into `/bin/sh` emits
+    /// `tcgetattr failed` and never reaches the control-mode handshake.
+    #[cfg(unix)]
+    #[test]
+    fn tc_cn4_encoded_remote_bootstrap_keeps_tmux_stdin_on_the_pty() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        use std::io::{Read, Write};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let probe = crate::probe::probe_local_tmux();
+        if !probe.probed {
+            eprintln!("SKIP TC-CN4: no local tmux");
+            return;
+        }
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() % 1_000_000;
+        let session = format!("buoycn4{}{}", std::process::id(), nonce);
+        let socket = format!("bcn4-{}-{}", std::process::id(), nonce);
+        let args = crate::validation::build_control_mode_ssh_args(
+            "example.invalid", &session, &[], &probe.tmux_path, &socket,
+        ).expect("build the production remote attach command");
+        let remote = args.last().expect("remote command after host").clone();
+
+        let root = temp_dir("remote-pty");
+        fs::create_dir_all(root.join("home")).unwrap();
+        let pair = native_pty_system().openpty(PtySize {
+            rows: 24, cols: 80, pixel_width: 0, pixel_height: 0,
+        }).expect("open test pty");
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.args(["-c", remote.as_str()]);
+        cmd.env("HOME", root.join("home"));
+        cmd.env("XDG_CACHE_HOME", root.join("cache"));
+        cmd.env("TERM", "xterm-256color");
+        let mut child = pair.slave.spawn_command(cmd).expect("spawn encoded bootstrap");
+        drop(pair.slave);
+        let mut writer = pair.master.take_writer().expect("pty writer");
+        let mut reader = pair.master.try_clone_reader().expect("pty reader");
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => { if tx.send(buf[..n].to_vec()).is_err() { break; } }
+                }
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut output = Vec::new();
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(chunk) => output.extend(chunk),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            if String::from_utf8_lossy(&output).contains("%session-changed") { break; }
+        }
+
+        let text = String::from_utf8_lossy(&output).into_owned();
+        let reached_control_mode = text.contains("%begin") && text.contains("%session-changed");
+        let _ = writer.write_all(b"detach-client\n");
+        let _ = writer.flush();
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = child.kill();
+        let _ = Command::new(&probe.tmux_path)
+            .args(["-L", &socket, "kill-server"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = fs::remove_dir_all(root);
+
+        assert!(reached_control_mode,
+            "encoded bootstrap did not preserve tty stdin; output={text:?}");
     }
 }

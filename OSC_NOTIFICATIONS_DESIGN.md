@@ -166,7 +166,9 @@ not reuse this OSC dot as proof that a real agent issued a permission request.
 - `ui/renderer.js` owns per-tab unread state, session aggregation, and acknowledgement behavior.
 - `src-tauri/src/validation.rs` enables tmux focus events on every local/remote attach.
 - `src-tauri/src/claude_integration.rs` provisions the scoped Claude Code launcher locally and over
-  SSH while respecting explicit user configuration.
+  SSH while respecting explicit user configuration. The remote bootstrap is decoded inside command
+  substitution and passed as `/bin/sh -c`'s argument—not piped into the shell's stdin—so the final
+  tmux `exec` retains the pty allocated by `ssh -tt` and can start its control handshake.
 - `src-tauri/src/transport.rs` exposes the launcher PATH and Buoy marker to local tmux windows.
 - `ui/index.html` owns the shared dot styling.
 - `test/plugins.test.js` covers protocol classification and arbitrary chunk boundaries.
@@ -192,6 +194,7 @@ not reuse this OSC dot as proof that a real agent issued a permission request.
 | Codex default config, background pane | tmux forwards focus loss; Codex BEL creates a dot |
 | Claude Code default config in a new Buoy shell | Scoped launcher selects OSC 777; dot appears |
 | Claude Code with an explicit notification channel | Buoy defers to the user's choice |
+| Encoded SSH bootstrap under a real pty | Final tmux process retains tty stdin and emits its control handshake |
 
 ## 10. Non-goals
 

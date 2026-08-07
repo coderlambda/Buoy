@@ -120,8 +120,8 @@ mod tests {
         let dd = args.iter().position(|a| a == "--").unwrap();
         let command = &args[dd + 2];
         let encoded = command
-            .strip_prefix("echo ").unwrap()
-            .strip_suffix(" | base64 -d | /bin/sh").unwrap();
+            .strip_prefix("exec /bin/sh -c \"$(echo ").unwrap()
+            .strip_suffix(" | base64 -d)\"").unwrap();
         String::from_utf8(crate::validation::base64_decode(encoded).unwrap()).unwrap()
     }
 

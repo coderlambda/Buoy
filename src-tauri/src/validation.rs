@@ -226,7 +226,14 @@ fn build_tmux_ssh_args(
     args.push("--".into());
     args.push(host_token(&parts));
     let script = crate::claude_integration::remote_tmux_script(tmux_path, socket, &session, control);
-    let remote = format!("echo {} | base64 -d | /bin/sh", base64_encode(script.as_bytes()));
+    // Decode the bootstrap into `sh -c`'s argv, not its stdin. The remote login shell still owns
+    // the pty allocated by `ssh -tt`, so the decoded script—and its final `exec tmux -CC`—inherits
+    // that original tty fd. Piping the script into `/bin/sh` made tmux inherit the decoder pipe and
+    // fail `tcgetattr(0)` before emitting its control-mode handshake.
+    let remote = format!(
+        "exec /bin/sh -c \"$(echo {} | base64 -d)\"",
+        base64_encode(script.as_bytes())
+    );
     args.push(remote);
     Ok(args)
 }
@@ -401,8 +408,8 @@ mod tests {
         let dd = args.iter().position(|x| x == "--").unwrap();
         let command = &args[dd + 2];
         let encoded = command
-            .strip_prefix("echo ").unwrap()
-            .strip_suffix(" | base64 -d | /bin/sh").unwrap();
+            .strip_prefix("exec /bin/sh -c \"$(echo ").unwrap()
+            .strip_suffix(" | base64 -d)\"").unwrap();
         String::from_utf8(base64_decode(encoded).unwrap()).unwrap()
     }
 

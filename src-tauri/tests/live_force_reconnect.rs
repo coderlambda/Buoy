@@ -29,11 +29,13 @@ fn write_fake_ssh() -> std::path::PathBuf {
          argv = sys.argv[1:]\n\
          idx = argv.index('--')\n\
          remote = argv[idx + 2]\n\
-         prefix = 'echo '\n\
-         suffix = ' | base64 -d | /bin/sh'\n\
+         prefix = 'exec /bin/sh -c \"$(echo '\n\
+         suffix = ' | base64 -d)\"'\n\
          script = base64.b64decode(remote[len(prefix):-len(suffix)]).decode()\n\
          script = script.replace('LC_ALL=C.UTF-8', 'LC_ALL=en_US.UTF-8') if sys.platform == 'darwin' else script\n\
-         os.execv('/bin/sh', ['/bin/sh', '-c', script])\n");
+         encoded = base64.b64encode(script.encode()).decode()\n\
+         remote = prefix + encoded + suffix\n\
+         os.execv('/bin/sh', ['/bin/sh', '-c', remote])\n");
     std::fs::write(&path, script).expect("write fake-ssh");
     let mut perm = std::fs::metadata(&path).unwrap().permissions();
     use std::os::unix::fs::PermissionsExt;
