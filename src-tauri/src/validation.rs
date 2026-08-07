@@ -188,8 +188,8 @@ fn host_token(parts: &HostParts) -> String {
 }
 
 /// Build ssh argv for a session. The remote command is base64-wrapped because it now provisions
-/// Buoy's Claude launcher before exec'ing tmux; renderer-controlled values are still validated
-/// against narrow character sets before they are interpolated into that script.
+/// Buoy's Claude launcher/plugin bundle before exec'ing tmux; renderer-controlled values are still
+/// validated against narrow character sets before they are interpolated into that script.
 pub fn build_ssh_args(
     raw_host: &str,
     raw_session: &str,

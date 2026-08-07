@@ -42,25 +42,37 @@ xterm's `onBell` event then feeds the same unread state as OSC notifications. No
 or Codex-specific wrapper is required.
 
 Claude Code also defaults to an `auto` notification channel, but an unrecognized terminal receives
-no terminal notification. Buoy therefore installs an app-owned launcher at
-`$HOME/.cache/buoy/bin/claude` and puts that directory first on PATH inside Buoy sessions. The
-launcher passes `--settings '{"preferredNotifChannel":"ghostty"}'` to interactive Claude Code,
-which selects its OSC 777 output without claiming that Buoy is Ghostty globally.
+no terminal notification. Buoy does not identify itself as another terminal or depend on Claude's
+native terminal allowlist. Instead, it installs an app-owned launcher at
+`$HOME/.cache/buoy/bin/claude` and puts that directory first on PATH inside Buoy sessions. The same
+bundle contains a small Claude plugin whose `Notification` and `Stop` hooks write one generic OSC
+777 request directly to the controlling tty. Both lifecycle events intentionally collapse to the
+same boolean unread state; Buoy does not inspect, retain, or display Claude's hook payload.
+
+The launcher adds the plugin with Claude's repeatable `--plugin-dir` option. Plugin hooks are merged
+by Claude independently from settings-file hooks, so existing user/project hooks and every explicit
+`--settings` argument remain unchanged. This avoids relying on the undocumented precedence of
+multiple `--settings` flags and avoids requiring Node, Python, or `jq` on SSH hosts. A user's native
+Claude notification preference may coexist with the plugin; duplicate terminal requests are
+idempotent while the tab's unread state is already true.
 
 The launcher is deliberately scoped and conservative:
 
 - it is active only when `BUOY_TERMINAL=1` is inherited from a Buoy shell;
 - it delegates to the real `claude` executable found later on PATH;
-- an existing `preferredNotifChannel` in user or project settings wins;
-- explicit `--settings`, `--safe-mode`, `--bare`, print, help, and version invocations pass through;
+- explicit `--settings` and user `--plugin-dir` arguments are preserved;
+- `--safe-mode`, `--bare`, print, help, and version invocations pass through because they either
+  disable customizations intentionally or do not represent an interactive agent session;
 - `BUOY_CLAUDE_NOTIFICATIONS_DISABLED=1` is an environment-level opt-out;
 - Buoy never edits `~/.claude/settings.json`.
 
-Local sessions install the launcher before spawning the shell. Every SSH attach transfers the same
-small launcher through the existing connection, then records PATH and `BUOY_TERMINAL` in tmux's
-global environment for subsequently created windows. A shell that was already running before this
-feature cannot have its process environment rewritten; open a new Buoy tab or recreate the session
-once after upgrading.
+Local sessions install the launcher and plugin before spawning the shell. Every SSH attach transfers
+the same small bundle through the existing connection, then records PATH and `BUOY_TERMINAL` in
+tmux's global environment for subsequently created windows. The hook script writes to `/dev/tty`, so
+tmux naturally attributes the OSC bytes to the pane running Claude; no Buoy socket, surface ID, or
+event-routing service is needed. A shell that was already running before this feature cannot have
+its process environment rewritten; open a new Buoy tab or recreate the session once after upgrading.
+An already-running Claude process must be restarted to load the plugin.
 
 ## 3. Why OSC parsing happens before xterm
 
@@ -165,10 +177,11 @@ not reuse this OSC dot as proof that a real agent issued a permission request.
 - `ui/terminalTab.js` forwards xterm's standalone BEL event.
 - `ui/renderer.js` owns per-tab unread state, session aggregation, and acknowledgement behavior.
 - `src-tauri/src/validation.rs` enables tmux focus events on every local/remote attach.
-- `src-tauri/src/claude_integration.rs` provisions the scoped Claude Code launcher locally and over
-  SSH while respecting explicit user configuration. The remote bootstrap is decoded inside command
-  substitution and passed as `/bin/sh -c`'s argument—not piped into the shell's stdin—so the final
-  tmux `exec` retains the pty allocated by `ssh -tt` and can start its control handshake.
+- `src-tauri/src/claude_integration.rs` provisions the scoped Claude Code launcher/plugin bundle
+  locally and over SSH while preserving explicit user configuration. The remote bootstrap is
+  decoded inside command substitution and passed as `/bin/sh -c`'s argument—not piped into the
+  shell's stdin—so the final tmux `exec` retains the pty allocated by `ssh -tt` and can start its
+  control handshake.
 - `src-tauri/src/transport.rs` exposes the launcher PATH and Buoy marker to local tmux windows.
 - `ui/index.html` owns the shared dot styling.
 - `test/plugins.test.js` covers protocol classification and arbitrary chunk boundaries.
@@ -192,8 +205,9 @@ not reuse this OSC dot as proof that a real agent issued a permission request.
 | Plain/single-tab session card click | Its implicit tab is acknowledged |
 | Standalone BEL | Dot appears through xterm's bell event |
 | Codex default config, background pane | tmux forwards focus loss; Codex BEL creates a dot |
-| Claude Code default config in a new Buoy shell | Scoped launcher selects OSC 777; dot appears |
-| Claude Code with an explicit notification channel | Buoy defers to the user's choice |
+| Claude Code notification/response completion in a new Buoy shell | Scoped hook writes OSC 777; dot appears |
+| Claude Code with explicit `--settings` or another `--plugin-dir` | User arguments are unchanged; Buoy hook also loads |
+| Claude Code with an explicit native notification channel | Native channel and idempotent Buoy hook may coexist |
 | Encoded SSH bootstrap under a real pty | Final tmux process retains tty stdin and emits its control handshake |
 
 ## 10. Non-goals
