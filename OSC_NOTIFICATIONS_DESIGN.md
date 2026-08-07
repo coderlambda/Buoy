@@ -46,8 +46,8 @@ no terminal notification. Buoy does not identify itself as another terminal or d
 native terminal allowlist. Instead, it installs an app-owned launcher at
 `$HOME/.cache/buoy/bin/claude` and puts that directory first on PATH inside Buoy sessions. The same
 bundle contains a small Claude plugin whose `Notification` and `Stop` hooks write one generic OSC
-777 request directly to the controlling tty. Both lifecycle events intentionally collapse to the
-same boolean unread state; Buoy does not inspect, retain, or display Claude's hook payload.
+777 request to the terminal pane running Claude. Both lifecycle events intentionally collapse to
+the same boolean unread state; Buoy does not inspect, retain, or display Claude's hook payload.
 
 The launcher adds the plugin with Claude's repeatable `--plugin-dir` option. Plugin hooks are merged
 by Claude independently from settings-file hooks, so existing user/project hooks and every explicit
@@ -68,11 +68,18 @@ The launcher is deliberately scoped and conservative:
 
 Local sessions install the launcher and plugin before spawning the shell. Every SSH attach transfers
 the same small bundle through the existing connection, then records PATH and `BUOY_TERMINAL` in
-tmux's global environment for subsequently created windows. The hook script writes to `/dev/tty`, so
-tmux naturally attributes the OSC bytes to the pane running Claude; no Buoy socket, surface ID, or
-event-routing service is needed. A shell that was already running before this feature cannot have
-its process environment rewritten; open a new Buoy tab or recreate the session once after upgrading.
-An already-running Claude process must be restarted to load the plugin.
+tmux's global environment for subsequently created windows. Claude launches command hooks in a new
+session with pipe-backed stdio, so the hook cannot use `/dev/tty` even though the Claude parent has a
+controlling terminal. The hook instead resolves the exact `#{pane_tty}` from inherited `TMUX` and
+`TMUX_PANE` metadata. Outside tmux, or if the matching tmux binary is unavailable, it walks a
+bounded ancestor chain with POSIX `ps` to find the nearest real tty. Write/lookup failures remain
+non-fatal and report to hook stderr when `DT_DEBUG=1`.
+
+Writing to the resolved pane tty makes tmux naturally attribute the OSC bytes to the pane running
+Claude; no Buoy socket, surface ID, or event-routing service is needed. A shell that was already
+running before this feature cannot have its process environment rewritten; open a new Buoy tab or
+recreate the session once after upgrading. An already-running Claude process must be restarted to
+load the plugin.
 
 ## 3. Why OSC parsing happens before xterm
 

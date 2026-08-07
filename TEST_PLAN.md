@@ -177,7 +177,7 @@ injected through the same `terminalAPI` listener surface used by Tauri.
 - **TC-N9** a standalone BEL (Codex's zero-config `auto` fallback) marks the emitting tab/session
   through xterm's bell event and can be acknowledged normally.
 
-The Rust suite adds five Claude Code provisioning guards:
+The Rust suite adds six Claude Code provisioning guards:
 
 - **TC-CN1** the Buoy-owned launcher is installed executable and repeated installs are idempotent.
 - **TC-CN2** interactive Claude gets the Buoy hook plugin while arbitrary arguments, explicit
@@ -187,8 +187,11 @@ The Rust suite adds five Claude Code provisioning guards:
   PATH/`BUOY_TERMINAL` in tmux.
 - **TC-CN4** the exact encoded SSH bootstrap runs under a real pty and reaches tmux control mode;
   this catches accidentally leaving the final tmux process connected to the decoder pipe.
-- **TC-CN5** the installed hook script writes one complete OSC 777 notification through a real pty,
-  and that sequence survives a real tmux control-mode `%output` frame.
+- **TC-CN5** the installed hook script writes one complete OSC 777 notification from inside a real
+  tmux pane, and that sequence survives the control-mode `%output` frame.
+- **TC-CN6** the actual hook script runs after `setsid()` with pipe-backed stdio, reproducing
+  Claude's no-controlling-tty hook process; inherited `TMUX`/`TMUX_PANE` still route OSC 777 to the
+  exact pane and through the control-mode client.
 
 ---
 

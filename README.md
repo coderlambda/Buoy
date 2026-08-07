@@ -49,7 +49,7 @@ still works, as a plain non-persistent pty). **Remote** sessions need `ssh` acce
 ## Test
 
 ```bash
-npm run tauri:test     # Rust unit tests (127): validation, supervisor state machine,
+npm run tauri:test     # Rust unit tests (128): validation, supervisor state machine,
                        # persistence, control-mode parser + reply routing, window registry,
                        # tunnels/sticky ports, local pty backend, Claude launcher integration
 npm test               # JS unit tests for the ui/ frontend modules (clipboard, file

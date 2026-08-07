@@ -27,12 +27,10 @@ const CLAUDE_PLUGIN_HOOKS: &str = r#"{
   "hooks": {
     "Notification": [
       {
-        "matcher": "",
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/notify.sh",
-            "args": [],
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/notify.sh\"",
             "timeout": 5
           }
         ]
@@ -40,12 +38,10 @@ const CLAUDE_PLUGIN_HOOKS: &str = r#"{
     ],
     "Stop": [
       {
-        "matcher": "",
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/notify.sh",
-            "args": [],
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/notify.sh\"",
             "timeout": 5
           }
         ]
@@ -57,16 +53,59 @@ const CLAUDE_PLUGIN_HOOKS: &str = r#"{
 
 const CLAUDE_PLUGIN_NOTIFY: &str = r#"#!/bin/sh
 # Claude sends hook context on stdin. It is intentionally ignored: Buoy displays one generic dot.
-if [ "${BUOY_TERMINAL:-}" = 1 ]; then
-  { printf '\033]777;notify;Buoy;\007' > /dev/tty; } 2>/dev/null || :
+debug() {
+  if [ "${DT_DEBUG:-}" = 1 ]; then
+    printf 'buoy: Claude notification: %s\n' "$*" >&2
+  fi
+}
+
+if [ "${BUOY_TERMINAL:-}" != 1 ]; then
+  exit 0
+fi
+
+tty_target=
+
+# Claude starts hooks in a fresh session with pipe-backed stdio, so /dev/tty cannot be opened even
+# though the Claude parent has a controlling terminal. tmux provides the exact tty for this pane.
+if [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ] && command -v tmux >/dev/null 2>&1; then
+  tty_target=$(tmux display-message -p -t "$TMUX_PANE" '#{pane_tty}' 2>/dev/null) ||
+    tty_target=
+fi
+
+# Outside tmux, or when the server's tmux binary is not on PATH, find the nearest ancestor that
+# still owns a real tty. ps -o is specified by POSIX and works with both BSD and procps variants.
+if [ -z "$tty_target" ] || [ ! -w "$tty_target" ]; then
+  tty_target=
+  pid=$PPID
+  n=0
+  while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null && [ "$n" -lt 10 ]; do
+    tty_name=$(ps -o tty= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+    case "$tty_name" in
+      ''|'?'|'??') ;;
+      *)
+        if [ -w "/dev/$tty_name" ]; then
+          tty_target=/dev/$tty_name
+          break
+        fi
+        ;;
+    esac
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+    n=$((n + 1))
+  done
+fi
+
+if [ -z "$tty_target" ]; then
+  debug "could not resolve the Claude pane tty"
+elif ! printf '\033]777;notify;Buoy;\007' > "$tty_target" 2>/dev/null; then
+  debug "could not write to $tty_target"
 fi
 exit 0
 "#;
 
 /// POSIX `sh` wrapper installed as `$HOME/.cache/buoy/bin/claude`.
 ///
-/// Keep this dependency-free: the same bytes are installed on remote hosts during the ssh attach,
-/// where only a POSIX shell and the already-required `base64` utility are assumed.
+/// Keep the bundle dependency-light: remote installation needs only POSIX shell plus `base64`;
+/// hook delivery uses the already-required tmux, with POSIX `ps`/`tr` as its fallback.
 pub const CLAUDE_WRAPPER: &str = r#"#!/bin/sh
 set -uf
 
@@ -119,7 +158,7 @@ plugin_dir=$shim_dir/buoy-claude-notifications
 # A partial/failed install must never prevent Claude from launching.
 if [ ! -f "$plugin_dir/.claude-plugin/plugin.json" ] ||
    [ ! -f "$plugin_dir/hooks/hooks.json" ] ||
-   [ ! -x "$plugin_dir/scripts/notify.sh" ]; then
+   [ ! -f "$plugin_dir/scripts/notify.sh" ]; then
   exec "$real_claude" "$@"
 fi
 
@@ -501,7 +540,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn tc_cn5_hook_osc_survives_a_real_pty_and_tmux_control_mode() {
+    fn tc_cn5_hook_osc_survives_real_tmux_control_mode() {
         use portable_pty::{native_pty_system, CommandBuilder, PtySize};
         use std::io::Read;
         use std::sync::mpsc;
@@ -514,39 +553,6 @@ mod tests {
             .join(CLAUDE_PLUGIN_DIR_NAME)
             .join("scripts")
             .join("notify.sh");
-
-        let pair = native_pty_system()
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("open direct hook pty");
-        let mut command = CommandBuilder::new("/bin/sh");
-        command.arg(&hook);
-        command.env("BUOY_TERMINAL", "1");
-        let mut child = pair
-            .slave
-            .spawn_command(command)
-            .expect("spawn hook in direct pty");
-        drop(pair.slave);
-        let mut reader = pair.master.try_clone_reader().expect("direct pty reader");
-        let mut direct_output = Vec::new();
-        let mut buffer = [0u8; 1024];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
-                Ok(count) => direct_output.extend_from_slice(&buffer[..count]),
-            }
-        }
-        let _ = child.wait();
-        assert!(
-            direct_output
-                .windows(b"\x1b]777;notify;Buoy;\x07".len())
-                .any(|window| window == b"\x1b]777;notify;Buoy;\x07"),
-            "hook did not emit a complete OSC 777 request: {direct_output:?}"
-        );
 
         let probe = crate::probe::probe_local_tmux();
         if !probe.probed {
@@ -635,6 +641,187 @@ mod tests {
         assert!(
             text.contains("%output") && text.contains("\\033]777;notify;Buoy;\\007"),
             "tmux control mode did not preserve the hook OSC: {text:?}"
+        );
+    }
+
+    /// Claude launches command hooks in a new session with pipe-backed stdio. Reproduce that
+    /// topology instead of giving the hook a controlling pty: it must resolve the inherited tmux
+    /// pane explicitly and write the OSC to that pane's tty.
+    #[cfg(unix)]
+    #[test]
+    fn tc_cn6_detached_hook_targets_the_inherited_tmux_pane() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        use std::io::{Read, Write};
+        use std::os::unix::fs::symlink;
+        use std::os::unix::process::CommandExt;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let probe = crate::probe::probe_local_tmux();
+        if !probe.probed {
+            eprintln!("SKIP TC-CN6: no local tmux");
+            return;
+        }
+
+        let root = temp_dir("detached-hook");
+        let bin = root.join("bin");
+        ensure_local_shim_in(&bin).unwrap();
+        let hook = bin
+            .join(CLAUDE_PLUGIN_DIR_NAME)
+            .join("scripts")
+            .join("notify.sh");
+        // The production hook intentionally invokes bare `tmux`. Pin that name to the exact binary
+        // selected by Buoy's local probe so the test does not depend on the test runner's PATH.
+        symlink(&probe.tmux_path, bin.join("tmux")).expect("link the probed tmux into hook PATH");
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            % 1_000_000;
+        let session = format!("buoycn6{}{}", std::process::id(), nonce);
+        let socket = format!("bcn6-{}-{}", std::process::id(), nonce);
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open detached-hook tmux pty");
+        let mut tmux_command = CommandBuilder::new(&probe.tmux_path);
+        tmux_command.args([
+            "-CC",
+            "-L",
+            socket.as_str(),
+            "new-session",
+            "-D",
+            "-s",
+            session.as_str(),
+            "sleep 10",
+        ]);
+        tmux_command.env("TERM", "xterm-256color");
+        let mut tmux_child = pair
+            .slave
+            .spawn_command(tmux_command)
+            .expect("spawn control client for detached hook");
+        drop(pair.slave);
+        let mut writer = pair.master.take_writer().expect("detached-hook pty writer");
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .expect("detached-hook pty reader");
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 4096];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => {
+                        if tx.send(buffer[..count].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut control_output = Vec::new();
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(chunk) => control_output.extend(chunk),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            if String::from_utf8_lossy(&control_output).contains("%session-changed") {
+                break;
+            }
+        }
+
+        let target = format!("{session}:");
+        let pane_metadata = Command::new(&probe.tmux_path)
+            .args([
+                "-L",
+                &socket,
+                "display-message",
+                "-p",
+                "-t",
+                &target,
+                "#{pane_id}\t#{socket_path},#{pid},0\t#{pane_tty}",
+            ])
+            .output()
+            .expect("query the scratch tmux pane");
+        assert!(
+            pane_metadata.status.success(),
+            "could not query scratch pane: {}",
+            String::from_utf8_lossy(&pane_metadata.stderr)
+        );
+        let metadata = String::from_utf8_lossy(&pane_metadata.stdout);
+        let fields = metadata.trim().split('\t').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 3, "unexpected pane metadata: {metadata:?}");
+        let pane_id = fields[0];
+        let tmux_env = fields[1];
+        let pane_tty = fields[2];
+        assert!(pane_tty.starts_with("/dev/"), "real pane tty: {pane_tty:?}");
+
+        let inherited_path = std::env::var("PATH").unwrap_or_default();
+        let mut hook_command = Command::new("/bin/sh");
+        hook_command
+            .arg(&hook)
+            .env("BUOY_TERMINAL", "1")
+            .env("DT_DEBUG", "1")
+            .env("TMUX", tmux_env)
+            .env("TMUX_PANE", pane_id)
+            .env("PATH", format!("{}:{inherited_path}", bin.display()));
+        // SAFETY: pre_exec runs only async-signal-safe setsid in the freshly forked child. This is
+        // the essential regression condition: /dev/tty must be unavailable exactly as it is for a
+        // real Claude hook subprocess.
+        unsafe {
+            hook_command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let hook_output = hook_command.output().expect("run detached hook");
+        assert!(
+            hook_output.status.success(),
+            "detached hook failed: {}",
+            String::from_utf8_lossy(&hook_output.stderr)
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(chunk) => control_output.extend(chunk),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            if String::from_utf8_lossy(&control_output)
+                .contains("\\033]777;notify;Buoy;\\007")
+            {
+                break;
+            }
+        }
+        let text = String::from_utf8_lossy(&control_output).into_owned();
+        let _ = writer.write_all(b"detach-client\n");
+        let _ = writer.flush();
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = tmux_child.kill();
+        let _ = Command::new(&probe.tmux_path)
+            .args(["-L", &socket, "kill-server"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = fs::remove_dir_all(root);
+
+        assert!(
+            text.contains("%output") && text.contains("\\033]777;notify;Buoy;\\007"),
+            "detached hook did not reach pane {pane_id} on {pane_tty}; output={text:?}, stderr={:?}",
+            String::from_utf8_lossy(&hook_output.stderr)
         );
     }
 }
