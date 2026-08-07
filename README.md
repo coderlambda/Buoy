@@ -47,7 +47,7 @@ still works, as a plain non-persistent pty). **Remote** sessions need `ssh` acce
 ## Test
 
 ```bash
-npm run tauri:test     # Rust unit tests (116): validation, supervisor state machine,
+npm run tauri:test     # Rust unit tests (122): validation, supervisor state machine,
                        # persistence, control-mode parser + reply routing, window registry,
                        # tunnels/sticky ports, local pty backend
 npm test               # JS unit tests for the ui/ frontend modules (clipboard, file
@@ -55,6 +55,7 @@ npm test               # JS unit tests for the ui/ frontend modules (clipboard, 
 npm run gui-rename     # full-GUI inline-rename suite (real ui/ in a real browser)
 npm run gui-reorder    # full-GUI drag-to-reorder suite (real ui/ in a real browser)
 npm run gui-notifications # full-GUI OSC/BEL notification-dot and acknowledgement suite
+npm run gui-terminal-repaint # reconnect repaint/cursor and command-echo ordering in real xterm
 ```
 
 The `gui-*` suites drive the REAL `ui/index.html` + `ui/renderer.js` with browser/OS-level

@@ -3,6 +3,7 @@
 // provides one native-tab session plus one plain/single-tab session.
 window.__errs = [];
 window.__inputs = [];
+window.__terminalCalls = [];
 window.addEventListener('error', (e) => window.__errs.push(String(e.message)));
 
 const listeners = {};
@@ -24,12 +25,15 @@ window.terminalAPI = {
     tmuxPath: '/usr/bin/tmux', tmuxVersion: [3, 6] }),
   rename: async (id, title) => ({ ok: true, title }),
   input(...args) { window.__inputs.push(args); },
-  resize() {}, ack() {}, close() {}, kill() {}, retry() {}, forceReconnect() {},
+  resize(...args) { window.__terminalCalls.push(['resize', ...args]); },
+  ack() {}, close() {}, kill() {}, retry() {}, forceReconnect() {},
   openExternal() {}, copyText: async () => {},
   readRemoteFile: async () => ({}), saveFile: async () => ({}), enableHtmlScripts: async () => ({}),
   openForwardedUrl: async () => ({}), listTunnels: async () => [], closeTunnel() {},
   forceForward: async () => {}, listHosts: async () => [], rememberHost() {},
-  tabNew() {}, tabSelect() {}, tabClose() {}, tabCapture() {}, tabRename() {},
+  tabNew() {}, tabSelect() {}, tabClose() {},
+  tabCapture(...args) { window.__terminalCalls.push(['capture', ...args]); },
+  tabRename() {},
   reorderSessions: async () => {}, setSessionColor: async () => {},
   setLastActive: async () => {}, setLastTab: async () => {}, setTabPrefs: async () => {},
   onData: (cb) => (listeners.data = listeners.data || []).push(cb),

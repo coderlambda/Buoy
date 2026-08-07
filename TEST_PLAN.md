@@ -189,6 +189,16 @@ cd src-tauri && DT_LIVE_HOST=user@host cargo test --test <name> -- --ignored --n
 ```
 
 - **live_control_mode** — connect, second tab, per-window output isolation, tab re-visit.
+- **live_local_tmux TC-LT6** — capture/backfill restores tmux's exact cursor row/column without an
+  added newline (the Codex/Claude Code reconnect cursor regression).
+- **gui-terminal-repaint TC-CR1–3** — the real xterm is fitted/resized before backfill, restores the
+  tmux cursor, and echoes the first command beside its prompt instead of on the following row.
+- **control_backend tmux-title regressions** — the exact physical-Enter burst containing
+  `ESC k ls ESC \\` never exposes `ls` as terminal text, at every possible chunk split; unrelated
+  escape sequences remain byte-for-byte intact.
+- **Tauri dev hot reload** — with `DT_DEBUG=1 npx --yes @tauri-apps/cli@2 dev`, reload the frontend
+  twice and run `ls`; each reload logs one `replacing live backend`, leaves one tmux client, and the
+  command/output are delivered once without a reconnect loop.
 - **live_reconnect / live_force_reconnect** — the supervisor reattaches the SAME session.
 - **live_remote_file / live_relative_path** — clicked-path preview + cwd resolution (§16–17).
 - **live_tunnel** — sticky `ssh -L` ports across a break (§18; see TC-LT above).

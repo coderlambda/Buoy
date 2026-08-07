@@ -506,7 +506,23 @@ function showActiveTab(v) {
     const size = tab.content.fit ? tab.content.fit() : null;
     // Always re-assert size on show (a switched-to session/tab must be told its dimensions), and
     // keep _lastSize in sync so the debounced window-resize handler's change check stays correct.
-    if (size) { api.resize(v.meta.id, size.cols, size.rows); if (v.meta.id === activeId) _lastSize = size; }
+    let resizeResult = null;
+    if (size) {
+      resizeResult = api.resize(v.meta.id, size.cols, size.rows);
+      if (v.meta.id === activeId) _lastSize = size;
+    }
+    // Capture only AFTER xterm is fitted and the backend has accepted the matching tmux resize.
+    // Capturing earlier snapshots (often at the attach-time 80x24) and then painting them into a
+    // larger xterm put the prompt on one row and tmux's real cursor on the next. Tauri invokes
+    // resolve after resize() has queued refresh-client, so the following capture is FIFO behind it.
+    const captureAfterResize = () => {
+      if (isWindowTab(tab.winId)) lazyCapture(v, tab.winId);
+    };
+    if (resizeResult && typeof resizeResult.then === 'function') {
+      resizeResult.then(captureAfterResize, captureAfterResize);
+    } else {
+      captureAfterResize();
+    }
     // Don't focus a broken console — it must not capture keystrokes (§22). (A control session
     // still-settling on initial connect keeps focus so early input buffers as designed.)
     if (tab.content.focus && !shouldDropInput(v)) tab.content.focus();
@@ -1160,6 +1176,25 @@ window.__testReadBuffer = () => {
   const tab = activeTab(v);
   return tab && tab.content.readBuffer ? tab.content.readBuffer() : '';
 };
+// Exact xterm cursor/viewport inspection for reconnect-repaint regressions. The public app never
+// calls this; GUI tests use it to distinguish a backend cursor from where xterm will echo input.
+window.__testTerminalState = () => {
+  const v = views.get(activeId);
+  const tab = v && activeTab(v);
+  const term = tab && tab.content && tab.content.term;
+  if (!term) return null;
+  const buf = term.buffer.active;
+  const absoluteY = buf.baseY + buf.cursorY;
+  const textAt = (y) => {
+    const line = buf.getLine(y);
+    return line ? line.translateToString(true) : '';
+  };
+  return {
+    cols: term.cols, rows: term.rows,
+    cursorX: buf.cursorX, cursorY: buf.cursorY, baseY: buf.baseY,
+    line: textAt(absoluteY), previous: textAt(absoluteY - 1), next: textAt(absoluteY + 1),
+  };
+};
 api.onState(({ id, state }) => {
   // Logged like onWindow/onReady: a session stuck showing "connecting" is exactly a missing/late
   // state event, and without this line the log can't distinguish "never emitted" from "ignored".
@@ -1167,6 +1202,12 @@ api.onState(({ id, state }) => {
   const v = views.get(id);
   if (!v) return;
   v.state = state;
+  if (state === 'connecting' && v.meta.mode === 'control') {
+    // A fresh backend needs a fresh, post-resize capture even when the existing xterm/tab objects
+    // survive a supervisor reconnect. The backend gates input until that repaint completes.
+    v.inputReady = false;
+    for (const [, tab] of v.tabs) if (isWindowTab(tab.winId)) tab.backfilled = false;
+  }
   // The backend has acted on the reconnect request (it always reports a state after a spawn), so
   // release the in-flight guard and let the control be clicked again.
   if (state !== 'connecting') clearReconnect(id);
@@ -1211,8 +1252,11 @@ api.onWindow(({ id, action, window, name, order }) => {
     ensureTab(v, window);
     if (v.activeWindow !== window) {
       v.activeWindow = window;
-      if (id === activeId) { showActiveTab(v); lazyCapture(v, window); }
     }
+    // The first `add` provisionally sets activeWindow, so the initial authoritative `active` event
+    // can name the same id. Still mount/fit here: backend attach no longer performs a premature
+    // 80x24 capture, and this post-fit path owns the one correctly-sized backfill.
+    if (id === activeId) showActiveTab(v);
     // Don't overwrite the saved last-tab from tmux's initial active event while a restore is still
     // pending — otherwise we'd clobber the tab we're about to restore to.
     if (!v.restoreTab) rememberLastTab(v, window);
@@ -1323,7 +1367,7 @@ function switchTab(v, winId, userInitiated = false) {
   if (userInitiated) clearTabNotification(v, tab);
   if (v.activeWindow === winId) return;
   v.activeWindow = winId;
-  if (isWindowTab(winId)) { api.tabSelect(v.meta.id, winId); lazyCapture(v, winId); rememberLastTab(v, winId); }
+  if (isWindowTab(winId)) { api.tabSelect(v.meta.id, winId); rememberLastTab(v, winId); }
   showActiveTab(v);
   renderTabs(v);
 }

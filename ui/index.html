@@ -149,9 +149,26 @@
     .term-gate .gate-badge.clickable:active { transform:scale(.97); }
     #status { height:22px; line-height:22px; padding:0 10px; background:var(--panel);
       color:var(--muted); font-size:11px; border-top:1px solid #313244; }
-    dialog { background:var(--panel); color:var(--fg); border:1px solid #45475a; border-radius:8px; }
-    dialog input, dialog select { width:100%; margin:4px 0 10px; padding:6px; background:var(--bg);
-      color:var(--fg); border:1px solid #45475a; border-radius:4px; }
+    dialog { background:var(--panel); color:var(--fg); border:1px solid #45475a; border-radius:8px;
+      color-scheme:dark; }
+    dialog input, dialog select { width:100%; padding:6px 9px; background:var(--bg); color:var(--fg);
+      border:1px solid #45475a; border-radius:5px; font:inherit; line-height:16px;
+      transition:border-color .12s, box-shadow .12s; }
+    dialog input { margin:4px 0 10px; }
+    dialog input:hover, dialog select:hover { border-color:#585b70; }
+    dialog input:focus, dialog select:focus { outline:none; border-color:var(--accent);
+      box-shadow:0 0 0 2px rgba(137,180,250,.15); }
+    /* WebKit otherwise paints this one control as a glossy macOS pop-up button. Keep the native
+       select semantics, but give its closed state the same flat treatment as the dialog inputs. */
+    .dialog-select { position:relative; margin:4px 0 10px; }
+    .dialog-select select { display:block; margin:0; padding-right:34px; cursor:pointer;
+      appearance:none; -webkit-appearance:none; }
+    .dialog-select::after { content:''; position:absolute; right:12px; top:50%; width:7px; height:7px;
+      border-right:1.5px solid var(--muted); border-bottom:1.5px solid var(--muted);
+      transform:translateY(-65%) rotate(45deg); pointer-events:none; transition:border-color .12s; }
+    .dialog-select:hover::after { border-color:var(--fg); }
+    .dialog-select:focus-within::after { border-color:var(--accent); }
+    dialog select option { background:var(--panel); color:var(--fg); }
     dialog button { padding:6px 12px; margin-left:6px; }
     dialog label { font-size:12px; color:var(--muted); }
     .err { color:#f38ba8; font-size:11px; }
@@ -252,11 +269,14 @@
 
   <dialog id="dialog">
     <form method="dialog" id="form">
-      <div><label>Type</label>
-        <select id="f-kind">
-          <option value="remote" selected>Remote host (ssh + tmux)</option>
-          <option value="local">Local shell (tmux)</option>
-        </select></div>
+      <div><label for="f-kind">Type</label>
+        <div class="dialog-select">
+          <select id="f-kind">
+            <option value="remote" selected>Remote host (ssh + tmux)</option>
+            <option value="local">Local shell (tmux)</option>
+          </select>
+        </div>
+      </div>
       <div id="remote-fields">
         <label>Host</label>
         <div id="host-wrap">

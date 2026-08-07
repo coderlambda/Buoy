@@ -135,6 +135,8 @@ fn tc_lt2_local_session_survives_client_death() {
     let b2 = ControlBackend::spawn(cfg(), sink(rec2.clone()), 90, 30).expect("spawn 2");
     for _ in 0..40 { if rec2.lock().unwrap().ready { break; } sleep_ms(250); }
     assert!(rec2.lock().unwrap().ready, "reattached client ready");
+    let win = rec2.lock().unwrap().windows.first().cloned().expect("reattached window");
+    b2.capture_window(&win); // the renderer does this after fitting/resizing the real xterm
     for _ in 0..40 { if all_text(&rec2).contains("SURVIVOR_MARK") { break; } sleep_ms(250); }
     assert!(all_text(&rec2).contains("SURVIVOR_MARK"),
         "a local session's work SURVIVED its client dying (this is why local uses tmux); got: {}",
@@ -261,6 +263,46 @@ fn tc_lt5_local_tmux_keeps_unicode_window_names() {
         .output().expect("display-message");
     let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
     assert_eq!(name, "✳ task", "unicode window name stored intact (not mangled to '_')");
+
+    backend.kill();
+    kill_server(&tmux, "control", ver, session);
+}
+
+/// TC-LT6 reconnect/backfill must restore tmux's actual pane cursor. Full-screen TUIs such as
+/// Codex and Claude Code keep an input cursor above a footer, so the final captured text row is not
+/// the cursor row. This uses a real tmux pane positioned at row 5, column 7 and verifies the repaint
+/// ends with that exact CSI position rather than a synthetic trailing newline.
+#[test]
+fn tc_lt6_capture_restores_real_cursor_position() {
+    let Some((tmux, ver)) = local_tmux() else { eprintln!("SKIP: no local tmux"); return };
+    let session = "buoylt6";
+    kill_server(&tmux, "control", ver, session);
+
+    let rec = Arc::new(Mutex::new(Rec::default()));
+    let backend = ControlBackend::spawn(
+        BackendConfig {
+            host: String::new(), session: session.into(),
+            tmux_path: tmux.clone(), tmux_version: ver, base_args: vec![],
+            transport: Transport::Local,
+        },
+        sink(rec.clone()), 90, 30,
+    ).expect("spawn");
+    for _ in 0..40 { if rec.lock().unwrap().ready { break; } sleep_ms(250); }
+    assert!(rec.lock().unwrap().ready, "ready");
+    let win = rec.lock().unwrap().windows.first().cloned().expect("a window");
+
+    // Clear, draw one cell, place the cursor at 1-based row 5/column 7, then remain quiet while the
+    // capture and cursor query complete. The captured cell stream itself contains no cursor CSI.
+    backend.write("printf '\\033[2J\\033[Htop\\033[5;7H'; sleep 3\n");
+    sleep_ms(500);
+    rec.lock().unwrap().by_window.insert(win.clone(), String::new());
+    backend.capture_window(&win);
+    sleep_ms(500);
+
+    let repaint = rec.lock().unwrap().by_window.get(&win).cloned().unwrap_or_default();
+    assert!(repaint.ends_with("\x1b[5;7H"),
+        "capture repaint restores tmux cursor and adds no newline; tail={:?}",
+        repaint.chars().rev().take(32).collect::<String>().chars().rev().collect::<String>());
 
     backend.kill();
     kill_server(&tmux, "control", ver, session);

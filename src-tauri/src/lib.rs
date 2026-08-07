@@ -291,6 +291,17 @@ fn create_session(app: AppHandle, state: State<AppState>, meta: CreateArgs) -> R
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis().to_string()).unwrap_or_else(|_| "session".into())
     });
+    // A webview reload (notably Tauri dev's frontend hot reload) calls create_session again while
+    // the Rust process and its AppState remain alive. Replacing the HashMap entry without closing
+    // its backend leaves the old Supervisor running on its worker Arcs; old and new `-D` tmux
+    // clients then detach each other forever and both can emit the same shell echo to the renderer.
+    // Stop a same-id backend before building its replacement. Keep tunnels alive: this is a client
+    // reattach, not the user's Close/Kill action.
+    let replaced = { state.sessions.lock().unwrap().remove(&id) };
+    if let Some(existing) = replaced {
+        dlog!("create_session: replacing live backend id={}", id);
+        existing.backend.kill();
+    }
     // App owns the tmux session name: derive a charset-safe one from the id when not supplied.
     let session = match &meta.session {
         Some(s) if validation::validate_session(s).is_ok() => s.clone(),

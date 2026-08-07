@@ -32,11 +32,13 @@ fn live_reconnects_after_ssh_killed() {
     // Collect output + count ready transitions (each successful (re)connect fires Ready).
     let out = Arc::new(Mutex::new(String::new()));
     let ready_count = Arc::new(AtomicUsize::new(0));
-    let oc = out.clone(); let rc = ready_count.clone();
+    let active_window = Arc::new(Mutex::new(None::<String>));
+    let oc = out.clone(); let rc = ready_count.clone(); let aw = active_window.clone();
     let app_sink: buoy_lib::control_backend::BackendSink = Arc::new(move |ev: BackendEvent| {
         match ev {
             BackendEvent::Data { data, .. } => oc.lock().unwrap().push_str(&data),
             BackendEvent::Ready => { rc.fetch_add(1, Ordering::Relaxed); }
+            BackendEvent::WindowActive { window, .. } => { *aw.lock().unwrap() = Some(window); }
             _ => {}
         }
     });
@@ -81,9 +83,12 @@ fn live_reconnects_after_ssh_killed() {
     assert!(ready_count.load(Ordering::Relaxed) >= 2,
         "supervisor reconnected (ready_count={})", ready_count.load(Ordering::Relaxed));
 
+    // The renderer fits/resizes first, then requests the reattached window's backfill.
+    let win = active_window.lock().unwrap().clone().expect("active window after reconnect");
+    sup.capture_window(&win);
     // After reattach, the SAME tmux session's scrollback (with our marker) is replayed.
     for _ in 0..20 { if out.lock().unwrap().matches("RECONNECT_MARK").count() >= 2 { break; } sleep_ms(250); }
-    assert!(out.lock().unwrap().contains("RECONNECT_MARK"),
+    assert!(out.lock().unwrap().matches("RECONNECT_MARK").count() >= 2,
         "reattached session replays prior content (same session, not fresh)");
 
     // sanity: we passed through a Reconnecting or Connecting state after the break

@@ -18,6 +18,9 @@ pub enum ReplyKind {
     Topology,
     /// A `capture-pane` scrollback back-fill, painted into the given window (None = active).
     Capture { window: Option<String> },
+    /// The cursor-position query paired with a completed capture. `capture-pane` returns only
+    /// cells, not the pane cursor; retain the captured rows until this second FIFO reply arrives.
+    CaptureCursor { window: String, body: Vec<String> },
 }
 
 pub struct ReplyChannel {

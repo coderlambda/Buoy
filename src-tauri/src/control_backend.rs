@@ -75,11 +75,19 @@ struct Inner {
     // buffering; otherwise a tab switch during startup/reconnect can replay protocol replies into
     // whichever window happens to be active later.
     pending_input: Vec<(String, Option<String>)>,
+    // A capture is a two-reply transaction (cells, then cursor coordinates). Input for that window
+    // waits until the repaint is emitted, preventing the first typed command from racing between
+    // the snapshot and its cursor query and being echoed on a separate visual row.
+    pending_captures: std::collections::BTreeSet<String>,
     pending_output: std::collections::BTreeMap<String, Vec<String>>,
     // Per-pane carry of trailing incomplete UTF-8 bytes. tmux can split a multi-byte char across
     // two %output events for the SAME pane; carrying the partial tail here (keyed by pane, since
     // interleaved panes must not corrupt each other) reassembles it on the next event.
     utf8_carry: std::collections::BTreeMap<String, Vec<u8>>,
+    // tmux/screen's terminal-title protocol is `ESC k title ESC \\`. xterm.js does not recognize
+    // it and visibly prints `title`, so filter it as a per-pane byte stream (the sequence can split
+    // across %output events).
+    title_filters: std::collections::BTreeMap<String, TmuxTitleFilter>,
     // Coalescing output buffer: window -> accumulated text awaiting the next flush. A redrawing
     // TUI produces ~750 %output events/sec; emitting one Tauri IPC message each floods and crashes
     // the webview. We batch here and a flush thread emits ONE message per window at ~60fps, which
@@ -142,8 +150,10 @@ impl ControlBackend {
             ready: false,
             attached: false,
             pending_input: Vec::new(),
+            pending_captures: std::collections::BTreeSet::new(),
             pending_output: std::collections::BTreeMap::new(),
             utf8_carry: std::collections::BTreeMap::new(),
+            title_filters: std::collections::BTreeMap::new(),
             out_buf: std::collections::BTreeMap::new(),
             refresh_queued: false,
             stopped: false,
@@ -279,8 +289,14 @@ impl ControlBackend {
     pub fn capture_window(&self, win: &str) {
         if !is_win_id(win) { return; }
         let mut g = self.inner.lock().unwrap();
+        // One backfill per window at a time. The renderer also guards this, but keeping the
+        // transaction invariant here protects reconnect races and direct command callers.
+        if !g.pending_captures.insert(win.to_string()) { return; }
         g.send(
-            format!("capture-pane -p -e -q -J -N -S -{} -t {}", MAX_HISTORY, win),
+            // Keep physical pane rows physical. `-J` joins wrapped rows and `-N` preserves padding;
+            // replaying that text can reflow to a different height in xterm and separate the prompt
+            // from the cursor even when both terminals have the same dimensions.
+            format!("capture-pane -p -e -q -S -{} -t {}", MAX_HISTORY, win),
             ReplyKind::Capture { window: Some(win.to_string()) },
         );
     }
@@ -353,9 +369,26 @@ impl Inner {
     /// it to apply_topology would parse it as pane rows.
     fn on_reply(inner: &Arc<Mutex<Inner>>, ok: bool, body: Vec<String>) {
         let kind = { inner.lock().unwrap().reply.take() };
-        crate::dlog!("on_reply: kind={:?} ok={} bodyLines={}", kind, ok, body.len());
+        let kind_name = match kind.as_ref() {
+            Some(ReplyKind::Ignore) => "ignore",
+            Some(ReplyKind::Topology) => "topology",
+            Some(ReplyKind::Capture { .. }) => "capture",
+            Some(ReplyKind::CaptureCursor { .. }) => "capture-cursor",
+            None => "unexpected",
+        };
+        // Do not Debug-print `kind`: CaptureCursor deliberately carries up to MAX_HISTORY captured
+        // rows while awaiting the coordinate reply, which would flood the opt-in diagnostic log.
+        crate::dlog!("on_reply: kind={} ok={} bodyLines={}", kind_name, ok, body.len());
         if !ok {
-            crate::dlog!("on_reply: %error for kind={:?}, body discarded: {:?}", kind, body);
+            crate::dlog!("on_reply: %error for kind={}, body discarded: {:?}", kind_name, body);
+            let failed_window = match kind.as_ref() {
+                Some(ReplyKind::Capture { window: Some(window) }) => Some(window.clone()),
+                Some(ReplyKind::CaptureCursor { window, .. }) => Some(window.clone()),
+                _ => None,
+            };
+            if let Some(window) = failed_window {
+                inner.lock().unwrap().finish_capture(&window);
+            }
             return;
         }
         match kind {
@@ -364,7 +397,14 @@ impl Inner {
                 Inner::apply_topology(inner, lines);
             }
             Some(ReplyKind::Capture { window }) => {
-                Inner::paint_capture(inner, window, body);
+                Inner::request_capture_cursor(inner, window, body);
+            }
+            Some(ReplyKind::CaptureCursor { window, body: capture }) => {
+                if let Some((x, y)) = parse_cursor_position(&body) {
+                    Inner::paint_capture(inner, window, capture, x, y);
+                } else {
+                    inner.lock().unwrap().finish_capture(&window);
+                }
             }
             _ => {}
         }
@@ -453,9 +493,11 @@ impl Inner {
         // to bytes, prepend this pane's carried incomplete UTF-8 tail, decode the valid prefix, and
         // stash any new incomplete tail. This is where a char split across two %output events for
         // the same pane is reassembled.
+        let raw: Vec<u8> = data.chars().map(|c| c as u8).collect();
+        let filtered = self.title_filters.entry(pane.clone()).or_default().push(&raw);
         let mut bytes: Vec<u8> = Vec::new();
         if let Some(carry) = self.utf8_carry.remove(&pane) { bytes.extend_from_slice(&carry); }
-        bytes.extend(data.chars().map(|c| c as u8));
+        bytes.extend(filtered);
         let (text, tail) = decode_utf8_prefix(&bytes);
         if !tail.is_empty() { self.utf8_carry.insert(pane.clone(), tail); }
         if text.is_empty() { return false; }
@@ -499,7 +541,7 @@ impl Inner {
             let mut g = inner.lock().unwrap();
             if g.attached { crate::dlog!("on_attach: already attached, skip"); return; }
             g.attached = true;
-            crate::dlog!("on_attach: refreshing topology + capturing scrollback");
+            crate::dlog!("on_attach: refreshing topology");
             // Tab titles follow the pane title (OSC 2 / `\e]2;…`), the standard, program-agnostic
             // way any tool (Claude Code, vim, a shell PROMPT_COMMAND, …) names its tab. Fall back to
             // the running command when the title is just tmux's default (== the host name), so an
@@ -513,11 +555,6 @@ impl Inner {
                 ReplyKind::Ignore,
             );
             g.refresh_now();
-            let session = g.session.clone();
-            g.send(
-                format!("capture-pane -p -e -q -J -N -S -{} -t {}", MAX_HISTORY, session),
-                ReplyKind::Capture { window: None },
-            );
         }
         // fast-path ready shortly after attach (topology reply has landed)
         let inner2 = inner.clone();
@@ -554,7 +591,7 @@ impl Inner {
     /// active window. Buffer until ready; an unaddressed item also waits for topology.
     fn write_input(&mut self, data: &str, target: Option<String>) {
         match target.clone().or_else(|| self.reg.active_window.clone()) {
-            Some(t) if self.ready => {
+            Some(t) if self.ready && !self.pending_captures.contains(&t) => {
                 for line in encode_send_keys(data, &t) { self.send(line, ReplyKind::Ignore); }
             }
             _ => {
@@ -573,38 +610,120 @@ impl Inner {
         let queued = std::mem::take(&mut self.pending_input);
         crate::dlog!("flush_pending_input: {} chunks active={:?}", queued.len(), active);
         for (data, explicit) in queued {
-            if let Some(target) = explicit.or_else(|| active.clone()) {
+            let target = explicit.clone().or_else(|| active.clone());
+            if let Some(target) = target.filter(|t| !self.pending_captures.contains(t)) {
                 for line in encode_send_keys(&data, &target) {
                     self.send(line, ReplyKind::Ignore);
                 }
             } else {
-                // Topology is still unknown. Keep only the entries that genuinely need it; an
-                // explicitly addressed item above can already be delivered as soon as ready.
-                self.pending_input.push((data, None));
+                // Topology may still be unknown, or this window's capture/cursor transaction may
+                // still be pending. Preserve the original addressing until it becomes sendable.
+                self.pending_input.push((data, explicit));
             }
         }
     }
 
-    fn paint_capture(inner: &Arc<Mutex<Inner>>, window: Option<String>, body: Vec<String>) {
-        let mut b = body;
-        while b.last().map(|l| l.is_empty()).unwrap_or(false) {
-            b.pop();
-        }
+    fn finish_capture(&mut self, window: &str) {
+        self.pending_captures.remove(window);
+        self.flush_pending_input();
+    }
+
+    /// `capture-pane` does not include the pane's cursor position. Query it immediately after the
+    /// capture and carry the captured rows in the reply tag so the two FIFO replies stay paired.
+    fn request_capture_cursor(
+        inner: &Arc<Mutex<Inner>>,
+        window: Option<String>,
+        body: Vec<String>,
+    ) {
         let mut g = inner.lock().unwrap();
-        g.flush_output();   // paint scrollback AFTER any buffered live output, never before
         let target = window.or_else(|| g.reg.active_window.clone());
         if let Some(t) = target {
-            if !b.is_empty() {
-                // Capture body lines are LATIN1 (like %output); a whole capture line's bytes are
-                // contiguous, so decode each line latin1 -> UTF-8 (no cross-line carry needed).
-                let joined = b.join("\r\n");
-                let bytes: Vec<u8> = joined.chars().map(|c| c as u8).collect();
-                let (text, _tail) = decode_utf8_prefix(&bytes);
-                let data = format!("\x1b[H\x1b[2J{}\r\n", text);
-                g.emit(BackendEvent::Data { window: t, data });
-            }
+            g.send(
+                format!("display-message -p -t {} '#{{cursor_x}} #{{cursor_y}}'", t),
+                ReplyKind::CaptureCursor { window: t, body },
+            );
         }
     }
+
+    fn paint_capture(
+        inner: &Arc<Mutex<Inner>>,
+        window: String,
+        body: Vec<String>,
+        cursor_x: usize,
+        cursor_y: usize,
+    ) {
+        let data = capture_repaint(&body, cursor_x, cursor_y);
+        let mut g = inner.lock().unwrap();
+        g.flush_output();   // paint scrollback AFTER any buffered live output, never before
+        g.emit(BackendEvent::Data { window: window.clone(), data });
+        // The repaint event is emitted before buffered input reaches tmux, so its later echo is
+        // ordered after the restored screen/cursor in the frontend.
+        g.finish_capture(&window);
+    }
+}
+
+#[derive(Default)]
+struct TmuxTitleFilter {
+    state: TitleFilterState,
+}
+
+#[derive(Default)]
+enum TitleFilterState {
+    #[default]
+    Normal,
+    SawEsc,
+    InTitle,
+    InTitleSawEsc,
+}
+
+impl TmuxTitleFilter {
+    /// Remove tmux/screen's `ESC k title ESC \\` (or BEL-terminated) title sequence while
+    /// preserving every other byte exactly. State is retained so any byte boundary is safe.
+    fn push(&mut self, input: &[u8]) -> Vec<u8> {
+        use TitleFilterState::*;
+        let mut out = Vec::with_capacity(input.len());
+        for &byte in input {
+            self.state = match self.state {
+                Normal if byte == 0x1b => SawEsc,
+                Normal => { out.push(byte); Normal }
+                SawEsc if byte == b'k' => InTitle,
+                SawEsc if byte == 0x1b => { out.push(0x1b); SawEsc }
+                SawEsc => { out.extend_from_slice(&[0x1b, byte]); Normal }
+                InTitle if byte == 0x07 => Normal,
+                InTitle if byte == 0x1b => InTitleSawEsc,
+                InTitle => InTitle,
+                InTitleSawEsc if byte == b'\\' => Normal,
+                InTitleSawEsc if byte == 0x1b => InTitleSawEsc,
+                InTitleSawEsc => InTitle,
+            };
+        }
+        out
+    }
+}
+
+/// Decode tmux's `display-message '#{cursor_x} #{cursor_y}'` reply.
+fn parse_cursor_position(body: &[String]) -> Option<(usize, usize)> {
+    let mut fields = body.first()?.split_whitespace();
+    let x = fields.next()?.parse().ok()?;
+    let y = fields.next()?.parse().ok()?;
+    if fields.next().is_some() { return None; }
+    Some((x, y))
+}
+
+/// Repaint a tmux capture and finish at tmux's real cursor instead of after the final text row.
+/// Trailing blank screen rows are significant and deliberately preserved.
+fn capture_repaint(body: &[String], cursor_x: usize, cursor_y: usize) -> String {
+    // Capture body lines are LATIN1 (like %output); a whole capture line's bytes are contiguous, so
+    // decode each line latin1 -> UTF-8 (no cross-line carry needed).
+    let joined = body.join("\r\n");
+    let bytes: Vec<u8> = joined.chars().map(|c| c as u8).collect();
+    let (text, _tail) = decode_utf8_prefix(&bytes);
+    format!(
+        "\x1b[H\x1b[2J{}\x1b[{};{}H",
+        text,
+        cursor_y.saturating_add(1),
+        cursor_x.saturating_add(1),
+    )
 }
 
 // "@win %pane paneActive winActive name"
@@ -737,8 +856,10 @@ mod tests {
             ready: false,
             attached: false,
             pending_input: Vec::new(),
+            pending_captures: std::collections::BTreeSet::new(),
             pending_output: std::collections::BTreeMap::new(),
             utf8_carry: std::collections::BTreeMap::new(),
+            title_filters: std::collections::BTreeMap::new(),
             out_buf: std::collections::BTreeMap::new(),
             refresh_queued: false,
             stopped: false,
@@ -823,6 +944,92 @@ mod tests {
         assert!(commands.contains("send-keys -t @7 -l \"query reply\""),
             "buffer retained explicit target: {commands}");
         assert!(inner.lock().unwrap().pending_input.is_empty());
+    }
+
+    #[test]
+    fn tc_cb_capture_repaint_restores_tmux_cursor_without_extra_line() {
+        // Codex commonly keeps its input cursor above a footer. The capture's final text row is
+        // therefore not a usable cursor proxy, and the old synthetic trailing CRLF was one row
+        // worse again. tmux coordinates are zero-based; CSI H is one-based.
+        let data = capture_repaint(
+            &["history".into(), "> prompt".into(), "footer".into(), "".into()],
+            2,
+            1,
+        );
+        assert_eq!(
+            data,
+            "\x1b[H\x1b[2Jhistory\r\n> prompt\r\nfooter\r\n\x1b[2;3H"
+        );
+        assert!(!data.ends_with("\r\n"), "repaint must finish at the reported cursor");
+    }
+
+    #[test]
+    fn tc_cb_capture_queues_cursor_query_with_original_rows() {
+        let (inner, sent) = test_inner();
+        assert_eq!(inner.lock().unwrap().reply.take(), Some(ReplyKind::Ignore));
+        let rows = vec!["input".to_string(), "status".to_string()];
+
+        Inner::request_capture_cursor(&inner, Some("@4".into()), rows.clone());
+        assert!(sent_str(&sent).contains(
+            "display-message -p -t @4 '#{cursor_x} #{cursor_y}'"
+        ));
+        assert_eq!(
+            inner.lock().unwrap().reply.take(),
+            Some(ReplyKind::CaptureCursor { window: "@4".into(), body: rows })
+        );
+    }
+
+    #[test]
+    fn tc_cb_parse_cursor_position_is_strict() {
+        assert_eq!(parse_cursor_position(&["2 37".into()]), Some((2, 37)));
+        assert_eq!(parse_cursor_position(&["2".into()]), None);
+        assert_eq!(parse_cursor_position(&["2 37 extra".into()]), None);
+        assert_eq!(parse_cursor_position(&["x 37".into()]), None);
+    }
+
+    #[test]
+    fn tc_cb_tmux_title_sequence_never_becomes_visible_text() {
+        // This is the exact burst zsh/tmux emitted after a physically typed Enter. xterm.js does
+        // not implement ESC-k and displayed its payload (`ls`) on the row before command output.
+        let input = b"\x1b[?1l\x1b>\x1b[?2004l\r\r\n\x1bkls\x1b\\";
+        let expected = b"\x1b[?1l\x1b>\x1b[?2004l\r\r\n";
+        for split in 0..=input.len() {
+            let mut filter = TmuxTitleFilter::default();
+            let mut output = filter.push(&input[..split]);
+            output.extend(filter.push(&input[split..]));
+            assert_eq!(output, expected, "split at byte {split}");
+        }
+    }
+
+    #[test]
+    fn tc_cb_tmux_title_filter_preserves_other_escapes_and_bel_terminator() {
+        let mut filter = TmuxTitleFilter::default();
+        let mut output = filter.push(b"a\x1b");
+        output.extend(filter.push(b"[31mred\x1bkhidden\x07z"));
+        assert_eq!(output, b"a\x1b[31mredz");
+    }
+
+    #[test]
+    fn tc_cb_input_waits_for_capture_repaint() {
+        let (inner, sent) = test_inner();
+        assert_eq!(inner.lock().unwrap().reply.take(), Some(ReplyKind::Ignore));
+        Inner::apply_topology(&inner, vec!["@0 %0 1 1 zsh".into()]);
+        Inner::mark_ready(&inner);
+        sent.lock().unwrap().clear();
+
+        {
+            let mut g = inner.lock().unwrap();
+            g.pending_captures.insert("@0".into());
+            g.write_input("echo AFTER_REPAINT\n", Some("@0".into()));
+            assert_eq!(g.pending_input.len(), 1, "input is held during capture");
+        }
+        assert!(!sent_str(&sent).contains("send-keys"), "nothing reaches tmux early");
+
+        inner.lock().unwrap().finish_capture("@0");
+        assert!(inner.lock().unwrap().pending_input.is_empty());
+        let commands = sent_str(&sent);
+        assert!(commands.contains("send-keys -t @0 -l \"echo AFTER_REPAINT\""));
+        assert!(commands.contains("send-keys -t @0 Enter"));
     }
 
     #[test]

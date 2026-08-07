@@ -55,12 +55,11 @@ impl ControlModeParser {
 
     fn line(&mut self, raw: &str, out: &mut Vec<ControlEvent>) {
         let line = strip_markers(raw);
-        if line.is_empty() {
-            return;
-        }
 
-        // Inside a reply block: everything until %end/%error is verbatim body (even lines that
-        // start with '%', e.g. a display-message reply "%34").
+        // Inside a reply block: everything until %end/%error is verbatim body — including empty
+        // capture rows and lines that start with '%' (e.g. a display-message reply "%34"). This
+        // check must precede the empty-line fast path below or reconnect backfill collapses a TUI's
+        // vertical layout and leaves its displayed cursor/content out of alignment.
         if let Some(reply) = self.in_reply.as_mut() {
             if line == "%end" || line.starts_with("%end ") || line == "%error" || line.starts_with("%error ") {
                 let ok = line.starts_with("%end");
@@ -69,6 +68,10 @@ impl ControlModeParser {
                 return;
             }
             reply.lines.push(line.to_string());
+            return;
+        }
+
+        if line.is_empty() {
             return;
         }
 
@@ -240,10 +243,13 @@ mod tests {
 
     #[test]
     fn tc_cm_reply_body_verbatim() {
-        // a display-message reply whose body line starts with '%' must be body, not a control line
-        let ev = collect(&["%begin 1 42 0\r\n", "%34\r\n", "%end 1 42 0\r\n"]);
+        // A display-message reply whose body line starts with '%' must be body, not a control line;
+        // an empty capture row is equally significant and must survive too.
+        let ev = collect(&["%begin 1 42 0\r\n", "%34\r\n", "\r\n", "%end 1 42 0\r\n"]);
         let reply = ev.iter().find(|e| matches!(e, ControlEvent::Reply { .. })).unwrap();
-        assert_eq!(reply, &ControlEvent::Reply { cmd: "42".into(), ok: true, body: vec!["%34".into()] });
+        assert_eq!(reply, &ControlEvent::Reply {
+            cmd: "42".into(), ok: true, body: vec!["%34".into(), "".into()]
+        });
     }
 
     #[test]

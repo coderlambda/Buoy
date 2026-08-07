@@ -526,6 +526,13 @@ parser, window registry, reconnect supervisor, session store) is shared verbatim
   **`window-size latest`** so the window tracks the newest client — **not** `-x/-y`, which
   are inert on attach (§5.1). So: **fit the container → spawn the pty at that size**; do not
   rely on the launch command's flags to size the window.
+- Control-mode backfill follows the same rule: **fit xterm → resize tmux → capture cells + cursor →
+  repaint → release buffered input**. The backend does not capture at its provisional attach size.
+  This keeps the shell prompt and its cursor on the same row when the first command is echoed.
+- `create_session(id)` is a replacement operation when that id is already live. This matters in
+  `tauri dev`, where a frontend hot reload keeps Rust `AppState` alive but initializes the renderer
+  again: the old backend must be closed before its replacement starts, or two reconnect supervisors
+  detach each other and duplicate terminal output.
 - Do **not** key a corrective resize off "first `onData`": the first bytes from a fresh et
   are typically the ssh/et connection banner or et's stdout diagnostics (§5.1), **not**
   tmux's redraw, so resizing then can fire before tmux attaches. If a post-attach corrective
@@ -855,6 +862,9 @@ unit-tested collaborators, so the coordinator holds little state and each rule i
   - **Output is TAGGED with its window.** `%output %P` -> look up `P`'s window in the registry
     and emit `{window, pane, data}`. If `P` isn't mapped yet (output can race ahead of the
     listing on a brand-new window), buffer BY PANE and flush on the next reconcile — never guess.
+    Filter tmux/screen's `ESC k title ESC \\` protocol as a per-pane byte stream before emitting:
+    xterm.js does not implement that title sequence and otherwise renders its payload as a phantom
+    command line after Enter. The filter retains state across `%output` chunk boundaries.
   - **Input & capture address a WINDOW, not a pane.** `send-keys -t @win` / `capture-pane -t @win`
     (tmux resolves the window's active pane). Verified on the host. This removed the async
     "query the pane id first" step whose gap let keystrokes land in the previously-active window.
@@ -867,7 +877,8 @@ unit-tested collaborators, so the coordinator holds little state and each rule i
     the old one" bug. Positional correlation binds each capture reply to the exact window it was
     requested for, empty or not.
   - resize -> `refresh-client -C <cols>x<rows>` (verified on 3.5a).
-  - **Input gating lives ONLY in the backend.** It buffers input until ready (attach settled, fast
+  - **Input gating lives ONLY in the backend.** It buffers input until ready and while the target
+    window's capture/cursor repaint transaction is pending (attach settled, fast
     path 500ms after `%session-changed`; spawn-time fallback guarantees ready even if that signal
     never arrives), then replays in order. The renderer forwards keystrokes unconditionally and
     keeps `inputReady` purely as a status-line flag — no second buffer/timer (that duplication was

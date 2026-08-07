@@ -8,6 +8,8 @@
     "gui-rename": "electron test/gui-rename.js",
     "gui-reorder": "electron test/gui-reorder.js",
     "gui-notifications": "electron test/gui-notifications.js",
+    "gui-new-session": "electron test/gui-new-session.js",
+    "gui-terminal-repaint": "electron test/gui-terminal-repaint.js",
     "tauri": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo tauri",
     "tauri:dev": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo tauri dev",
     "tauri:build": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo tauri build",

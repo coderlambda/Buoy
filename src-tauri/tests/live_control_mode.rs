@@ -163,7 +163,9 @@ fn live_reattach_existing_session() {
     let b2 = ControlBackend::spawn(cfg(), sink(rec2.clone()), 90, 30).expect("spawn 2");
     for _ in 0..40 { if rec2.lock().unwrap().ready { break; } sleep_ms(250); }
     assert!(rec2.lock().unwrap().ready, "reconnect ready");
-    sleep_ms(2000);          // let attach capture back-fill the active window
+    let win = rec2.lock().unwrap().windows.first().cloned().expect("reattached window");
+    b2.capture_window(&win); // renderer-owned, post-fit backfill
+    sleep_ms(2000);
     {
         let r = rec2.lock().unwrap();
         let all: String = r.by_window.values().cloned().collect::<Vec<_>>().join("\n");
