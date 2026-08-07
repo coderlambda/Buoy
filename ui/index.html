@@ -45,8 +45,9 @@
     .dot.closed { background:#6c7086; }
     /* Keep session state indicators in one narrow left column: connection first, unread beneath.
        The column retains the old connection-dot top alignment without consuming title width. */
-    .session .status-dots { width:8px; flex:none; display:flex; flex-direction:column;
-      align-items:center; gap:5px; margin-top:4px; }
+    .session .status-dots { width:8px; flex:none; display:grid; grid-template-columns:8px;
+      grid-auto-flow:row; grid-auto-rows:8px; justify-items:center; align-items:center;
+      row-gap:5px; margin-top:4px; }
     .session .status-dots .dot { margin-top:0; }
     /* Agent/program notification: one intentionally detail-free unread dot. The session copy is a
        rollup of its tabs; both use the same visual language. */

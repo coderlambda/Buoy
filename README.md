@@ -28,6 +28,8 @@ survives in git history and on `main`), and `TEST_PLAN.md` for the test matrix.
 - **Persistence** (`src-tauri/src/session_store.rs`): disk-backed, re-validated on load.
 - **Clickable paths and URLs** in terminal output: remote file preview/download (§16–17),
   and loopback URLs open through a sticky `ssh -L` tunnel that survives reconnects (§18).
+- **Agent notification dots** on the emitting tab and its session. Codex works through its terminal
+  bell fallback; Claude Code gets a Buoy-scoped OSC 777 launcher without changing global settings.
 - The app augments PATH (`/opt/homebrew/bin`, etc.) so `tmux` is found even when the app
   is launched from Finder; a missing binary surfaces a clear error, not a silent failure.
 
@@ -47,9 +49,9 @@ still works, as a plain non-persistent pty). **Remote** sessions need `ssh` acce
 ## Test
 
 ```bash
-npm run tauri:test     # Rust unit tests (122): validation, supervisor state machine,
+npm run tauri:test     # Rust unit tests (125): validation, supervisor state machine,
                        # persistence, control-mode parser + reply routing, window registry,
-                       # tunnels/sticky ports, local pty backend
+                       # tunnels/sticky ports, local pty backend, Claude launcher integration
 npm test               # JS unit tests for the ui/ frontend modules (clipboard, file
                        # viewer, link plugins)
 npm run gui-rename     # full-GUI inline-rename suite (real ui/ in a real browser)

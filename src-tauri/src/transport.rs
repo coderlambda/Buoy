@@ -6,7 +6,7 @@
 //! control-mode parser, the same supervisor, the same reattach-by-socket behavior (DESIGN.md §5.3b)
 //! — instead of a parallel implementation that would drift.
 //!
-//! Remote: `ssh -tt [-p port] <opts> -- host env LC_ALL=C.UTF-8 tmux -L sock new-session -A -s name`
+//! Remote: `ssh -tt [-p port] <opts> -- host <base64 bootstrap + exec tmux>`
 //! Local:  `tmux -L sock new-session -A -s name`, with the environment set on the child directly.
 
 use crate::validation::{
@@ -79,13 +79,21 @@ pub fn spawn_spec(
             })
         }
         Transport::Local => {
-            let args = if control {
+            let mut args = if control {
                 build_local_control_mode_args(session, tmux_path, socket)?
             } else {
                 build_local_tmux_args(session, tmux_path, socket)?
             };
+            let path = crate::claude_integration::path_with_local_shim(&crate::augmented_path());
+            // A tmux server keeps a global environment across client reconnects. Update it after
+            // every attach so tabs opened after a Buoy upgrade also inherit the launcher PATH.
+            args.extend([
+                ";".into(), "set-environment".into(), "-g".into(), "PATH".into(), path.clone(),
+                ";".into(), "set-environment".into(), "-g".into(), "BUOY_TERMINAL".into(), "1".into(),
+            ]);
             let mut env: Vec<(String, String)> = vec![
-                ("PATH".into(), crate::augmented_path()),
+                ("PATH".into(), path),
+                ("BUOY_TERMINAL".into(), "1".into()),
                 // The tmux CLIENT draws into our pty (plain mode) and the SERVER hands TERM to the
                 // shells it starts. portable_pty does not reliably inherit TERM, and an unset TERM
                 // leaves the shell thinking it's dumb: no colors, broken full-screen editors.
@@ -108,6 +116,15 @@ pub fn current_locale() -> (Option<String>, Option<String>) {
 mod tests {
     use super::*;
 
+    fn remote_script(args: &[String]) -> String {
+        let dd = args.iter().position(|a| a == "--").unwrap();
+        let command = &args[dd + 2];
+        let encoded = command
+            .strip_prefix("echo ").unwrap()
+            .strip_suffix(" | base64 -d | /bin/sh").unwrap();
+        String::from_utf8(crate::validation::base64_decode(encoded).unwrap()).unwrap()
+    }
+
     // TC-T1 remote control mode is unchanged by the local refactor: still ssh, still -tt, still the
     // env LC_ALL prefix and -CC before -L. This is the regression guard for the shared path.
     #[test]
@@ -116,7 +133,10 @@ mod tests {
         assert_eq!(s.program, "ssh");
         assert_eq!(s.args[0], "-tt");
         let dd = s.args.iter().position(|a| a == "--").unwrap();
-        assert_eq!(&s.args[dd + 1..dd + 6], &["me@h", "env", "LC_ALL=C.UTF-8", "/t", "-CC"]);
+        assert_eq!(s.args[dd + 1], "me@h");
+        let script = remote_script(&s.args);
+        assert!(script.contains("LC_ALL=C.UTF-8"));
+        assert!(script.contains("exec /t -CC -L dtcc3-7"));
         // ssh options are present
         assert!(s.args.windows(2).any(|w| w == ["-o", "ConnectTimeout=8"]));
         // the app's locale must NOT leak into the remote child's env (the remote gets its LC_ALL via
@@ -132,12 +152,19 @@ mod tests {
         assert_eq!(s.program, "/opt/homebrew/bin/tmux");
         assert_eq!(s.args, [
             "-CC", "-L", "dtcc3-6-dt-x", "new-session", "-D", "-A", "-s", "dt-x", ";",
-            "set-option", "-g", "focus-events", "on",
+            "set-option", "-g", "focus-events", "on", ";", "set-environment", "-g", "PATH",
+            &crate::claude_integration::path_with_local_shim(&crate::augmented_path()), ";",
+            "set-environment", "-g", "BUOY_TERMINAL", "1",
         ]);
         assert!(!s.args.iter().any(|a| a.contains("ssh") || a == "-tt" || a == "--"),
             "no ssh scaffolding: {:?}", s.args);
         // TERM is always set; LC_ALL is not, because the environment is already UTF-8
         assert!(s.env.iter().any(|(k, v)| k == "TERM" && v == "xterm-256color"));
+        assert!(s.env.iter().any(|(k, v)| k == "BUOY_TERMINAL" && v == "1"));
+        assert!(s.env.iter().any(|(k, v)| {
+            k == "PATH" && v.split(':').next() == crate::claude_integration::local_shim_dir().ok()
+                .as_deref().and_then(|p| p.to_str())
+        }));
         assert!(!s.env.iter().any(|(k, _)| k == "LC_ALL"), "UTF-8 locale left alone: {:?}", s.env);
     }
 
@@ -148,7 +175,9 @@ mod tests {
         assert_eq!(s.program, "tmux");
         assert_eq!(s.args, [
             "-L", "dtapp3-6", "new-session", "-A", "-s", "dt-x", ";", "set-option", "-g",
-            "focus-events", "on",
+            "focus-events", "on", ";", "set-environment", "-g", "PATH",
+            &crate::claude_integration::path_with_local_shim(&crate::augmented_path()), ";",
+            "set-environment", "-g", "BUOY_TERMINAL", "1",
         ]);
         // no locale at all -> force C.UTF-8, or tmux mangles every non-ASCII byte to '_'
         assert!(s.env.iter().any(|(k, v)| k == "LC_ALL" && v == "C.UTF-8"), "{:?}", s.env);

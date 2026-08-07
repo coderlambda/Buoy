@@ -21,6 +21,7 @@ pub mod html_preview;
 pub mod supervisor;
 pub mod tunnel;
 pub mod host_history;
+pub mod claude_integration;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -327,6 +328,13 @@ fn create_session(app: AppHandle, state: State<AppState>, meta: CreateArgs) -> R
     // timeout). `local_tmux` is None when this machine has no tmux at all — the one case that falls
     // back to a bare pty with no durability.
     let is_local = meta.kind.as_deref() == Some("local");
+    if is_local {
+        if let Err(error) = claude_integration::ensure_local_shim() {
+            // Notification integration is an enhancement, not a prerequisite for opening a shell.
+            // Keep the session usable on a read-only or unusually configured home directory.
+            dlog!("create_session: could not install Claude notification shim: {}", error);
+        }
+    }
     let mut local_tmux: Option<(String, Option<(u32, u32)>)> = None;
     let cache_proven = meta.tmux_path.is_some()
         && state.store.load().iter().any(|s| s.id == id && s.attach_ok);

@@ -187,15 +187,26 @@ fn host_token(parts: &HostParts) -> String {
     }
 }
 
-/// Build ssh argv for a session (mirrors buildSshArgs):
-///   ssh -tt [-p port] [baseArgs] -- <user@host> <tmuxPath> -L <socket>
-///     new-session -A -s <name> \; set-option -g focus-events on
+/// Build ssh argv for a session. The remote command is base64-wrapped because it now provisions
+/// Buoy's Claude launcher before exec'ing tmux; renderer-controlled values are still validated
+/// against narrow character sets before they are interpolated into that script.
 pub fn build_ssh_args(
     raw_host: &str,
     raw_session: &str,
     base_args: &[String],
     tmux_path: &str,
     socket: &str,
+) -> Result<Vec<String>> {
+    build_tmux_ssh_args(raw_host, raw_session, base_args, tmux_path, socket, false)
+}
+
+fn build_tmux_ssh_args(
+    raw_host: &str,
+    raw_session: &str,
+    base_args: &[String],
+    tmux_path: &str,
+    socket: &str,
+    control: bool,
 ) -> Result<Vec<String>> {
     let session = validate_session(raw_session)?;
     let parts = parse_host(raw_host)?;
@@ -214,31 +225,9 @@ pub fn build_ssh_args(
     args.extend(base_args.iter().cloned());
     args.push("--".into());
     args.push(host_token(&parts));
-    // Force a UTF-8 locale for the remote tmux. Many dev hosts log in with LANG unset / LC_CTYPE=C,
-    // and tmux only enables UTF-8 when its OWN process locale is UTF-8 — otherwise it replaces every
-    // non-ASCII byte with '_' EVERYWHERE it stores text (pane titles, window names, options). That
-    // turned agent tab titles like "✳ task" into "_ task". `env LC_ALL=C.UTF-8` sets it for the
-    // server fork; it only affects NEWLY-created servers (existing ones must be recreated).
-    args.extend([
-        "env".into(),
-        "LC_ALL=C.UTF-8".into(),
-        tmux_path.to_string(),
-        "-L".into(),
-        socket.to_string(),
-        "new-session".into(),
-        "-A".into(),
-        "-s".into(),
-        session,
-        // OpenSSH joins the remote-command argv into a shell command. Escape the separator once so
-        // the login shell passes a literal `;` argument to tmux instead of running `set-option` as
-        // an unrelated shell command. Focus events let terminal apps (including Codex) distinguish
-        // a visible pane from a background one without requiring per-app configuration.
-        "\\;".into(),
-        "set-option".into(),
-        "-g".into(),
-        "focus-events".into(),
-        "on".into(),
-    ]);
+    let script = crate::claude_integration::remote_tmux_script(tmux_path, socket, &session, control);
+    let remote = format!("echo {} | base64 -d | /bin/sh", base64_encode(script.as_bytes()));
+    args.push(remote);
     Ok(args)
 }
 
@@ -318,17 +307,7 @@ pub fn build_control_mode_ssh_args(
     tmux_path: &str,
     socket: &str,
 ) -> Result<Vec<String>> {
-    let mut args = build_ssh_args(raw_host, raw_session, base_args, tmux_path, socket)?;
-    // args = [... "--", host, env, LC_ALL=…, tmux, "-L", sock, "new-session", "-A", "-s", name].
-    // -CC goes right after the tmux binary (i.e. immediately before its "-L" flag), independent of
-    // any env-prefix tokens before the binary.
-    if let Some(l) = args.iter().position(|a| a == "-L") {
-        args.insert(l, "-CC".into());
-    }
-    if let Some(ns) = args.iter().position(|a| a == "new-session") {
-        args.insert(ns + 1, "-D".into());
-    }
-    Ok(args)
+    build_tmux_ssh_args(raw_host, raw_session, base_args, tmux_path, socket, true)
 }
 
 /// Build ssh argv to KILL a remote tmux session (mirrors buildKillArgs): base64-wrapped so the
@@ -418,6 +397,15 @@ pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
+    fn remote_script(args: &[String]) -> String {
+        let dd = args.iter().position(|x| x == "--").unwrap();
+        let command = &args[dd + 2];
+        let encoded = command
+            .strip_prefix("echo ").unwrap()
+            .strip_suffix(" | base64 -d | /bin/sh").unwrap();
+        String::from_utf8(base64_decode(encoded).unwrap()).unwrap()
+    }
+
     #[test]
     fn tc_v_session_charset() {
         assert!(validate_session("dev").is_ok());
@@ -454,11 +442,14 @@ mod tests {
     fn tc_v_build_ssh_args() {
         let a = build_ssh_args("me@h", "dev", &[], ".local/bin/tmux", "dtapp3-7").unwrap();
         let dd = a.iter().position(|x| x == "--").unwrap();
-        // remote command is prefixed with `env LC_ALL=C.UTF-8` so the tmux server is UTF-8.
-        assert_eq!(&a[dd + 1..], &[
-            "me@h", "env", "LC_ALL=C.UTF-8", ".local/bin/tmux", "-L", "dtapp3-7",
-            "new-session", "-A", "-s", "dev", "\\;", "set-option", "-g", "focus-events", "on"
-        ]);
+        assert_eq!(a[dd + 1], "me@h");
+        assert_eq!(a.len(), dd + 3, "one safely wrapped remote command follows the host");
+        let script = remote_script(&a);
+        assert!(script.contains("LC_ALL=C.UTF-8"));
+        assert!(script.contains("PATH=\"$buoy_bin:$PATH\""));
+        assert!(script.contains(
+            "exec .local/bin/tmux -L dtapp3-7 new-session -A -s dev \\; set-option -g focus-events on"
+        ));
         assert!(build_ssh_args("me@h", "a;b", &[], "tmux", "s").is_err());
     }
 
@@ -466,16 +457,11 @@ mod tests {
     fn tc_v_build_control_mode_args() {
         let a = build_control_mode_ssh_args("me@h", "dev", &[], "/t", "dtcc3-7").unwrap();
         let dd = a.iter().position(|x| x == "--").unwrap();
-        // env-prefixed, tmux binary, then -CC right before its -L flag.
-        assert_eq!(&a[dd + 1..dd + 6], &["me@h", "env", "LC_ALL=C.UTF-8", "/t", "-CC"]);
-        assert_eq!(a[dd + 6], "-L");
-        // new-session -D -A -s dev, then enable the focus reports Codex uses for its default
-        // unfocused-only terminal notifications.
-        let ns = a.iter().position(|s| s == "new-session").unwrap();
-        assert_eq!(&a[ns..], &[
-            "new-session", "-D", "-A", "-s", "dev", "\\;", "set-option", "-g",
-            "focus-events", "on",
-        ]);
+        assert_eq!(a[dd + 1], "me@h");
+        let script = remote_script(&a);
+        assert!(script.contains("exec /t -CC -L dtcc3-7 new-session -D -A -s dev"));
+        assert!(script.contains("set-option -g focus-events on"));
+        assert!(script.contains("set-environment -g BUOY_TERMINAL 1"));
     }
 
     // TC-V-L1 local tmux argv: no ssh, no host, no `--`/env prefix — just the tmux flags.

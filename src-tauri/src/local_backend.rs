@@ -74,7 +74,8 @@ impl LocalBackend {
         // TERM must be set explicitly: portable_pty does NOT inherit it reliably, and an unset TERM
         // leaves xterm.js talking to a shell that thinks it's dumb (no colors, broken editors).
         cmd.env("TERM", "xterm-256color");
-        cmd.env("PATH", crate::augmented_path());
+        cmd.env("PATH", crate::claude_integration::path_with_local_shim(&crate::augmented_path()));
+        cmd.env("BUOY_TERMINAL", "1");
         if let Some(dir) = &cwd { cmd.cwd(dir); }
 
         let child = pair.slave.spawn_command(cmd)

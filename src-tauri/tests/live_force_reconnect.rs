@@ -18,21 +18,22 @@ use buoy_lib::supervisor::{real_backend_factory, State, StateSink, Supervisor, S
 
 fn sleep_ms(ms: u64) { thread::sleep(Duration::from_millis(ms)); }
 
-// Write a fake `ssh` that ignores all ssh transport args and execs the LOCAL tmux found in the
-// argv (the backend runs `ssh <opts> -- <host> env LC_ALL=.. tmux -CC -L sock new-session ...`).
-// This lets the real ControlBackend attach a local tmux with no sshd. Returns the script path.
-fn write_fake_ssh(tmux: &str) -> std::path::PathBuf {
+// Write a fake `ssh` that ignores the transport options and runs Buoy's wrapped remote command
+// locally. This exercises both the bootstrap and the real ControlBackend without needing sshd.
+fn write_fake_ssh() -> std::path::PathBuf {
     let dir = std::env::temp_dir();
     let path = dir.join("buoy-fake-ssh-test");
     let script = format!(
         "#!/usr/bin/env python3\n\
-         import os, sys\n\
+         import base64, os, sys\n\
          argv = sys.argv[1:]\n\
-         idx = next((i for i,a in enumerate(argv) if a.endswith('tmux') or a=='tmux'), None)\n\
-         if idx is None:\n    sys.stderr.write('fake-ssh: no tmux in %r\\n' % argv); sys.exit(2)\n\
-         cmd = argv[idx:]\n\
-         cmd[0] = {tmux:?}\n\
-         os.execvp(cmd[0], cmd)\n");
+         idx = argv.index('--')\n\
+         remote = argv[idx + 2]\n\
+         prefix = 'echo '\n\
+         suffix = ' | base64 -d | /bin/sh'\n\
+         script = base64.b64decode(remote[len(prefix):-len(suffix)]).decode()\n\
+         script = script.replace('LC_ALL=C.UTF-8', 'LC_ALL=en_US.UTF-8') if sys.platform == 'darwin' else script\n\
+         os.execv('/bin/sh', ['/bin/sh', '-c', script])\n");
     std::fs::write(&path, script).expect("write fake-ssh");
     let mut perm = std::fs::metadata(&path).unwrap().permissions();
     use std::os::unix::fs::PermissionsExt;
@@ -46,7 +47,7 @@ fn write_fake_ssh(tmux: &str) -> std::path::PathBuf {
 fn force_reconnect_does_not_loop() {
     let tmux = std::env::var("DT_TMUX").unwrap_or_else(|_| "/opt/homebrew/bin/tmux".into());
     if !std::path::Path::new(&tmux).exists() { eprintln!("SKIP: no tmux at {tmux} (set DT_TMUX)"); return; }
-    let fake_ssh = write_fake_ssh(&tmux);
+    let fake_ssh = write_fake_ssh();
     std::env::set_var("BUOY_SSH_BIN", &fake_ssh);
     let session = "buoyLiveFR";
 

@@ -14,6 +14,7 @@ const check = (condition, message) => {
 };
 
 const UI = path.join(__dirname, '..', 'ui');
+const SCREENSHOT_DIR = process.env.BUOY_GUI_SCREENSHOT_DIR || '';
 
 function writeTestPage() {
   const html = fs.readFileSync(path.join(UI, 'index.html'), 'utf8');
@@ -38,6 +39,11 @@ app.whenReady().then(async () => {
   const js = (code) => wc.executeJavaScript(code);
   const fire = (event, payload) => js(
     `window.__fire(${JSON.stringify(event)}, ${JSON.stringify(payload)})`);
+  const snapshot = async (name) => {
+    if (!SCREENSHOT_DIR) return;
+    fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
+    fs.writeFileSync(path.join(SCREENSHOT_DIR, name), (await wc.capturePage()).toPNG());
+  };
 
   function dotState() {
     return js(`(() => ({
@@ -48,9 +54,14 @@ app.whenReady().then(async () => {
         const stack = row && row.querySelector('.status-dots');
         const notice = row && row.querySelector('.notification-dot');
         const connection = stack && stack.querySelector('.dot');
-        return !!(stack && notice && connection && notice.parentElement === stack
-          && stack.firstElementChild === connection
-          && notice.getBoundingClientRect().top >= connection.getBoundingClientRect().bottom);
+        if (!(stack && notice && connection && notice.parentElement === stack
+          && stack.firstElementChild === connection)) return false;
+        const noticeBox = notice.getBoundingClientRect();
+        const connectionBox = connection.getBoundingClientRect();
+        const noticeCenter = noticeBox.left + noticeBox.width / 2;
+        const connectionCenter = connectionBox.left + connectionBox.width / 2;
+        return Math.abs(noticeCenter - connectionCenter) <= 0.5
+          && noticeBox.top >= connectionBox.bottom + 4;
       })(),
       tabDots: Array.from(document.querySelectorAll('#tabs .tab:not(.plus)')).filter(
         (tab) => tab.querySelector('.notification-dot')).map(
@@ -106,6 +117,7 @@ app.whenReady().then(async () => {
     `TC-N2 completed OSC marks only agent + its session (got ${JSON.stringify(state)})`);
   check(state.sessionDotInStatusColumn,
     'TC-N2 session notification dot sits below the connection status dot');
+  await snapshot('osc-notifications-unread.png');
 
   // Ordinary rerenders cannot resurrect/lose state; then notify the other tab so aggregation has
   // two children but still one session dot.
@@ -119,11 +131,13 @@ app.whenReady().then(async () => {
   state = await dotState();
   check(state.sessionS1 === 1 && JSON.stringify(state.tabDots) === JSON.stringify(['shell']),
     `TC-N4 clicking agent clears only agent; shell keeps the session unread (got ${JSON.stringify(state)})`);
+  await snapshot('osc-notifications-partial-clear.png');
 
   check(await clickTab('shell'), 'TC-N5 could click the remaining notified shell tab');
   state = await dotState();
   check(state.sessionS1 === 0 && state.tabDots.length === 0,
     'TC-N5 clearing the last unread tab clears the session rollup');
+  await snapshot('osc-notifications-cleared.png');
 
   // Clicking an already-active tab must acknowledge it too (switchTab's same-window early return
   // used to make this gesture easy to miss).

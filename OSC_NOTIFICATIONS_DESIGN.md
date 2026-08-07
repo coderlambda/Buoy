@@ -41,6 +41,27 @@ Buoy enables tmux `focus-events` on every attach, so Codex receives the focus re
 xterm's `onBell` event then feeds the same unread state as OSC notifications. No `~/.codex` change
 or Codex-specific wrapper is required.
 
+Claude Code also defaults to an `auto` notification channel, but an unrecognized terminal receives
+no terminal notification. Buoy therefore installs an app-owned launcher at
+`$HOME/.cache/buoy/bin/claude` and puts that directory first on PATH inside Buoy sessions. The
+launcher passes `--settings '{"preferredNotifChannel":"ghostty"}'` to interactive Claude Code,
+which selects its OSC 777 output without claiming that Buoy is Ghostty globally.
+
+The launcher is deliberately scoped and conservative:
+
+- it is active only when `BUOY_TERMINAL=1` is inherited from a Buoy shell;
+- it delegates to the real `claude` executable found later on PATH;
+- an existing `preferredNotifChannel` in user or project settings wins;
+- explicit `--settings`, `--safe-mode`, `--bare`, print, help, and version invocations pass through;
+- `BUOY_CLAUDE_NOTIFICATIONS_DISABLED=1` is an environment-level opt-out;
+- Buoy never edits `~/.claude/settings.json`.
+
+Local sessions install the launcher before spawning the shell. Every SSH attach transfers the same
+small launcher through the existing connection, then records PATH and `BUOY_TERMINAL` in tmux's
+global environment for subsequently created windows. A shell that was already running before this
+feature cannot have its process environment rewritten; open a new Buoy tab or recreate the session
+once after upgrading.
+
 ## 3. Why OSC parsing happens before xterm
 
 The backend already tags control-mode output with its authoritative tmux window ID. The renderer
@@ -144,6 +165,9 @@ not reuse this OSC dot as proof that a real agent issued a permission request.
 - `ui/terminalTab.js` forwards xterm's standalone BEL event.
 - `ui/renderer.js` owns per-tab unread state, session aggregation, and acknowledgement behavior.
 - `src-tauri/src/validation.rs` enables tmux focus events on every local/remote attach.
+- `src-tauri/src/claude_integration.rs` provisions the scoped Claude Code launcher locally and over
+  SSH while respecting explicit user configuration.
+- `src-tauri/src/transport.rs` exposes the launcher PATH and Buoy marker to local tmux windows.
 - `ui/index.html` owns the shared dot styling.
 - `test/plugins.test.js` covers protocol classification and arbitrary chunk boundaries.
 - `test/gui-notifications.js` covers the real renderer behavior and DOM rollup/clearing rules.
@@ -166,6 +190,8 @@ not reuse this OSC dot as proof that a real agent issued a permission request.
 | Plain/single-tab session card click | Its implicit tab is acknowledged |
 | Standalone BEL | Dot appears through xterm's bell event |
 | Codex default config, background pane | tmux forwards focus loss; Codex BEL creates a dot |
+| Claude Code default config in a new Buoy shell | Scoped launcher selects OSC 777; dot appears |
+| Claude Code with an explicit notification channel | Buoy defers to the user's choice |
 
 ## 10. Non-goals
 
