@@ -966,6 +966,17 @@ pub fn run() {
     let store = SessionStore::new(user_data_dir().join("sessions.json"));
     let config = load_config();
     tauri::Builder::default()
+        // This must stay first: two app processes restoring the same persisted tmux session would
+        // both use `new-session -D`, detach one another, and make both supervisors reconnect
+        // forever. A later launch exits here and brings the already-running Buoy window forward.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            dlog!("single-instance: focusing the existing main window");
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {

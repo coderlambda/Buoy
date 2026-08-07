@@ -533,6 +533,11 @@ parser, window registry, reconnect supervisor, session store) is shared verbatim
   `tauri dev`, where a frontend hot reload keeps Rust `AppState` alive but initializes the renderer
   again: the old backend must be closed before its replacement starts, or two reconnect supervisors
   detach each other and duplicate terminal output.
+- **Only one Buoy process may own persisted sessions.** A second app process restoring the same
+  session also launches tmux with `new-session -D`; each client then detaches the other and both
+  supervisors back off and reattach forever. The single-instance plugin is therefore registered
+  before every other Tauri plugin. A later launch asks the existing process to show, unminimize, and
+  focus its main window, then exits before it can create a backend.
 - Do **not** key a corrective resize off "first `onData`": the first bytes from a fresh et
   are typically the ssh/et connection banner or et's stdout diagnostics (§5.1), **not**
   tmux's redraw, so resizing then can fire before tmux attaches. If a post-attach corrective

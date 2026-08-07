@@ -3,7 +3,7 @@ name = "buoy"
 version = "0.1.0"
 description = "Buoy — durable remote terminal (ssh + tmux control mode) whose sessions resurface after network drops"
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.77.2"
 
 # The Tauri app is a library + a thin binary, per Tauri v2 convention.
 [lib]
@@ -15,6 +15,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }

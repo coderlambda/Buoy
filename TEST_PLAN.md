@@ -205,6 +205,9 @@ cd src-tauri && DT_LIVE_HOST=user@host cargo test --test <name> -- --ignored --n
 - **Tauri dev hot reload** — with `DT_DEBUG=1 npx --yes @tauri-apps/cli@2 dev`, reload the frontend
   twice and run `ls`; each reload logs one `replacing live backend`, leaves one tmux client, and the
   command/output are delivered once without a reconnect loop.
+- **Second app launch** — start the built Buoy binary, then launch that same binary again. The second
+  process exits promptly, the existing main window is focused, there remains one Buoy process and
+  one tmux control client per session, and the first process logs no detach/reconnect transition.
 - **live_reconnect / live_force_reconnect** — the supervisor reattaches the SAME session.
 - **live_remote_file / live_relative_path** — clicked-path preview + cwd resolution (§16–17).
 - **live_tunnel** — sticky `ssh -L` ports across a break (§18; see TC-LT above).
