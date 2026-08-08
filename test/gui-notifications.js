@@ -77,6 +77,29 @@ app.whenReady().then(async () => {
     return true;
   })()`);
 
+  const clickVisibleTerminal = () => js(`(() => {
+    const terminal = Array.from(document.querySelectorAll('#term .xterm')).find((node) => {
+      const rect = node.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    });
+    if (!terminal) return false;
+    terminal.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, button: 0 }));
+    return true;
+  })()`);
+
+  const keyInVisibleTerminal = () => js(`(() => {
+    const terminal = Array.from(document.querySelectorAll('#term .xterm')).find((node) => {
+      const rect = node.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    });
+    const target = terminal && (terminal.querySelector('textarea') || terminal);
+    if (!target) return false;
+    target.dispatchEvent(new KeyboardEvent('keydown', {
+      bubbles: true, cancelable: true, key: 'x', code: 'KeyX'
+    }));
+    return true;
+  })()`);
+
   await win.loadFile(page);
   await sleep(800);
 
@@ -105,6 +128,12 @@ app.whenReady().then(async () => {
       && String(args[1]).includes(']10;rgb:')),
     `TC-N1b OSC colour reply is addressed to its source tab (got ${JSON.stringify(colourReplies)})`);
 
+  // A notification from the terminal the user is already viewing is not unread work.
+  await fire('data', { id: 's1', window: '@0', data: '\u001b]9;Visible work finished\u0007' });
+  state = await dotState();
+  check(state.sessionS1 === 0 && state.tabDots.length === 0,
+    'TC-N1c a notification from the visible active tab is ignored');
+
   // Split OSC 777 across chunks: no dot before the terminator, then one on the emitting tab and
   // one rollup on its session.
   await fire('data', { id: 's1', window: '@1', data: '\u001b]777;notify;Agent;Needs input' });
@@ -119,9 +148,14 @@ app.whenReady().then(async () => {
     'TC-N2 session notification dot sits below the connection status dot');
   await snapshot('osc-notifications-unread.png');
 
-  // Ordinary rerenders cannot resurrect/lose state; then notify the other tab so aggregation has
-  // two children but still one session dot.
+  // A backend active-window report changes what is displayed but is not a user acknowledgement.
+  // After it reveals the unread agent tab, a notification from the now-background shell gives us
+  // two unread children but still one session dot.
   await fire('state', { id: 's1', state: 'connected' });
+  await fire('window', { id: 's1', action: 'active', window: '@1', order: ['@0', '@1'] });
+  state = await dotState();
+  check(state.sessionS1 === 1 && JSON.stringify(state.tabDots) === JSON.stringify(['agent']),
+    'TC-N3 backend-driven activation does not acknowledge the unread tab');
   await fire('data', { id: 's1', window: '@0', data: '\u001b]9;Shell done\u001b\\' });
   state = await dotState();
   check(state.sessionS1 === 1 && state.tabDots.length === 2,
@@ -139,16 +173,57 @@ app.whenReady().then(async () => {
     'TC-N5 clearing the last unread tab clears the session rollup');
   await snapshot('osc-notifications-cleared.png');
 
-  // Clicking an already-active tab must acknowledge it too (switchTab's same-window early return
-  // used to make this gesture easy to miss).
-  await fire('data', { id: 's1', window: '@0', data: '\u001b]99;;New work finished\u001b\\' });
-  state = await dotState();
-  check(state.sessionS1 === 1 && JSON.stringify(state.tabDots) === JSON.stringify(['shell']),
-    'TC-N6 a genuinely new OSC after clearing shows the dots again');
-  check(await clickTab('shell'), 'TC-N6 could click the already-active shell tab');
+  // New notifications from the active shell remain ignored, including OSC 99.
+  await fire('data', { id: 's1', window: '@0', data: '\u001b]99;;Visible work finished\u001b\\' });
   state = await dotState();
   check(state.sessionS1 === 0 && state.tabDots.length === 0,
-    'TC-N6 clicking the already-active notified tab clears it');
+    'TC-N6 a new notification from the active tab stays acknowledged');
+
+  // Make shell unread in the background, then let tmux report it active. That automatic report
+  // preserves the dot; clicking the already-visible tab header is the explicit acknowledgement.
+  await fire('window', { id: 's1', action: 'active', window: '@1', order: ['@0', '@1'] });
+  await fire('data', { id: 's1', window: '@0', data: '\u001b]99;;New work finished\u001b\\' });
+  await fire('window', { id: 's1', action: 'active', window: '@0', order: ['@0', '@1'] });
+  state = await dotState();
+  check(state.sessionS1 === 1 && JSON.stringify(state.tabDots) === JSON.stringify(['shell']),
+    'TC-N6b backend-driven activation preserves an existing shell dot');
+  check(await clickTab('shell'), 'TC-N6b could click the already-active shell tab');
+  state = await dotState();
+  check(state.sessionS1 === 0 && state.tabDots.length === 0,
+    'TC-N6b clicking the already-active notified tab clears it');
+
+  // Clicking in the terminal is also an acknowledgement, even when the click emits no pty bytes.
+  await fire('window', { id: 's1', action: 'active', window: '@1', order: ['@0', '@1'] });
+  await fire('data', { id: 's1', window: '@0', data: '\u001b]777;notify;Shell;Click me\u0007' });
+  await fire('window', { id: 's1', action: 'active', window: '@0', order: ['@0', '@1'] });
+  check(await clickVisibleTerminal(), 'TC-N6c could click the visible terminal');
+  state = await dotState();
+  check(state.sessionS1 === 0 && state.tabDots.length === 0,
+    'TC-N6c clicking inside the terminal clears its existing dot');
+
+  // Keyboard/paste input uses the same acknowledgement path.
+  await fire('window', { id: 's1', action: 'active', window: '@1', order: ['@0', '@1'] });
+  await fire('data', { id: 's1', window: '@0', data: '\u001b]9;Type to acknowledge\u0007' });
+  await fire('window', { id: 's1', action: 'active', window: '@0', order: ['@0', '@1'] });
+  await fire('data', { id: 's1', window: '@0', data: '\u001b]10;?\u0007' });
+  await sleep(100);
+  state = await dotState();
+  check(state.sessionS1 === 1 && JSON.stringify(state.tabDots) === JSON.stringify(['shell']),
+    'TC-N6d an active xterm protocol reply is not mistaken for user input');
+  check(await keyInVisibleTerminal(), 'TC-N6d could type in the visible terminal');
+  state = await dotState();
+  check(state.sessionS1 === 0 && state.tabDots.length === 0,
+    'TC-N6d input in the visible terminal clears its existing dot');
+
+  // The same rule applies to a mounted background xterm.
+  await fire('data', { id: 's1', window: '@1', data: '\u001b]9;Background work\u0007' });
+  await fire('data', { id: 's1', window: '@1', data: '\u001b]10;?\u0007' });
+  await sleep(100);
+  state = await dotState();
+  check(state.sessionS1 === 1 && JSON.stringify(state.tabDots) === JSON.stringify(['agent']),
+    'TC-N6e a background xterm protocol reply does not acknowledge its dot');
+  await clickTab('agent');
+  await clickTab('shell');
 
   // Kitty multipart/control semantics: d=0 waits, final body notifies, p=close does not.
   await fire('data', { id: 's1', window: '@1', data: '\u001b]99;i=x:d=0;p=title;Build\u001b\\' });

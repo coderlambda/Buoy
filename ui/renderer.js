@@ -177,6 +177,8 @@ function ensureTab(v, winId) {
     // A standalone terminal BEL is Codex's zero-config fallback when its auto notification backend
     // does not recognize the terminal. xterm consumes BEL, so receive it through term.onBell.
     onBell: () => markTabNotification(v, tab),
+    // Pointer, keyboard, and paste gestures inside the terminal explicitly acknowledge it.
+    onInteract: () => acknowledgeTerminalInteraction(v, tab),
   };
   const content = registry.createTabContent('terminal', { id: v.meta.id, meta: v.meta, linkProvider, linkHandler }, ctx);
   tab = {
@@ -223,6 +225,9 @@ function harvestOscNotifications(v, tab, data) {
 // the same per-tab ownership and acknowledgement behavior as OSC 9/99/777.
 function markTabNotification(v, tab) {
   if (!v || !tab || tab.unreadNotification) return;
+  // The visible tab already has the user's attention. Consume the event without manufacturing an
+  // unread state that can only be cleared by leaving and returning to the same tab.
+  if (v.meta.id === activeId && activeTab(v) === tab) return;
   tab.unreadNotification = true;
   renderSidebar();
   if (v.meta.id === activeId) renderTabs(v);
@@ -241,6 +246,13 @@ function clearTabNotification(v, tab) {
   renderSidebar();
   if (v.meta.id === activeId) renderTabs(v);
   return true;
+}
+
+// Terminal activity acknowledges only the terminal the user can currently see. xterm also emits
+// automatic protocol replies through onData, so terminalTab reports real DOM gestures separately.
+function acknowledgeTerminalInteraction(v, tab) {
+  if (!v || !tab || v.meta.id !== activeId || activeTab(v) !== tab) return false;
+  return clearTabNotification(v, tab);
 }
 
 // Open a file-viewer tab for a clicked path (§16). App-local tab (no tmux window): synthetic id,
@@ -1161,6 +1173,7 @@ function deliver(v, tab, data) {
 window.__testType = (s) => {
   if (activeId == null) return;
   const v = views.get(activeId);
+  acknowledgeTerminalInteraction(v, v && activeTab(v));
   api.input(activeId, s, v && v.activeWindow);
 };
 window.__testInputReady = () => { const v = views.get(activeId); return !!(v && v.inputReady); };

@@ -7,9 +7,10 @@
 Buoy surfaces terminal notification escape sequences and standalone BEL attention signals as
 unread dots:
 
-- the tmux-window tab that emitted the notification shows a dot;
+- a background tmux-window tab that emitted the notification shows a dot;
 - its containing session card shows one rollup dot;
-- clicking that exact tab clears its unread state;
+- notifications emitted by the currently visible tab are consumed without creating unread state;
+- clicking that tab or interacting with its terminal clears its unread state;
 - the session dot remains while any other tab in the session is unread;
 - after acknowledgement, ordinary output and UI rerenders do not restore the dot—a new,
   complete notification sequence is required.
@@ -145,16 +146,20 @@ Unread state is ephemeral renderer state; it is not persisted across app restart
 tab.unreadNotification = false
           |
           | complete OSC 9/99/777 notification or standalone BEL
+          | while the tab is not currently visible
           v
 tab.unreadNotification = true
           |
-          | user clicks that tab header
+          | user clicks that tab header or its visible terminal,
+          | or sends input to that terminal
           v
 tab.unreadNotification = false
 ```
 
 Repeated notifications while a tab is already unread keep the same boolean dot. Once the user
-clears it, a later complete notification moves it back to unread.
+clears it, a later complete notification received while the tab is in the background moves it back
+to unread. A notification from the active tab in the visible session is already in the user's
+attention context and is therefore ignored rather than immediately creating a dot.
 
 The session does not store a second mutable unread flag. Its value is derived every render:
 
@@ -167,15 +172,18 @@ automatically removes its contribution to the session rollup.
 
 ## 5. Acknowledgement semantics
 
-Acknowledgement is caused by an explicit user viewing gesture:
+Acknowledgement is caused by explicit user attention or terminal input:
 
 - Clicking a native tmux tab clears only that tab, including when it is already active.
+- Clicking or tapping inside the visible terminal clears that tab, even if the pointer gesture does
+  not send bytes to the pty.
+- Keyboard or paste input sent to the visible terminal clears that tab.
 - Clicking a session card does not clear native-tab notifications. It reveals the project, after
   which the user can choose the notified tab. This preserves notifications on other tabs.
 - Plain/local fallback sessions have one implicit tab and no visible tab strip. Clicking their
   session card acknowledges that sole tab so their dot cannot become impossible to clear.
-- Automatic restore, backend-driven active-window changes, incoming output, rename, reconnect,
-  and unrelated rerenders never acknowledge a notification.
+- Automatic restore, backend-driven active-window changes, incoming output, automatic terminal
+  protocol replies, rename, reconnect, and unrelated rerenders never acknowledge a notification.
 
 No timer clears unread state. A dot remains until its user acknowledgement or until the emitting
 tab/session is closed.
@@ -229,17 +237,22 @@ not reuse this OSC dot as proof that a real agent issued a permission request.
 | --- | --- |
 | Split OSC 777 before terminator | No dot until the terminator arrives |
 | Notification from background tmux window | Dot on that tab and its session |
+| Notification or standalone BEL from the visible active tab | No dot |
 | Two unread tabs | Two tab dots, one session dot |
 | Click one of two unread tabs | Clicked dot clears; session dot remains |
 | Click last unread tab | Tab and session dots clear |
 | Click already-active unread tab | Dot clears |
+| Click/tap inside an already-active unread terminal | Dot clears |
+| Type or paste in an already-active unread terminal | Dot clears |
+| Backend reports an unread tab active without user interaction | Dot remains |
+| Active or background xterm sends an automatic protocol reply | Its dot remains |
 | Plain output after acknowledgement | Dot stays cleared |
 | New notification after acknowledgement | Dot returns |
 | OSC 99 `d=0` fragment | No dot |
 | OSC 99 final title/body fragment | Dot appears |
 | OSC 99 close/query/control message | No dot |
 | Plain/single-tab session card click | Its implicit tab is acknowledged |
-| Standalone BEL | Dot appears through xterm's bell event |
+| Standalone BEL in a background tab | Dot appears through xterm's bell event |
 | Codex default config, background pane | tmux forwards focus loss; Codex BEL creates a dot |
 | Claude Code notification/response completion in a new Buoy shell | Scoped hook writes OSC 777; dot appears |
 | User rc file prepends a competing `claude` | First prompt repairs lookup; Buoy launcher still runs |

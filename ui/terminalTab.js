@@ -80,6 +80,13 @@ function createTerminalTab(spec, ctx) {
       container.appendChild(el);
       term.open(el);
       mounted = true;
+      // Observe real DOM gestures instead of term.onData: xterm uses onData for both user input and
+      // automatic terminal protocol replies, and a reply must not acknowledge unread work.
+      const acknowledge = () => { if (ctx.onInteract) ctx.onInteract(); };
+      el.addEventListener('pointerdown', acknowledge, true);
+      el.addEventListener('keydown', acknowledge, true);
+      el.addEventListener('paste', acknowledge, true);
+      el.addEventListener('beforeinput', acknowledge, true);  // IME/composition input
       // Right-click: copy the selection if there is one (otherwise let the default menu through).
       el.addEventListener('contextmenu', (e) => {
         if (term.hasSelection && term.hasSelection()) { e.preventDefault(); copySelection(); }
