@@ -56,7 +56,7 @@ pub fn resolve_shell(explicit: Option<&str>) -> String {
 
 impl LocalBackend {
     pub fn spawn(cfg: LocalConfig, sink: LocalSink, cols: u16, rows: u16) -> Result<Self, String> {
-        let shell = resolve_shell(cfg.shell.as_deref());
+        let real_shell = resolve_shell(cfg.shell.as_deref());
         let cwd = cfg.cwd
             .filter(|c| !c.trim().is_empty())
             .or_else(|| std::env::var("HOME").ok())
@@ -67,10 +67,20 @@ impl LocalBackend {
             .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .map_err(|e| format!("openpty failed: {e}"))?;
 
-        let mut cmd = CommandBuilder::new(&shell);
-        // Login shell, so the user gets the same environment/prompt as opening Terminal.app. This is
-        // what $SHELL users expect; a non-login shell skips .zprofile/.bash_profile.
-        cmd.arg("-l");
+        let shell_launcher = crate::claude_integration::local_shell_launcher().ok();
+        let launch_with_integration = shell_launcher.as_ref().is_some_and(|path| path.is_file());
+        let mut cmd = if launch_with_integration {
+            CommandBuilder::new(shell_launcher.as_ref().unwrap())
+        } else {
+            let mut direct = CommandBuilder::new(&real_shell);
+            // Installation failure must not prevent a terminal from opening.
+            direct.arg("-l");
+            direct
+        };
+        if launch_with_integration {
+            cmd.env("BUOY_REAL_SHELL", &real_shell);
+            cmd.env("BUOY_SHELL_LAUNCHER", shell_launcher.as_ref().unwrap());
+        }
         // TERM must be set explicitly: portable_pty does NOT inherit it reliably, and an unset TERM
         // leaves xterm.js talking to a shell that thinks it's dumb (no colors, broken editors).
         cmd.env("TERM", "xterm-256color");
@@ -79,7 +89,7 @@ impl LocalBackend {
         if let Some(dir) = &cwd { cmd.cwd(dir); }
 
         let child = pair.slave.spawn_command(cmd)
-            .map_err(|e| format!("failed to start {shell}: {e}"))?;
+            .map_err(|e| format!("failed to start {real_shell}: {e}"))?;
         drop(pair.slave);
 
         let writer = pair.master.take_writer().map_err(|e| format!("pty writer: {e}"))?;

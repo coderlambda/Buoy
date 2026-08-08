@@ -85,15 +85,45 @@ pub fn spawn_spec(
                 build_local_tmux_args(session, tmux_path, socket)?
             };
             let path = crate::claude_integration::path_with_local_shim(&crate::augmented_path());
-            // A tmux server keeps a global environment across client reconnects. Update it after
-            // every attach so tabs opened after a Buoy upgrade also inherit the launcher PATH.
+            let shell_launcher = crate::claude_integration::local_shell_launcher()
+                .unwrap_or_else(|_| std::path::PathBuf::from("/bin/sh"));
+            let shell_launcher = shell_launcher.to_string_lossy().into_owned();
+            let real_shell = crate::claude_integration::local_real_shell();
+            let tmux_bin = std::fs::canonicalize(tmux_path)
+                .unwrap_or_else(|_| std::path::PathBuf::from(tmux_path))
+                .to_string_lossy()
+                .into_owned();
+            let initial_shell = if std::path::Path::new(&shell_launcher).is_file() {
+                shell_launcher.clone()
+            } else {
+                real_shell.clone()
+            };
+            let default_command = concat!(
+                "if [ -x \"$BUOY_SHELL_LAUNCHER\" ]; then exec \"$BUOY_SHELL_LAUNCHER\"; ",
+                "else exec \"$BUOY_REAL_SHELL\" -l; fi"
+            );
+            // The first pane gets the shell launcher through SHELL. After `new-session` starts it,
+            // restore tmux's default shell and use an explicit launcher command for future panes.
+            // Updating only tmux's PATH cannot change a shell after its rc files have run.
             args.extend([
                 ";".into(), "set-environment".into(), "-g".into(), "PATH".into(), path.clone(),
                 ";".into(), "set-environment".into(), "-g".into(), "BUOY_TERMINAL".into(), "1".into(),
+                ";".into(), "set-environment".into(), "-g".into(), "BUOY_SESSION_ID".into(), session.into(),
+                ";".into(), "set-environment".into(), "-g".into(), "BUOY_SHELL_LAUNCHER".into(), shell_launcher.clone(),
+                ";".into(), "set-environment".into(), "-g".into(), "BUOY_REAL_SHELL".into(), real_shell.clone(),
+                ";".into(), "set-environment".into(), "-g".into(), "BUOY_TMUX_BIN".into(), tmux_bin.clone(),
+                ";".into(), "set-environment".into(), "-g".into(), "SHELL".into(), real_shell.clone(),
+                ";".into(), "set-option".into(), "-g".into(), "default-shell".into(), real_shell.clone(),
+                ";".into(), "set-option".into(), "-g".into(), "default-command".into(), default_command.into(),
             ]);
             let mut env: Vec<(String, String)> = vec![
                 ("PATH".into(), path),
                 ("BUOY_TERMINAL".into(), "1".into()),
+                ("BUOY_SESSION_ID".into(), session.into()),
+                ("BUOY_SHELL_LAUNCHER".into(), shell_launcher),
+                ("BUOY_REAL_SHELL".into(), real_shell),
+                ("BUOY_TMUX_BIN".into(), tmux_bin),
+                ("SHELL".into(), initial_shell),
                 // The tmux CLIENT draws into our pty (plain mode) and the SERVER hands TERM to the
                 // shells it starts. portable_pty does not reliably inherit TERM, and an unset TERM
                 // leaves the shell thinking it's dumb: no colors, broken full-screen editors.
@@ -149,18 +179,35 @@ mod tests {
     fn tc_t2_local_control_spec() {
         let s = spawn_spec(Transport::Local, true, "", "dt-x", "/opt/homebrew/bin/tmux",
                            "dtcc3-6-dt-x", &[], Some("en_US.UTF-8"), None).unwrap();
+        let launcher = crate::claude_integration::local_shell_launcher().unwrap()
+            .to_string_lossy().into_owned();
+        let real_shell = crate::claude_integration::local_real_shell();
+        let tmux_bin = std::fs::canonicalize("/opt/homebrew/bin/tmux")
+            .unwrap_or_else(|_| std::path::PathBuf::from("/opt/homebrew/bin/tmux"))
+            .to_string_lossy().into_owned();
+        let default_command = "if [ -x \"$BUOY_SHELL_LAUNCHER\" ]; then exec \"$BUOY_SHELL_LAUNCHER\"; else exec \"$BUOY_REAL_SHELL\" -l; fi";
         assert_eq!(s.program, "/opt/homebrew/bin/tmux");
         assert_eq!(s.args, [
             "-CC", "-L", "dtcc3-6-dt-x", "new-session", "-D", "-A", "-s", "dt-x", ";",
             "set-option", "-g", "focus-events", "on", ";", "set-environment", "-g", "PATH",
             &crate::claude_integration::path_with_local_shim(&crate::augmented_path()), ";",
-            "set-environment", "-g", "BUOY_TERMINAL", "1",
+            "set-environment", "-g", "BUOY_TERMINAL", "1", ";", "set-environment", "-g",
+            "BUOY_SESSION_ID", "dt-x", ";", "set-environment", "-g", "BUOY_SHELL_LAUNCHER",
+            &launcher, ";", "set-environment", "-g", "BUOY_REAL_SHELL", &real_shell, ";",
+            "set-environment", "-g", "BUOY_TMUX_BIN", &tmux_bin, ";",
+            "set-environment", "-g", "SHELL", &real_shell, ";", "set-option", "-g",
+            "default-shell", &real_shell, ";", "set-option", "-g", "default-command",
+            default_command,
         ]);
         assert!(!s.args.iter().any(|a| a.contains("ssh") || a == "-tt" || a == "--"),
             "no ssh scaffolding: {:?}", s.args);
         // TERM is always set; LC_ALL is not, because the environment is already UTF-8
         assert!(s.env.iter().any(|(k, v)| k == "TERM" && v == "xterm-256color"));
         assert!(s.env.iter().any(|(k, v)| k == "BUOY_TERMINAL" && v == "1"));
+        assert!(s.env.iter().any(|(k, v)| k == "BUOY_SESSION_ID" && v == "dt-x"));
+        assert!(s.env.iter().any(|(k, v)| k == "BUOY_SHELL_LAUNCHER" && v == &launcher));
+        assert!(s.env.iter().any(|(k, v)| k == "BUOY_REAL_SHELL" && v == &real_shell));
+        assert!(s.env.iter().any(|(k, v)| k == "BUOY_TMUX_BIN" && v == &tmux_bin));
         assert!(s.env.iter().any(|(k, v)| {
             k == "PATH" && v.split(':').next() == crate::claude_integration::local_shim_dir().ok()
                 .as_deref().and_then(|p| p.to_str())
@@ -172,12 +219,22 @@ mod tests {
     #[test]
     fn tc_t3_local_plain_spec() {
         let s = spawn_spec(Transport::Local, false, "", "dt-x", "tmux", "dtapp3-6", &[], None, None).unwrap();
+        let launcher = crate::claude_integration::local_shell_launcher().unwrap()
+            .to_string_lossy().into_owned();
+        let real_shell = crate::claude_integration::local_real_shell();
+        let default_command = "if [ -x \"$BUOY_SHELL_LAUNCHER\" ]; then exec \"$BUOY_SHELL_LAUNCHER\"; else exec \"$BUOY_REAL_SHELL\" -l; fi";
         assert_eq!(s.program, "tmux");
         assert_eq!(s.args, [
             "-L", "dtapp3-6", "new-session", "-A", "-s", "dt-x", ";", "set-option", "-g",
             "focus-events", "on", ";", "set-environment", "-g", "PATH",
             &crate::claude_integration::path_with_local_shim(&crate::augmented_path()), ";",
-            "set-environment", "-g", "BUOY_TERMINAL", "1",
+            "set-environment", "-g", "BUOY_TERMINAL", "1", ";", "set-environment", "-g",
+            "BUOY_SESSION_ID", "dt-x", ";", "set-environment", "-g", "BUOY_SHELL_LAUNCHER",
+            &launcher, ";", "set-environment", "-g", "BUOY_REAL_SHELL", &real_shell, ";",
+            "set-environment", "-g", "BUOY_TMUX_BIN", "tmux", ";", "set-environment", "-g",
+            "SHELL", &real_shell, ";", "set-option", "-g",
+            "default-shell", &real_shell, ";", "set-option", "-g", "default-command",
+            default_command,
         ]);
         // no locale at all -> force C.UTF-8, or tmux mangles every non-ASCII byte to '_'
         assert!(s.env.iter().any(|(k, v)| k == "LC_ALL" && v == "C.UTF-8"), "{:?}", s.env);

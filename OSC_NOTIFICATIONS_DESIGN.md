@@ -44,10 +44,11 @@ or Codex-specific wrapper is required.
 Claude Code also defaults to an `auto` notification channel, but an unrecognized terminal receives
 no terminal notification. Buoy does not identify itself as another terminal or depend on Claude's
 native terminal allowlist. Instead, it installs an app-owned launcher at
-`$HOME/.cache/buoy/bin/claude` and puts that directory first on PATH inside Buoy sessions. The same
-bundle contains a small Claude plugin whose `Notification` and `Stop` hooks write one generic OSC
-777 request to the terminal pane running Claude. Both lifecycle events intentionally collapse to
-the same boolean unread state; Buoy does not inspect, retain, or display Claude's hook payload.
+`$HOME/.cache/buoy/bin/claude` and makes that launcher authoritative inside Buoy shells after the
+shell has finished loading the user's startup files. The same bundle contains a small Claude plugin
+whose `Notification` and `Stop` hooks write one generic OSC 777 request to the terminal pane running
+Claude. Both lifecycle events intentionally collapse to the same boolean unread state; Buoy does
+not inspect, retain, or display Claude's hook payload.
 
 The launcher adds the plugin with Claude's repeatable `--plugin-dir` option. Plugin hooks are merged
 by Claude independently from settings-file hooks, so existing user/project hooks and every explicit
@@ -66,14 +67,40 @@ The launcher is deliberately scoped and conservative:
 - `BUOY_CLAUDE_NOTIFICATIONS_DISABLED=1` is an environment-level opt-out;
 - Buoy never edits `~/.claude/settings.json`.
 
-Local sessions install the launcher and plugin before spawning the shell. Every SSH attach transfers
-the same small bundle through the existing connection, then records PATH and `BUOY_TERMINAL` in
-tmux's global environment for subsequently created windows. Claude launches command hooks in a new
-session with pipe-backed stdio, so the hook cannot use `/dev/tty` even though the Claude parent has a
-controlling terminal. The hook instead resolves the exact `#{pane_tty}` from inherited `TMUX` and
-`TMUX_PANE` metadata. Outside tmux, or if the matching tmux binary is unavailable, it walks a
-bounded ancestor chain with POSIX `ps` to find the nearest real tty. Write/lookup failures remain
-non-fatal and report to hook stderr when `DT_DEBUG=1`.
+Prepending PATH only in the process that starts tmux is insufficient: `.zshenv`, `.zshrc`, shell
+frameworks, and version managers may rebuild PATH before the first prompt and place another
+`claude` ahead of Buoy. A tmux hook cannot repair that running shell because tmux's environment is
+only inherited by processes created later. Buoy therefore installs an app-owned shell launcher and
+uses it as the private tmux server's default command:
+
+- **zsh:** a temporary `ZDOTDIR` bootstrap restores the user's real `ZDOTDIR`, sources the real
+  `.zshenv`, and schedules a one-shot `precmd`. The hook runs after `.zprofile` and `.zshrc`, then
+  prepends Buoy's per-pane shim, clears command hashing, removes a conflicting alias, and installs a
+  `claude()` wrapper function.
+- **bash:** an app-owned `--rcfile` reproduces interactive login startup by sourcing `/etc/profile`
+  and the first user login profile, then performs the same PATH, hash, alias, and function repair.
+- **fish:** `--init-command` sources Buoy integration after the user's normal fish configuration.
+- **other POSIX interactive shells:** an `ENV` integration provides the PATH and function repair
+  when the shell supports the standard interactive startup hook.
+
+The launcher creates a mode-0700 shim under the host's temporary directory, keyed by Buoy session
+and tmux pane. The generated shim removes every Buoy temporary-shim directory from PATH before
+delegating to the persistent launcher, preventing shim-to-shim recursion. The persistent launcher
+continues to skip itself while resolving the real Claude executable. No file in the user's shell or
+Claude configuration is edited.
+
+Local sessions install the shell integration, launcher, and plugin before spawning the shell.
+Every SSH attach transfers the same dependency-light bundle through the existing connection, then
+records the launcher environment and default command in the private tmux server for subsequently
+created windows. The transfer still assumes only POSIX `sh` and `base64`; shell-specific files are
+data consumed later by the matching shell. Claude launches command hooks in a new session with
+pipe-backed stdio, so the hook cannot use `/dev/tty` even though the Claude parent has a controlling
+terminal. The hook instead resolves the exact `#{pane_tty}` from inherited `TMUX` and `TMUX_PANE`
+metadata. Outside tmux, or if the matching tmux binary is unavailable, it walks a bounded ancestor
+chain with POSIX `ps` to find the nearest real tty. Buoy exports the already-probed tmux executable
+as an absolute hook dependency, so a user startup file may replace PATH completely without losing
+exact pane routing. Write/lookup failures remain non-fatal and report to hook stderr when
+`DT_DEBUG=1`.
 
 Writing to the resolved pane tty makes tmux naturally attribute the OSC bytes to the pane running
 Claude; no Buoy socket, surface ID, or event-routing service is needed. A shell that was already
@@ -184,12 +211,14 @@ not reuse this OSC dot as proof that a real agent issued a permission request.
 - `ui/terminalTab.js` forwards xterm's standalone BEL event.
 - `ui/renderer.js` owns per-tab unread state, session aggregation, and acknowledgement behavior.
 - `src-tauri/src/validation.rs` enables tmux focus events on every local/remote attach.
-- `src-tauri/src/claude_integration.rs` provisions the scoped Claude Code launcher/plugin bundle
-  locally and over SSH while preserving explicit user configuration. The remote bootstrap is
-  decoded inside command substitution and passed as `/bin/sh -c`'s argument—not piped into the
-  shell's stdin—so the final tmux `exec` retains the pty allocated by `ssh -tt` and can start its
-  control handshake.
-- `src-tauri/src/transport.rs` exposes the launcher PATH and Buoy marker to local tmux windows.
+- `src-tauri/src/claude_integration.rs` provisions the scoped Claude Code launcher/plugin bundle and
+  post-startup zsh/bash/fish/POSIX integration locally and over SSH while preserving explicit user
+  configuration. The remote bootstrap is decoded inside command substitution and passed as
+  `/bin/sh -c`'s argument—not piped into the shell's stdin—so the final tmux `exec` retains the pty
+  allocated by `ssh -tt` and can start its control handshake.
+- `src-tauri/src/transport.rs` exposes the shell launcher, real shell identity, session identity,
+  initial launcher PATH, and Buoy marker to local tmux windows. The initial PATH remains a fallback;
+  the post-startup integration is authoritative.
 - `ui/index.html` owns the shared dot styling.
 - `test/plugins.test.js` covers protocol classification and arbitrary chunk boundaries.
 - `test/gui-notifications.js` covers the real renderer behavior and DOM rollup/clearing rules.
@@ -213,6 +242,11 @@ not reuse this OSC dot as proof that a real agent issued a permission request.
 | Standalone BEL | Dot appears through xterm's bell event |
 | Codex default config, background pane | tmux forwards focus loss; Codex BEL creates a dot |
 | Claude Code notification/response completion in a new Buoy shell | Scoped hook writes OSC 777; dot appears |
+| User rc file prepends a competing `claude` | First prompt repairs lookup; Buoy launcher still runs |
+| Custom zsh `ZDOTDIR` | User startup files load once from the original directory; Buoy hook runs afterwards |
+| zsh `noclobber` or a stale generated shim | Per-pane shim is atomically refreshed without startup noise |
+| Nested/competing Buoy shim entries on PATH | Generated shim removes all temporary entries and cannot recurse |
+| New tmux window after reconnect | tmux default command launches the same post-rc integration |
 | Claude Code with explicit `--settings` or another `--plugin-dir` | User arguments are unchanged; Buoy hook also loads |
 | Claude Code with an explicit native notification channel | Native channel and idempotent Buoy hook may coexist |
 | Encoded SSH bootstrap under a real pty | Final tmux process retains tty stdin and emits its control handshake |
