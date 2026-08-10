@@ -17,7 +17,7 @@ what needs a **live remote** (opt-in `#[ignore]`d suites).
 | Local tmux backend | `src-tauri/src/local_backend.rs` | integration (real pty + real tmux) | ✅ |
 | Tunnels / sticky ports | `src-tauri/src/tunnel.rs` | unit (real sockets, no remote) | ✅ |
 | Frontend modules (clipboard, file viewer, link plugins, TUI detection) | `ui/src/*.ts` | TypeScript unit (`npm test`) | ✅ |
-| Full GUI (rename, reorder, notifications, new-session form, reconnect/reveal repaint, Canvas fallback) | `ui/index.html` + `ui/src/renderer.ts` | real Tauri platform webview + WebDriver | ✅ |
+| Full GUI (rename, reorder, notifications, new-session form, repaint, Canvas fallback, scroll ownership) | `ui/index.html` + `ui/src/renderer.ts` | real Tauri platform webview + WebDriver | ✅ |
 | Real ssh+tmux end-to-end | `src-tauri/tests/live_*.rs` | live host, `#[ignore]`d | ❌ needs `DT_LIVE_HOST` |
 
 Deferred with the feature: backpressure watermarks (the `ack` bridge call is a no-op in the
@@ -246,6 +246,8 @@ cd src-tauri && DT_LIVE_HOST=user@host cargo test --test <name> -- --ignored --n
 - **gui-terminal-repaint TC-P1–5 / TC-R1–4** — hidden-tab writes repaint on same-size reveal;
   visibility/focus recover only the active pane; ordinary output does not invoke recovery; Canvas
   attaches and repaints, while a forced addon failure retains a working DOM pane.
+- **gui-terminal-repaint TC-L1** — the page, main flex column, and terminal host cannot create a
+  competing scrollbar; the visible xterm viewport remains the sole terminal scrollback owner.
 - **control_backend tmux-title regressions** — the exact physical-Enter burst containing
   `ESC k ls ESC \\` never exposes `ls` as terminal text, at every possible chunk split; unrelated
   escape sequences remain byte-for-byte intact.

@@ -60,7 +60,7 @@ npm run test:ui        # all full-GUI suites in the real Tauri platform webview
 npm run gui-rename     # full-GUI inline-rename suite (single-suite shortcut)
 npm run gui-reorder    # full-GUI drag-to-reorder suite (single-suite shortcut)
 npm run gui-notifications # full-GUI OSC/BEL notification-dot and acknowledgement suite
-npm run gui-terminal-repaint # reconnect repaint/cursor and command-echo ordering in real xterm
+npm run gui-terminal-repaint # repaint/cursor, command echo, and single-scrollbar layout in real xterm
 npm run measure:renderer  # opt-in Canvas-vs-DOM WKWebView measurements (fresh process each)
 ```
 
