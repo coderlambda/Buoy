@@ -1,6 +1,6 @@
-'use strict';
-// GUI test for drag-to-reorder (sidebar projects + control-mode tabs), driven by REAL OS-level
-// mouse press/move/release in a real Chromium against the REAL ui/renderer.js and ui/index.html.
+
+// GUI test for drag-to-reorder (sidebar projects + control-mode tabs), driven by WebDriver pointer
+// input in Buoy's real Tauri webview against ui/src/renderer.ts and ui/index.html.
 //
 // Why a full-GUI test: the shipped bug was that HTML5 drag-and-drop never fires in the Tauri
 // webview at all (wry overrides WKWebView's NSDraggingDestination methods for file-drop and answers
@@ -11,69 +11,119 @@
 // nothing about whether the gesture is reachable, and — worse — would have PASSED against the old
 // HTML5 code too if written with dispatchEvent(new DragEvent(...)).
 //
-// Usage: node_modules/.bin/electron test/gui-reorder.js
-const { app, BrowserWindow } = require('electron');
-const fs = require('fs');
-const path = require('path');
+import { createChecks, js, loadFixture, session } from './tauri-ui-harness.js';
 
-let failures = 0;
-const check = (c, m) => { console.log((c ? 'ok   ' : 'FAIL ') + m); if (!c) failures++; };
-
-const UI = path.join(__dirname, '..', 'ui');
-
-// Load the REAL index.html minus the <script src="tauri-api.js"> tag (it needs window.__TAURI__ and
-// would overwrite the preload's stub). Kept in ui/ so relative script/stylesheet srcs still resolve.
-function writeTestPage() {
-  const html = fs.readFileSync(path.join(UI, 'index.html'), 'utf8');
-  const stripped = html.replace(/\s*<script src="tauri-api\.js"><\/script>/, '');
-  if (stripped === html) throw new Error('tauri-api.js script tag not found in ui/index.html');
-  const out = path.join(UI, '.gui-reorder-test.html');
-  fs.writeFileSync(out, stripped);
-  return out;
-}
-
-app.disableHardwareAcceleration();
-app.whenReady().then(async () => {
-  const page = writeTestPage();
-  const cleanup = () => { try { fs.unlinkSync(page); } catch (_) {} };
-
-  const win = new BrowserWindow({
-    width: 1000, height: 700, show: false,
-    webPreferences: { offscreen: true, contextIsolation: false,
-      preload: path.join(__dirname, 'gui-reorder-preload.js') },
+describe('Tauri UI: drag reorder', () => {
+  before(async () => {
+    await browser.setWindowSize(1000, 700);
+    await loadFixture([
+      session(1, 'project one'), session(2, 'project two'), session(3, 'project three'),
+    ]);
   });
-  const wc = win.webContents;
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const js = (code) => wc.executeJavaScript(code);
 
-  await win.loadFile(page);
-  await sleep(1000);   // let init() + mount() settle
+  it('reorders sessions and tabs through native pointer events', async () => {
+  const { check, finish } = createChecks();
+  interface Point { x: number; y: number }
+  interface GestureOptions { cancel?: boolean; steps?: number }
+  interface DragSample {
+    hasClass: boolean;
+    containerFlag: boolean;
+    draggedTransform: string;
+    otherTransform: string;
+    pointerEvents: string;
+  }
+
+  const sleep = (ms: number) => browser.pause(ms);
+
+  // The embedded WKWebView driver accepts WebdriverIO's complete high-level action sequences, but
+  // does not preserve a held mouse button across separate performActions commands. Keep each
+  // gesture in one sequence; in-page samplers below observe transient drag state while it runs.
+  async function pointerGesture(from: Point, points: Point[] = [], { cancel = false }: GestureOptions = {}): Promise<void> {
+    await js(`window.__cancelNextTestPointer = ${JSON.stringify(cancel)}`);
+    let action = browser.action('pointer', { parameters: { pointerType: 'mouse' } })
+      .move({ x: from.x, y: from.y, origin: 'viewport', duration: 0 })
+      .down({ button: 0 });
+    for (const point of points) {
+      action = action.pause(30).move({
+        x: point.x, y: point.y, origin: 'viewport', duration: 30,
+      });
+    }
+    action = action.pause(30).up({ button: 0 });
+    await action.perform();
+  }
+  const clickAt = (point: Point) => pointerGesture(point);
 
   const errs = await js('window.__errs || []');
   check(errs.length === 0, `no uncaught renderer errors (got ${JSON.stringify(errs)})`);
+
+  // tauri-plugin-wdio-webdriver currently maps W3C pointer actions to native mouse events in
+  // WKWebView, but WebKit does not promote those injected mouse events back into PointerEvents (and
+  // reports buttons=0 on injected mousemoves). Production mouse input does get promoted. Bridge
+  // that one automation gap while preserving the native hit-testing and native mouse sequence.
+  await js(`(() => {
+    if (window.__tauriPointerBridgeInstalled) return;
+    window.__tauriPointerBridgeInstalled = true;
+    let pressed = false;
+    let downTarget = null;
+    let downX = 0;
+    let downY = 0;
+    const emit = (target, type, event, buttons) => target.dispatchEvent(new PointerEvent(type, {
+      bubbles: true, cancelable: true, pointerId: 1, pointerType: 'mouse', isPrimary: true,
+      button: event.button, buttons, clientX: event.clientX, clientY: event.clientY,
+      screenX: event.screenX, screenY: event.screenY,
+    }));
+    document.addEventListener('mousedown', (event) => {
+      if (event.button !== 0) return;
+      pressed = true;
+      downTarget = event.target;
+      downX = event.clientX;
+      downY = event.clientY;
+      emit(event.target, 'pointerdown', event, 1);
+    }, true);
+    document.addEventListener('mousemove', (event) => {
+      if (!pressed) return;
+      emit(window, 'pointermove', event, 1);
+      if (typeof window.__sampleTestPointerMove === 'function') {
+        window.__sampleTestPointerMove();
+      }
+    }, true);
+    document.addEventListener('mouseup', (event) => {
+      if (!pressed || event.button !== 0) return;
+      pressed = false;
+      const cancel = window.__cancelNextTestPointer === true;
+      window.__cancelNextTestPointer = false;
+      emit(window, cancel ? 'pointercancel' : 'pointerup', event, 0);
+      // The embedded driver omits the native click after even a sub-threshold injected move.
+      // Real WKWebView input still clicks, so complete that automation-only sequence explicitly.
+      const distance = Math.hypot(event.clientX - downX, event.clientY - downY);
+      if (!cancel && distance > 0 && distance < 4 && downTarget) {
+        downTarget.dispatchEvent(new MouseEvent('click', {
+          bubbles: true, cancelable: true, detail: 1,
+          clientX: event.clientX, clientY: event.clientY,
+        }));
+      }
+      downTarget = null;
+    }, true);
+  })()`);
 
   // Deliver a REAL drag: mouseDown, several mouseMoves (a single jump wouldn't clear the 4px
   // threshold in a lifelike way, and we want the intermediate frames to assert against), mouseUp.
   // `steps` matters: the renderer only starts dragging on a move past DRAG_THRESHOLD, so a
   // down/up with no move in between must stay a click — asserted separately below.
-  async function dragBy(from, dx, dy, opts = {}) {
+  async function dragBy(from: Point, dx: number, dy: number, opts: GestureOptions = {}): Promise<void> {
     const steps = opts.steps || 8;
-    wc.sendInputEvent({ type: 'mouseDown', x: from.x, y: from.y, button: 'left', clickCount: 1 });
-    await sleep(30);
+    const points: Point[] = [];
     for (let i = 1; i <= steps; i++) {
-      wc.sendInputEvent({ type: 'mouseMove',
-        x: Math.round(from.x + (dx * i) / steps), y: Math.round(from.y + (dy * i) / steps) });
-      await sleep(25);
-      if (opts.onMove) await opts.onMove(i);
+      points.push({
+        x: Math.round(from.x + (dx * i) / steps),
+        y: Math.round(from.y + (dy * i) / steps),
+      });
     }
-    if (opts.beforeUp) await opts.beforeUp();
-    if (opts.abandon) return;               // caller wants to inspect the mid-drag state and clean up
-    wc.sendInputEvent({ type: 'mouseUp',
-      x: Math.round(from.x + dx), y: Math.round(from.y + dy), button: 'left', clickCount: 1 });
+    await pointerGesture(from, points, { cancel: opts.cancel === true });
     await sleep(350);                       // commit + re-render + transition
   }
 
-  const centerOf = (sel) => js(
+  const centerOf = (sel: string): Promise<Point> => js(
     `(() => { const n = document.querySelector(${JSON.stringify(sel)}); if (!n) return null;
        const r = n.getBoundingClientRect(); if (!r.width && !r.height) return null;
        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }; })()`);
@@ -90,7 +140,7 @@ app.whenReady().then(async () => {
   // draggable=true hands the gesture straight back to the machinery that swallows it.
   const draggables = await js(
     `Array.from(document.querySelectorAll('#sessions .session')).map((n) => n.draggable)`);
-  check(draggables.every((d) => d === false),
+  check(draggables.every((d: boolean) => d === false),
     `TC-D0 rows are not HTML5-draggable (that path is dead in this webview; got ${JSON.stringify(draggables)})`);
 
   // ---- TC-D1 a real pointer drag downward reorders the list ----------------------------------
@@ -127,25 +177,34 @@ app.whenReady().then(async () => {
   // dynamically". We do the latter, so assert the dragged card is lifted and following the pointer
   // AND that the displaced card has actually shifted — a gap the size of a row IS the placeholder.
   const p1c = await centerOf('#sessions .session[data-id="s1"]');
-  let mid = null;
-  await dragBy(p1c, 0, rowPitch + 6, {
-    abandon: true,
-    beforeUp: async () => {
-      mid = await js(`(() => {
+  const beforeCancelReorders = (await js('window.__reorders')).length;
+  await js(`(() => {
+    window.__dragSamples = [];
+    window.__sampleTestPointerMove = () => {
         const dragged = document.querySelector('#sessions .session[data-id="s1"]');
         const other = document.querySelector('#sessions .session[data-id="s2"]');
         const cs = getComputedStyle(dragged);
-        return { hasClass: dragged.classList.contains('dragging'),
-                 containerFlag: document.getElementById('sessions').classList.contains('reordering'),
-                 draggedTransform: cs.transform,
-                 // INLINE style for the displaced card, not computed: the slide is a CSS transition,
-                 // so a computed read taken mid-transition reports an intermediate value (or 0 if it
-                 // hasn't ticked yet). The inline value is the target the renderer committed to.
-                 otherTransform: other.style.transform,
-                 // pointer-events must be off on the lifted card or it eats its own pointermoves.
-                 pointerEvents: cs.pointerEvents }; })()`);
-    },
-  });
+        window.__dragSamples.push({
+          hasClass: dragged.classList.contains('dragging'),
+          containerFlag: document.getElementById('sessions').classList.contains('reordering'),
+          draggedTransform: cs.transform,
+          // INLINE style for the displaced card, not computed: the slide is a CSS transition,
+          // so a computed read taken mid-transition reports an intermediate value (or 0 if it
+          // hasn't ticked yet). The inline value is the target the renderer committed to.
+          otherTransform: other.style.transform,
+          // pointer-events must be off on the lifted card or it eats its own pointermoves.
+          pointerEvents: cs.pointerEvents,
+        });
+      };
+  })()`);
+  // Cancel after the native moves: the sampler sees the live state, while TC-D4 can verify that a
+  // cancelled gesture leaves neither an order change nor half-applied styling behind.
+  await dragBy(p1c, 0, rowPitch + 6, { cancel: true });
+  const samples = await js(`(() => { delete window.__sampleTestPointerMove;
+    return window.__dragSamples || []; })()`);
+  const activeSamples = (samples as DragSample[]).filter((sample: DragSample) => sample.hasClass && sample.containerFlag);
+  const mid = activeSamples[activeSamples.length - 1]
+    || null;
   check(mid && mid.hasClass === true, 'TC-D3 the dragged card is marked .dragging while in flight');
   check(mid && mid.containerFlag === true,
     'TC-D3 the container is in .reordering (this is what enables the slide transition)');
@@ -170,12 +229,8 @@ app.whenReady().then(async () => {
     `TC-D3 …by exactly one slot, so the gap matches the dragged card (${otherShift}px vs pitch ${rowPitch}px)`);
 
   // ---- TC-D4 releasing the pointer outside any new slot / cancelling must not persist junk ---
-  // Finish the abandoned drag above with a pointercancel and assert the strip is restored and
-  // NOTHING was persisted. A half-applied reorder would be worse than none.
-  const beforeCancelReorders = (await js('window.__reorders')).length;
-  await js(`(() => { const el = document.querySelector('#sessions .session[data-id="s1"]');
-     el.dispatchEvent(new PointerEvent('pointercancel', { bubbles: true, pointerId: 1 })); })()`);
-  await sleep(200);
+  // The native sequence above ended with pointerCancel. Assert the strip is restored and NOTHING
+  // was persisted. A half-applied reorder would be worse than none.
   const afterCancel = await js(`(() => {
     const el = document.querySelector('#sessions .session[data-id="s1"]');
     return { transform: el.style.transform, cls: el.classList.contains('dragging'),
@@ -194,8 +249,7 @@ app.whenReady().then(async () => {
   // The threshold exists for exactly this: mount-on-click is the primary gesture and must survive.
   await js('window.__setLastActive.length = 0');
   const p3 = await centerOf('#sessions .session[data-id="s3"]');
-  wc.sendInputEvent({ type: 'mouseDown', x: p3.x, y: p3.y, button: 'left', clickCount: 1 });
-  wc.sendInputEvent({ type: 'mouseUp', x: p3.x, y: p3.y, button: 'left', clickCount: 1 });
+  await clickAt(p3);
   await sleep(300);
   check(JSON.stringify(await js('window.__setLastActive')) === JSON.stringify(['s3']),
     `TC-D5 a press-release with no movement still selects the project (got ${JSON.stringify(await js('window.__setLastActive'))})`);
@@ -206,17 +260,22 @@ app.whenReady().then(async () => {
   // DRAG_THRESHOLD buys; without it every click on a project would flicker into a 2px drag.
   await js('window.__setLastActive.length = 0');
   const p2j = await centerOf('#sessions .session[data-id="s2"]');
-  wc.sendInputEvent({ type: 'mouseDown', x: p2j.x, y: p2j.y, button: 'left', clickCount: 1 });
-  await sleep(20);
-  wc.sendInputEvent({ type: 'mouseMove', x: p2j.x + 1, y: p2j.y + 2 });   // under the 4px threshold
-  await sleep(20);
+  await js(`(() => { window.__jitterLifted = false;
+    window.__jitterSampler = setInterval(() => {
+      const el = document.querySelector('#sessions .session[data-id="s2"]');
+      if (el.classList.contains('dragging')
+          || document.getElementById('sessions').classList.contains('reordering')
+          || el.style.transform) window.__jitterLifted = true;
+    }, 5); })()`);
+  await pointerGesture(p2j, [{ x: p2j.x + 1, y: p2j.y + 2 }]); // under the 4px threshold
+  await sleep(100);
   const jitter = await js(`(() => { const el = document.querySelector('#sessions .session[data-id="s2"]');
-     return { lifted: el.classList.contains('dragging'), transform: el.style.transform,
+     clearInterval(window.__jitterSampler);
+     return { everLifted: window.__jitterLifted, lifted: el.classList.contains('dragging'), transform: el.style.transform,
               reordering: document.getElementById('sessions').classList.contains('reordering') }; })()`);
-  check(jitter.lifted === false && jitter.reordering === false && jitter.transform === '',
+  check(jitter.everLifted === false && jitter.lifted === false
+      && jitter.reordering === false && jitter.transform === '',
     `TC-D5 a sub-threshold jitter does not start a drag (got ${JSON.stringify(jitter)})`);
-  wc.sendInputEvent({ type: 'mouseUp', x: p2j.x + 1, y: p2j.y + 2, button: 'left', clickCount: 1 });
-  await sleep(300);
   check(JSON.stringify(await js('window.__setLastActive')) === JSON.stringify(['s2']),
     `TC-D5 …and still selects the project (got ${JSON.stringify(await js('window.__setLastActive'))})`);
   check(JSON.stringify(await rowIds()) === JSON.stringify(['s1', 's2', 's3']),
@@ -243,8 +302,10 @@ app.whenReady().then(async () => {
   // and the drag drops any anchor that press already set.
   const selState = () => js(`(() => { const s = window.getSelection();
     return { text: s ? s.toString() : '', type: s ? s.type : null, ranges: s ? s.rangeCount : 0,
-             sessionsUS: getComputedStyle(document.getElementById('sessions')).userSelect,
-             tabsUS: getComputedStyle(document.getElementById('tabs')).userSelect }; })()`);
+             sessionsUS: getComputedStyle(document.getElementById('sessions')).webkitUserSelect
+               || getComputedStyle(document.getElementById('sessions')).userSelect,
+             tabsUS: getComputedStyle(document.getElementById('tabs')).webkitUserSelect
+               || getComputedStyle(document.getElementById('tabs')).userSelect }; })()`);
   const us = await selState();
   check(us.sessionsUS === 'none',
     `TC-D10 the project list is not selectable (got user-select:${us.sessionsUS})`);
@@ -256,14 +317,21 @@ app.whenReady().then(async () => {
      const r = n.getBoundingClientRect();
      return { x: Math.round(r.left + 4), y: Math.round(r.top + r.height / 2) }; })()`);
   check(!!labelPt, 'TC-D10 the first row has a visible text label to press on');
-  const selDuring = [];
-  await dragBy(labelPt, 30, rowPitch * 2 + 6, {
-    steps: 10,
-    onMove: async () => { selDuring.push(await selState()); },
-  });
-  const selected = selDuring.filter((s) => s.text.trim() !== '');
+  await js(`(() => { window.__selectionSamples = [];
+    window.__selectionSampler = setInterval(() => {
+      const selection = window.getSelection();
+      window.__selectionSamples.push({
+        text: selection ? selection.toString() : '',
+        type: selection ? selection.type : null,
+        ranges: selection ? selection.rangeCount : 0,
+      });
+    }, 10); })()`);
+  await dragBy(labelPt, 30, rowPitch * 2 + 6, { steps: 10 });
+  const selDuring = await js(`(() => { clearInterval(window.__selectionSampler);
+    return window.__selectionSamples || []; })()`);
+  const selected = selDuring.filter((s: { text: string }) => s.text.trim() !== '');
   check(selected.length === 0,
-    `TC-D10 no text was selected at any point during the drag (got ${JSON.stringify(selected.map((s) => s.text))})`);
+    `TC-D10 no text was selected at any point during the drag (got ${JSON.stringify(selected.map((s: { text: string }) => s.text))})`);
   const selAfter = await selState();
   check(selAfter.text.trim() === '',
     `TC-D10 …nor left selected after release (got ${JSON.stringify(selAfter.text)})`);
@@ -271,7 +339,8 @@ app.whenReady().then(async () => {
   // could no longer select the text you're editing).
   const inputUS = await js(`(() => { const li = document.querySelector('#sessions .session');
      const i = document.createElement('input'); li.appendChild(i);
-     const v = getComputedStyle(i).userSelect; i.remove(); return v; })()`);
+     const cs = getComputedStyle(i); const v = cs.webkitUserSelect || cs.userSelect;
+     i.remove(); return v; })()`);
   check(inputUS === 'text',
     `TC-D10 a rename editor inside a row IS still selectable (got user-select:${inputUS})`);
   // …and the converse: a selection the user made ELSEWHERE (terminal output, a file preview) is
@@ -296,18 +365,27 @@ app.whenReady().then(async () => {
 
   // These drags really did reorder (that's not what's under test here), so clear the recorders. TC-D9
   // below reads the order dynamically rather than assuming one.
-  await js(`window.__reorders.length = 0; window.__setLastActive.length = 0;`);
+  await js(`(() => { window.__reorders.length = 0; window.__setLastActive.length = 0; })()`);
 
   // ---- TC-D9 a row being RENAMED must not be draggable ---------------------------------------
   // The two gestures share the row. `li.onclick` already ignores clicks while renaming, and the drag
   // path has to agree: pressing the row's sub-line mid-rename used to lift and reorder it (the
   // `input, .controls, …` exemption only covers a press ON the editor, not elsewhere in the row).
   const nameEl = await centerOf('#sessions .session:first-child .name');
-  for (const clickCount of [1, 2]) {   // real double-click, as TC-R does
-    wc.sendInputEvent({ type: 'mouseDown', x: nameEl.x, y: nameEl.y, button: 'left', clickCount });
-    wc.sendInputEvent({ type: 'mouseUp', x: nameEl.x, y: nameEl.y, button: 'left', clickCount });
-    await sleep(40);
-  }
+  await clickAt(nameEl);
+  await js(`(() => {
+    const clientX = ${JSON.stringify(nameEl?.x)}, clientY = ${JSON.stringify(nameEl?.y)};
+    const second = document.elementFromPoint(clientX, clientY);
+    if (!second) return;
+    second.dispatchEvent(new MouseEvent('click', {
+      bubbles: true, cancelable: true, detail: 2, clientX, clientY,
+    }));
+    const current = document.elementFromPoint(clientX, clientY);
+    if (!current) return;
+    current.dispatchEvent(new MouseEvent('dblclick', {
+      bubbles: true, cancelable: true, detail: 2, clientX, clientY,
+    }));
+  })()`);
   await sleep(300);
   check(await js(`!!document.querySelector('#sessions .session:first-child .name input')`) === true,
     'TC-D9 precondition: a rename editor is open on the first row');
@@ -316,30 +394,27 @@ app.whenReady().then(async () => {
      if (!s) return null; const r = s.getBoundingClientRect();
      return { x: Math.round(r.left + 10), y: Math.round(r.top + r.height / 2) }; })()`);
   check(!!subPt, 'TC-D9 the row has a visible sub-line to press');
-  let renameMid = null;
-  await dragBy(subPt, 0, rowPitch + 6, {
-    abandon: true,
-    beforeUp: async () => {
-      renameMid = await js(`({ lifted: !!document.querySelector('#sessions .session.dragging'),
-        editing: !!document.querySelector('#sessions .session .name input') })`);
-    },
-  });
+  await js(`(() => { window.__renameDragLifted = false;
+    window.__renameDragSampler = setInterval(() => {
+      if (document.querySelector('#sessions .session.dragging')) window.__renameDragLifted = true;
+    }, 5); })()`);
+  await dragBy(subPt, 0, rowPitch + 6);
+  const renameMid = await js(`(() => { clearInterval(window.__renameDragSampler);
+    return { lifted: window.__renameDragLifted,
+      editing: !!document.querySelector('#sessions .session .name input') }; })()`);
   check(renameMid && renameMid.lifted === false,
     'TC-D9 dragging elsewhere in a row that is being renamed does NOT lift it');
   check(renameMid && renameMid.editing === true, 'TC-D9 …and the editor is still open');
-  wc.sendInputEvent({ type: 'mouseUp', x: subPt.x, y: subPt.y + rowPitch + 6, button: 'left', clickCount: 1 });
-  await sleep(350);
   check(JSON.stringify(await rowIds()) === JSON.stringify(orderBeforeRename),
     `TC-D9 …and nothing was reordered (got ${JSON.stringify(await rowIds())})`);
   // Close the editor so it can't interfere with the tab cases below.
-  wc.sendInputEvent({ type: 'keyDown', keyCode: 'Escape' });
-  wc.sendInputEvent({ type: 'keyUp', keyCode: 'Escape' });
+  await browser.keys('Escape');
   await sleep(250);
 
   // ---- TC-D7 the tab strip reorders horizontally ---------------------------------------------
   // Same mechanism, other axis — and the axis maths (clientX, translateX) is separate code.
   const proj = await js(`document.querySelector('#sessions .session.active').dataset.id`);
-  const fire = (ev) => js(`window.__fire('window', Object.assign({ id: ${JSON.stringify(proj)} }, ${JSON.stringify(ev)}))`);
+  const fire = (ev: Record<string, unknown>) => js(`window.__fire('window', Object.assign({ id: ${JSON.stringify(proj)} }, ${JSON.stringify(ev)}))`);
   await fire({ action: 'add', window: '@0', order: ['@0'] });
   await fire({ action: 'rename', window: '@0', name: 'shell' });
   await fire({ action: 'add', window: '@1', order: ['@0', '@1'] });
@@ -371,20 +446,20 @@ app.whenReady().then(async () => {
   // item list, dropping past the last tab would compute an index the tab order can't represent.
   const plusBefore = await js(`document.querySelector('#tabs .tab.plus').getBoundingClientRect().x`);
   const tLast = await centerOf('#tabs .tab:not(.plus):nth-of-type(3)');
-  let plusMid = null;
-  await dragBy(tLast, tabPitch + 6, 0, {
-    abandon: true,
-    beforeUp: async () => {
-      plusMid = await js(`(() => { const p = document.querySelector('#tabs .tab.plus');
-         return { transform: getComputedStyle(p).transform }; })()`);
-    },
-  });
-  check(plusMid && (plusMid.transform === 'none' || /matrix\(1, 0, 0, 1, 0, 0\)/.test(plusMid.transform)),
-    `TC-D8 the "+" button does not shift during a tab drag (got ${plusMid && plusMid.transform})`);
-  // Release past the end: the last tab is already last, so nothing changes and nothing is persisted.
   const prefsBefore = (await js('window.__tabPrefs')).length;
-  wc.sendInputEvent({ type: 'mouseUp', x: tLast.x + tabPitch + 6, y: tLast.y, button: 'left', clickCount: 1 });
-  await sleep(350);
+  await js(`(() => { window.__plusTransforms = [];
+    window.__plusSampler = setInterval(() => {
+      const plus = document.querySelector('#tabs .tab.plus');
+      window.__plusTransforms.push(getComputedStyle(plus).transform);
+    }, 10); })()`);
+  // Release past the end: the last tab is already last, so nothing changes and nothing is persisted.
+  await dragBy(tLast, tabPitch + 6, 0);
+  const plusTransforms = await js(`(() => { clearInterval(window.__plusSampler);
+    return window.__plusTransforms || []; })()`);
+  const shiftedPlus = plusTransforms.find((value: string) => value !== 'none'
+    && !/matrix\(1, 0, 0, 1, 0, 0\)/.test(value));
+  check(!shiftedPlus,
+    `TC-D8 the "+" button does not shift during a tab drag (got ${JSON.stringify(shiftedPlus)})`);
   check(JSON.stringify(await tabLabels()) === JSON.stringify(['logs', 'shell', 'build']),
     `TC-D8 dragging the last tab further right changes nothing (got ${JSON.stringify(await tabLabels())})`);
   check((await js('window.__tabPrefs')).length === prefsBefore,
@@ -393,7 +468,6 @@ app.whenReady().then(async () => {
   check(Math.abs(plusAfter - plusBefore) < 1,
     `TC-D8 the "+" stayed put (${plusBefore} -> ${plusAfter})`);
 
-  cleanup();
-  console.log(failures ? `\n${failures} check(s) FAILED` : '\nall ok');
-  app.exit(failures ? 1 : 0);
+  finish();
+  });
 });

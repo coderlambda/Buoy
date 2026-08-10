@@ -1,12 +1,12 @@
-'use strict';
-const { test } = require('node:test');
-const assert = require('node:assert');
-const { decodeOsc52 } = require('../ui/terminalTab');
+
+import { strict as assert } from 'node:assert';
+import { test } from 'node:test';
+import { decodeOsc52 } from '../ui/src/terminalTab.js';
 
 // OSC 52 is the standard "set the system clipboard" escape: ESC ] 52 ; <sel> ; <base64> ST.
 // xterm.js ignores it by default, so the terminal tab opts in and routes the decoded text to the
 // system clipboard. decodeOsc52 is the pure decode step (base64 -> UTF-8).
-const b64 = (s) => Buffer.from(s, 'utf8').toString('base64');
+const b64 = (s: string): string => Buffer.from(s, 'utf8').toString('base64');
 
 // TC-CB1 decodes a normal clipboard-set payload ("c;<base64>")
 test('TC-CB1 decodes OSC 52 clipboard payload', () => {

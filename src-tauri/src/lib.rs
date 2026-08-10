@@ -174,10 +174,18 @@ struct WindowPayload {
 // --- helpers -------------------------------------------------------------------------------
 
 fn user_data_dir() -> std::path::PathBuf {
-    // NOTE: kept as "durable-terminal" (the pre-rename name) so existing users' sessions.json /
-    // config.json are NOT orphaned by the rename to Buoy. This dir name isn't user-visible.
-    let base = dirs::data_dir().unwrap_or_else(|| std::env::temp_dir());
-    base.join("durable-terminal")
+    // UI automation must never inspect, adopt, or rewrite a developer's real sessions/tunnels.
+    // The feature-gated test binary gets a process-private data root instead.
+    #[cfg(feature = "ui-test")]
+    return std::env::temp_dir().join(format!("buoy-ui-test-{}", std::process::id()));
+
+    #[cfg(not(feature = "ui-test"))]
+    {
+        // NOTE: kept as "durable-terminal" (the pre-rename name) so existing users' sessions.json /
+        // config.json are NOT orphaned by the rename to Buoy. This dir name isn't user-visible.
+        let base = dirs::data_dir().unwrap_or_else(|| std::env::temp_dir());
+        base.join("durable-terminal")
+    }
 }
 
 fn emit_backend_event(app: &AppHandle, id: &str, ev: BackendEvent) {
@@ -965,7 +973,10 @@ fn force_forward(app: AppHandle, state: State<AppState>, id: String, remote: u16
 pub fn run() {
     let store = SessionStore::new(user_data_dir().join("sessions.json"));
     let config = load_config();
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+
+    #[cfg(not(feature = "ui-test"))]
+    let builder = builder
         // This must stay first: two app processes restoring the same persisted tmux session would
         // both use `new-session -D`, detach one another, and make both supervisors reconnect
         // forever. A later launch exits here and brings the already-running Buoy window forward.
@@ -976,7 +987,21 @@ pub fn run() {
                 let _ = window.show();
                 let _ = window.set_focus();
             }
-        }))
+        }));
+
+    #[cfg(feature = "ui-test")]
+    let builder = builder
+        // Both plugins are compile-time gated. The first installs a deterministic invoke/event
+        // bridge before the bundled tauri-api.ts module runs; the second lets WebdriverIO drive the real native
+        // webview on macOS, Linux, and Windows without Electron or an external browser driver.
+        .plugin(
+            tauri::plugin::Builder::<_, ()>::new("buoy-ui-test")
+                .js_init_script(include_str!("ui_test_init.js"))
+                .build(),
+        )
+        .plugin(tauri_plugin_wdio_webdriver::init());
+
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {

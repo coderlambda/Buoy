@@ -1,21 +1,49 @@
-'use strict';
+
 // Built-in 'terminal' tab-kind (§14/§15). Wraps an xterm.js terminal as a polymorphic
 // TabContent so the project/tab machinery can host it generically alongside future tab kinds
 // (markdown, browser, ...). Only terminal tabs bind to the tmux backend; other kinds ignore
 // onData/resize. This module is the reference implementation of the TabContent interface.
-/* global Terminal, FitAddon */
+/* global Terminal, FitAddon, CanvasAddon */
 
 // spec: { id, meta, linkProvider, linkHandler }  ctx: { input(bytes), ack(id,bytes), onReady?, ... }
 // Returns a TabContent: { kind, mount(el), onData(d), resize(c,r), focus(), dispose(),
 //                         readBuffer() (test hook), term (raw xterm) }.
-function createTerminalTab(spec, ctx) {
-  const term = new Terminal({
+export interface TerminalTabSpec {
+  linkHandler?: unknown;
+  linkProvider?: XtermLinkProvider;
+}
+
+export interface TerminalTabContext {
+  input(data: string): void;
+  ack?(bytes: number): void;
+  copyText?(text: string): void;
+  setStatus?(message: string): void;
+  onBell?(): void;
+  onInteract?(): void;
+}
+
+let repaintCount = 0;
+let inputLatencyStarted: number | null = null;
+let inputLatencyResult: number | null = null;
+
+// Diagnostic used by the native webview suite. Incrementing only after refresh succeeds makes the
+// counter detect both a missed call site and a renderer whose refresh primitive stopped working.
+export function getTerminalRepaintCount(): number { return repaintCount; }
+export function armTerminalInputLatency(): void {
+  inputLatencyStarted = performance.now();
+  inputLatencyResult = null;
+}
+export function getTerminalInputLatency(): number | null { return inputLatencyResult; }
+
+export function createTerminalTab(spec: TerminalTabSpec, ctx: TerminalTabContext) {
+  const options: XtermTerminalOptions = {
     fontFamily: 'Menlo, Consolas, monospace', fontSize: 13,
     theme: { background: '#1e1e2e', foreground: '#cdd6f4' }, scrollback: 5000,
     // §21: handle OSC 8 hyperlinks (embedded-URI links). Without this xterm renders them
     // underlined but the click is a no-op in the Tauri webview.
-    linkHandler: spec.linkHandler || undefined,
-  });
+  };
+  if (spec.linkHandler) options.linkHandler = spec.linkHandler;
+  const term = new Terminal(options);
   const fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
   // §13 regex-based URL/path links (our plugin engine).
@@ -47,8 +75,9 @@ function createTerminalTab(spec, ctx) {
   }
 
   let mounted = false;
-  let el = null;
-  const preOpen = [];   // bytes buffered until the xterm is opened
+  let el: HTMLDivElement | null = null;
+  let rendererKind: 'dom' | 'canvas' = 'dom';
+  const preOpen: string[] = [];   // bytes buffered until the xterm is opened
 
   // input up (gating is applied by the caller via ctx.input, which may buffer)
   term.onData((data) => ctx.input(data));
@@ -73,12 +102,22 @@ function createTerminalTab(spec, ctx) {
     term,                      // raw handle (link provider, tests)
     get mounted() { return mounted; },
 
-    mount(container) {
-      if (mounted) { container.appendChild(el); return; }
+    mount(container: HTMLElement) {
+      if (mounted && el) { container.appendChild(el); return; }
       el = document.createElement('div');
       el.style.width = '100%'; el.style.height = '100%';
       container.appendChild(el);
       term.open(el);
+      // Canvas draws the grid with 2D canvas calls instead of per-cell DOM nodes and holds no
+      // scarce WebGL context. Construction/load failure deliberately leaves xterm's DOM renderer
+      // active: the pane remains correct, only slower.
+      try {
+        term.loadAddon(new CanvasAddon.CanvasAddon());
+        rendererKind = 'canvas';
+        // A freshly attached renderer has no dirty rows. Without this mandatory repaint an idle
+        // terminal can remain blank until the user types or resizes it.
+        this.repaintAllRows();
+      } catch (_) { /* DOM renderer fallback */ }
       mounted = true;
       // Observe real DOM gestures instead of term.onData: xterm uses onData for both user input and
       // automatic terminal protocol replies, and a reply must not acknowledge unread work.
@@ -96,14 +135,32 @@ function createTerminalTab(spec, ctx) {
     },
     element() { return el; },
 
-    onData(data) {
+    onData(data: string) {
       if (!mounted) { preOpen.push(data); return; }
-      term.write(data, () => { if (ctx.ack) ctx.ack(byteLen(data)); });
+      term.write(data, () => {
+        if (ctx.ack) ctx.ack(byteLen(data));
+        const started = inputLatencyStarted;
+        if (started != null) {
+          inputLatencyStarted = null;
+          requestAnimationFrame(() => requestAnimationFrame(() => {
+            inputLatencyResult = performance.now() - started;
+          }));
+        }
+      });
     },
 
     fit() { try { fit.fit(); } catch (_) {} return { cols: term.cols, rows: term.rows }; },
-    resize(cols, rows) { try { term.resize(cols, rows); } catch (_) {} },
+    resize(cols: number, rows: number) { try { term.resize(cols, rows); } catch (_) {} },
     focus() { try { term.focus(); } catch (_) {} },
+    // Force xterm to re-render every row of the current buffer. This does not resize the grid,
+    // touch the PTY, or alter scrollback, so it is safe on reveal/focus/wake recovery paths.
+    repaintAllRows() {
+      try {
+        term.refresh(0, Math.max(0, term.rows - 1));
+        repaintCount += 1;
+      } catch (_) { /* renderer not ready */ }
+    },
+    rendererKind() { return rendererKind; },
 
     readBuffer() {   // test hook
       const buf = term.buffer.active; let out = '';
@@ -115,13 +172,13 @@ function createTerminalTab(spec, ctx) {
   };
 }
 
-function byteLen(s) { return typeof TextEncoder !== 'undefined' ? new TextEncoder().encode(s).length : Buffer.byteLength(s); }
+function byteLen(s: string): number { return new TextEncoder().encode(s).length; }
 
 // Decode an OSC 52 clipboard-SET payload into UTF-8 text, or '' if it isn't one we act on.
 // payload = "<selection>;<base64>" where selection is c/p/q/s/0-7 (which clipboard). We treat all
 // selections the same (write to the system clipboard). A "?" data field is a clipboard READ
 // request — we refuse it (returning '') so a remote program can't exfiltrate the clipboard.
-function decodeOsc52(payload) {
+export function decodeOsc52(payload: unknown): string {
   const s = String(payload == null ? '' : payload);
   const semi = s.indexOf(';');
   const b64 = semi >= 0 ? s.slice(semi + 1) : s;
@@ -132,25 +189,13 @@ function decodeOsc52(payload) {
   // any payload that wasn't wholly valid UTF-8 and fell back to the raw binary string, which silently
   // wrote mojibake to the system clipboard (e.g. valid-UTF-8 "café" mixed with one latin-1 byte came
   // out as "cafÃ© é"). Strict decoding means we either produce the right text or nothing.
-  let bytes;
+  let bytes: Uint8Array;
   try {
-    if (typeof atob === 'function') {
-      const bin = atob(b64);
-      bytes = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i) & 0xFF;
-    } else {
-      bytes = new Uint8Array(Buffer.from(b64, 'base64'));
-    }
+    const bin = atob(b64);
+    bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i) & 0xFF;
   } catch (_) { return ''; }
   if (!bytes.length) return '';
-  if (typeof TextDecoder === 'function') {
-    try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
-    catch (_) { return ''; }   // not valid UTF-8 -> refuse rather than paste garbage
-  }
-  // No TextDecoder (old runtime): Buffer's toString('utf8') is lossy, so verify by round-trip.
-  const text = Buffer.from(bytes).toString('utf8');
-  return Buffer.from(text, 'utf8').equals(Buffer.from(bytes)) ? text : '';
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
+  catch (_) { return ''; }   // not valid UTF-8 -> refuse rather than paste garbage
 }
-
-if (typeof module !== 'undefined' && module.exports) module.exports = { createTerminalTab, decodeOsc52 };
-if (typeof window !== 'undefined') window.DTTerminalTab = { createTerminalTab, decodeOsc52 };

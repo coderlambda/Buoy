@@ -1,13 +1,19 @@
-'use strict';
+
+import type { LinkContext, LinkModifiers, LinkPlugin } from './plugins.js';
+import type {
+  OscNotificationParser,
+  TuiActivityOptions,
+  TuiActivityTracker,
+} from './types.js';
+
 // Built-in link plugins: URL and filesystem path. They use the SAME registry API a
-// third-party plugin would (see src/shared/plugins.js), so they are examples as much as
+// third-party plugin would (see plugins.ts), so they are examples as much as
 // features. Register them, then register your own for tickets/PRs/etc.
-/* global module */
 
 // URL: http(s)/ftp/file, bare www., AND bare loopback host:port (localhost:3000, 127.0.0.1:8080
 // — with optional scheme + path). The bare-loopback form makes dev-server output clickable so it
 // can be port-forwarded (§18). Trailing punctuation trimmed by the char classes.
-const URL_RE = /\b(?:https?|ftp|file):\/\/[^\s"'<>`)]+|(?:\bwww\.[^\s"'<>`)]+)|(?:\b(?:localhost|127\.0\.0\.1):\d{1,5}(?:\/[^\s"'<>`)]*)?)/g;
+export const URL_RE = /\b(?:https?|ftp|file):\/\/[^\s"'<>`)]+|(?:\bwww\.[^\s"'<>`)]+)|(?:\b(?:localhost|127\.0\.0\.1):\d{1,5}(?:\/[^\s"'<>`)]*)?)/g;
 
 // Path matcher. Four kinds, tried left-to-right in one alternation:
 //   1. slash paths: absolute (/a/b), home (~/a/b), or slash-containing relative (./x, ../x, src/a)
@@ -17,7 +23,7 @@ const URL_RE = /\b(?:https?|ftp|file):\/\/[^\s"'<>`)]+|(?:\bwww\.[^\s"'<>`)]+)|(
 //   3. known extension-less names: Makefile, Dockerfile, LICENSE, README (word-bounded).
 // A plain word with no slash, no extension, and not on the known list stays unmatched (avoids
 // underlining every token). Trailing shell punctuation is excluded from the char classes.
-const KNOWN_NAMES = ['Makefile', 'Dockerfile', 'LICENSE', 'README', 'Gemfile', 'Rakefile'];
+export const KNOWN_NAMES = ['Makefile', 'Dockerfile', 'LICENSE', 'README', 'Gemfile', 'Rakefile'] as const;
 // 1. leading-anchored slash paths: absolute, home, or ./ ../ relative. The char class excludes
 //    ')' (and '(') so a path wrapped in a tool call — e.g. Update(/a/b/x.md) — doesn't swallow the
 //    trailing paren (matches URL_RE's exclusions). Paths literally containing parens are rare and
@@ -31,7 +37,7 @@ const REL_SLASH = String.raw`[\w.\-]+(?:\/[\w.\-]+)*\/[\w.\-]*\w\.[A-Za-z0-9]{1,
 const BARE_WITH_EXT = String.raw`[\w.\-]*\w\.[A-Za-z0-9]{1,8}`;
 // 4. known extension-less names.
 const KNOWN_RE = String.raw`\b(?:${KNOWN_NAMES.join('|')})\b`;
-const PATH_RE = new RegExp(`${SLASH_PATH}|${REL_SLASH}|${BARE_WITH_EXT}|${KNOWN_RE}`, 'g');
+export const PATH_RE = new RegExp(`${SLASH_PATH}|${REL_SLASH}|${BARE_WITH_EXT}|${KNOWN_RE}`, 'g');
 
 // Build the two default plugins. Handlers are thin — they call into ctx, which the host
 // (renderer) supplies with openExternal / copyText / setStatus / meta.
@@ -39,7 +45,7 @@ const PATH_RE = new RegExp(`${SLASH_PATH}|${REL_SLASH}|${BARE_WITH_EXT}|${KNOWN_
 // both behave identically. mods = { shift, meta, alt } (§18): plain = smart (loopback -> ssh -L
 // tunnel + local browser; else default browser); Shift(+Cmd) = chooser (where to open). Terminal
 // text is untrusted, so only safe schemes are opened.
-function openUrlSmart(text, ctx, mods) {
+export function openUrlSmart(text: string, ctx: LinkContext, mods?: LinkModifiers): void {
   if (mods && mods.shift && ctx.chooseOpen) { ctx.chooseOpen(text); return; }
   if (ctx.isLoopback && ctx.isLoopback(text) && ctx.openForwardedUrl) { ctx.openForwardedUrl(text); return; }
   let url = text;
@@ -53,10 +59,11 @@ function openUrlSmart(text, ctx, mods) {
 // `file:///abs`, `file://host/abs` (host ignored — CC uses an empty host), percent-encoding, and a
 // trailing `:line[:col]` suffix some tools append (stripped so the path resolves). Returns null for
 // anything that isn't file://, so callers fall through to URL handling.
-function parseFileUri(uri) {
+export function parseFileUri(uri: unknown): string | null {
   const m = /^file:\/\/[^/]*(\/[^\s]*)$/i.exec(String(uri).trim());
   if (!m) return null;
   let path = m[1];
+  if (!path) return null;
   try { path = decodeURIComponent(path); } catch (_) { /* keep raw on bad encoding */ }
   // strip a trailing :line or :line:col (but NOT a lone drive-like ":" mid-path)
   path = path.replace(/:\d+(?::\d+)?$/, '');
@@ -68,14 +75,16 @@ function parseFileUri(uri) {
 // Non-file links and malformed sequences are skipped. Pure/testable; the renderer builds a lookup
 // map from these so a clicked relative filename resolves to the agent's authoritative absolute path.
 const OSC8_LINK_RE = /\x1b\]8;[^;]*;([^\x07\x1b]*)(?:\x07|\x1b\\)([^\x1b]*)\x1b\]8;;(?:\x07|\x1b\\)/g;
-function extractOsc8FileLinks(data) {
-  const out = [];
+export interface Osc8FileLink { shown: string; path: string }
+
+export function extractOsc8FileLinks(data: string): Osc8FileLink[] {
+  const out: Osc8FileLink[] = [];
   if (!data || data.indexOf('\x1b]8;') === -1) return out;
   OSC8_LINK_RE.lastIndex = 0;
-  let m;
+  let m: RegExpExecArray | null;
   while ((m = OSC8_LINK_RE.exec(data)) !== null) {
     const shown = (m[2] || '').trim();
-    const path = parseFileUri(m[1]);
+    const path = parseFileUri(m[1] ?? '');
     if (shown && path) out.push({ shown, path });
   }
   return out;
@@ -92,11 +101,11 @@ function extractOsc8FileLinks(data) {
 //
 // `write()` returns how many COMPLETE, user-visible notification requests ended in this chunk.
 // The renderer only needs the count (the product intentionally shows a dot, not notification text).
-function createOscNotificationParser() {
+export function createOscNotificationParser(): OscNotificationParser {
   const MAX_PENDING = 16 * 1024;   // protocol payloads are small; bound hostile/incomplete OSCs
   let pending = '';
 
-  function nextOscStart(s, from) {
+  function nextOscStart(s: string, from: number): number {
     const esc = s.indexOf('\x1b]', from);
     const c1 = s.indexOf('\x9d', from);   // 8-bit OSC introducer
     if (esc < 0) return c1;
@@ -104,19 +113,19 @@ function createOscNotificationParser() {
     return Math.min(esc, c1);
   }
 
-  function terminator(s, from) {
+  function terminator(s: string, from: number): { at: number; len: number } | null {
     const bel = s.indexOf('\x07', from);
     const st7 = s.indexOf('\x1b\\', from);
     const st8 = s.indexOf('\x9c', from);  // 8-bit ST
     let at = -1; let len = 0;
-    for (const [i, n] of [[bel, 1], [st7, 2], [st8, 1]]) {
+    for (const [i, n] of [[bel, 1], [st7, 2], [st8, 1]] as const) {
       if (i >= 0 && (at < 0 || i < at)) { at = i; len = n; }
     }
     return at < 0 ? null : { at, len };
   }
 
   return {
-    write(data) {
+    write(data: unknown): number {
       if (data == null || data === '') return 0;
       pending += String(data);
       let notifications = 0;
@@ -161,7 +170,7 @@ function createOscNotificationParser() {
 // replies/control messages (close, alive, capability query, buttons/icon chunks); those must not
 // light an unread dot. Multipart notifications light it only on the final `d=1` chunk (`d` defaults
 // to 1), preventing title/body fragments from looking like multiple new notifications.
-function isOscNotification(payload) {
+export function isOscNotification(payload: string): boolean {
   const semi = payload.indexOf(';');
   if (semi < 0) return false;
   const code = payload.slice(0, semi);
@@ -174,7 +183,7 @@ function isOscNotification(payload) {
   const payloadSep = rest.indexOf(';');
   if (payloadSep < 0) return false;   // OSC 99 requires both semicolons
   const metadata = rest.slice(0, payloadSep);
-  const fields = Object.create(null);
+  const fields: Record<string, string> = Object.create(null) as Record<string, string>;
   for (const part of metadata.split(':')) {
     const eq = part.indexOf('=');
     if (eq > 0) fields[part.slice(0, eq)] = part.slice(eq + 1);
@@ -184,31 +193,72 @@ function isOscNotification(payload) {
   return part === 'title' || part === 'body';
 }
 
-function builtinLinkPlugins() {
+// A TUI proves it is repainting previous rows through explicit frame markers, two-argument cursor
+// positioning/margins, or vertical movement over at least two rows. Deliberately do NOT match CHA
+// (`CSI n G`): Claude emits it heavily, but so do ordinary prompts and carriage-return progress
+// bars. `CSI 1 A` is excluded for the same reason—single-line readline redraws are normal shell use.
+const TUI_SEQ_SOURCE = String.raw`\x1b\[(?:\?2026h|\d+;\d+[Hr]|(?:[2-9]|\d{2,})A)`;
+const TUI_SEQ = new RegExp(TUI_SEQ_SOURCE);
+const TUI_SEQ_GLOBAL = new RegExp(TUI_SEQ_SOURCE, 'g');
+const TUI_CARRY_CHARS = 16;
+
+export function containsTuiRepaint(data: string): boolean {
+  return TUI_SEQ.test(data);
+}
+
+export function createTuiActivityTracker(options?: TuiActivityOptions): TuiActivityTracker {
+  const { decayMs = 10_000, now: clock = Date.now } = options ?? {};
+  const decay = Math.max(0, decayMs);
+  let carry = '';
+  let activeUntil = Number.NEGATIVE_INFINITY;
+
+  return {
+    write(data: string, now = clock()): boolean {
+      if (data) {
+        const combined = carry + data;
+        // Rescan the overlap so split CSI sequences are detected, but ignore a match wholly inside
+        // the old carry: re-counting it on every small chunk would incorrectly extend the decay.
+        TUI_SEQ_GLOBAL.lastIndex = 0;
+        let match: RegExpExecArray | null;
+        while ((match = TUI_SEQ_GLOBAL.exec(combined)) !== null) {
+          if (match.index + match[0].length > carry.length) {
+            activeUntil = now + decay;
+            break;
+          }
+        }
+        carry = combined.slice(-TUI_CARRY_CHARS);
+      }
+      return now < activeUntil;
+    },
+    active(now = clock()): boolean { return now < activeUntil; },
+    reset(): void {
+      carry = '';
+      activeUntil = Number.NEGATIVE_INFINITY;
+    },
+  };
+}
+
+export function builtinLinkPlugins(): LinkPlugin[] {
   return [
     {
       name: 'url',
       priority: 10,   // URLs win over paths when they'd overlap (e.g. file:///a/b)
       regex: URL_RE,
-      onClick(text, ctx, mods) { openUrlSmart(text, ctx, mods); },
+      onClick(text: string, ctx: LinkContext, mods?: LinkModifiers) { openUrlSmart(text, ctx, mods); },
     },
     {
       name: 'path',
       priority: 0,
       regex: PATH_RE,
-      onClick(text, ctx) {
+      onClick(text: string, ctx: LinkContext) {
         // Open the path in an in-app file-viewer tab (§16): the host fetches the file's bytes
         // (remote over ssh, or local) and previews text/markdown/image with a Download button.
         // Falls back to copy+status if the host can't provide a viewer (older/plain builds).
         if (ctx.openViewer) { ctx.openViewer(text); return; }
-        ctx.copyText(text);
+        ctx.copyText?.(text);
         const where = ctx.meta && ctx.meta.host ? `remote (${ctx.meta.host})` : 'local';
         ctx.setStatus(`copied ${where} path: ${text}`);
       },
     },
   ];
 }
-
-// UMD-lite: CommonJS for tests, global for the sandboxed renderer (<script> tag).
-if (typeof module !== 'undefined' && module.exports) module.exports = { builtinLinkPlugins, openUrlSmart, parseFileUri, extractOsc8FileLinks, createOscNotificationParser, isOscNotification, URL_RE, PATH_RE, KNOWN_NAMES };
-if (typeof window !== 'undefined') window.DTBuiltinPlugins = { builtinLinkPlugins, openUrlSmart, parseFileUri, extractOsc8FileLinks, createOscNotificationParser, isOscNotification, URL_RE, PATH_RE, KNOWN_NAMES };

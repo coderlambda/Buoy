@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <title>Buoy</title>
-  <link rel="stylesheet" href="vendor/xterm.css" />
+  <link rel="stylesheet" href="/xterm.css" />
   <style>
     :root { --bg:#1e1e2e; --panel:#181825; --fg:#cdd6f4; --muted:#6c7086; --accent:#89b4fa; }
     * { box-sizing: border-box; }
@@ -35,8 +35,8 @@
        flight (Chromium stops extending; WebKit, which is what ships, keeps going — so dragging a
        card highlighted the text on the cards it passed over). These are chrome labels; nobody
        selects them. The rename editors opt back IN below. */
-    #sessions { user-select:none; }
-    #sessions input { user-select:text; }
+    #sessions { -webkit-user-select:none; user-select:none; }
+    #sessions input { -webkit-user-select:text; user-select:text; }
     .session.dragging { opacity:.85; z-index:5; transition:none !important; pointer-events:none;
       background:#313244; box-shadow:0 4px 14px rgba(0,0,0,.45); cursor:grabbing; }
     .dot { width:8px; height:8px; border-radius:50%; background:var(--muted); flex:none; margin-top:4px; }
@@ -113,8 +113,8 @@
     #tabs .tab.has-color { border-top:2px solid var(--tab-color); padding-top:2px; }
     #tabs.reordering .tab { transition:transform .16s ease; }
     #tabs.reordering { cursor:grabbing; }
-    #tabs { user-select:none; }              /* see #sessions: unconditional, not .reordering-only */
-    #tabs input { user-select:text; }
+    #tabs { -webkit-user-select:none; user-select:none; } /* see #sessions: unconditional */
+    #tabs input { -webkit-user-select:text; user-select:text; }
     #tabs .tab.dragging { opacity:.85; z-index:5; transition:none !important; pointer-events:none;
       background:#313244; box-shadow:0 4px 14px rgba(0,0,0,.45); cursor:grabbing; }
     /* kill-window sent, waiting for tmux to confirm the close: dim and ignore repeat clicks */
@@ -306,13 +306,9 @@
     </form>
   </dialog>
 
-  <script src="vendor/xterm.js"></script>
-  <script src="vendor/addon-fit.js"></script>
-  <script src="tauri-api.js"></script>
-  <script src="plugins.js"></script>
-  <script src="builtinPlugins.js"></script>
-  <script src="terminalTab.js"></script>
-  <script src="fileViewerTab.js"></script>
-  <script src="renderer.js"></script>
+  <script src="/xterm.js"></script>
+  <script src="/addon-fit.js"></script>
+  <script src="/addon-canvas.js"></script>
+  <script type="module" src="/src/main.ts"></script>
 </body>
 </html>

@@ -1,0 +1,6 @@
+[1m[7m%[27m[1m[0m                                                                                                                        printf '\033[1;32mcolored output\033[0m\n'; printf 'progress 50%%\rprogress 100%%\n'; ls /tmp >/dev/null; echo shell-done
+[0m[27m[24m[Jfixture-host% [K[?2004hpprintf '\033[1;32mcolored output\033[0m\n'; printf 'progress 50%%\rprogress 100%%\n'; ls /tmp >/dev [K//null; echo shell-done[?2004l
+[1;32mcolored output[0m
+progress 50%progress 100%
+shell-done
+[1m[7m%[27m[1m[0m                                                                                                                        [0m[27m[24m[Jfixture-host% [K[?2004h

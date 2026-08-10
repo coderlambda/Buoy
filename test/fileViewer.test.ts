@@ -1,13 +1,21 @@
-'use strict';
+
 // Unit tests for the file-viewer's PURE logic (§16): type classification, size caps, and the
 // safe markdown renderer. DOM rendering itself is exercised live; this covers the bug-prone
 // decision logic without a browser.
-const { test } = require('node:test');
-const assert = require('node:assert');
-const { createFileViewerTab, classify, renderMarkdown, extOf, TEXT_RENDER_CAP, IMAGE_RENDER_CAP,
-  HTML_RENDER_CAP } = require('../ui/fileViewerTab.js');
+import { strict as assert } from 'node:assert';
+import { test } from 'node:test';
+import {
+  createFileViewerTab,
+  classify,
+  renderMarkdown,
+  extOf,
+  TEXT_RENDER_CAP,
+  IMAGE_RENDER_CAP,
+  HTML_RENDER_CAP,
+} from '../ui/src/fileViewerTab.js';
+import type { FileViewerApi } from '../ui/src/fileViewerTab.js';
 
-const bytesOf = (s) => new TextEncoder().encode(s);
+const bytesOf = (s: string): Uint8Array => new TextEncoder().encode(s);
 
 // Tiny DOM stub — just enough for the viewer's createElement/appendChild/setAttribute usage. Used
 // only by the HTML-sandbox test, whose whole point is the ATTRIBUTES on the generated <iframe>:
@@ -15,9 +23,30 @@ const bytesOf = (s) => new TextEncoder().encode(s);
 // than left to a live click-through.
 // `fn` may be async, so this awaits it before restoring the globals (a plain try/finally would
 // tear `document` down while the callback was still mid-await).
-async function withFakeDom(fn) {
-  const mk = (tag) => {
-    const node = {
+interface FakeNode {
+  tagName: string;
+  children: FakeNode[];
+  attrs: Record<string, string>;
+  style: { cssText: string };
+  className: string;
+  textContent: string;
+  _innerHTML: string;
+  innerHTML: string;
+  disabled?: boolean;
+  onclick?: (() => unknown) | null;
+  src?: string;
+  srcdoc?: string;
+  setAttribute(key: string, value: unknown): void;
+  getAttribute(key: string): string | null;
+  appendChild(child: FakeNode): FakeNode;
+  querySelectorAll(): FakeNode[];
+  find(tag: string): FakeNode | null;
+  findClass(className: string): FakeNode | null;
+}
+
+async function withFakeDom<T>(fn: (makeNode: (tag: string) => FakeNode) => Promise<T>): Promise<T> {
+  const mk = (tag: string): FakeNode => {
+    const node: FakeNode = {
       tagName: String(tag).toLowerCase(), children: [], attrs: {}, style: { cssText: '' },
       className: '', textContent: '', _innerHTML: '',
       // Real DOM: assigning innerHTML replaces the subtree. renderInto() uses `= ''` to reset the
@@ -25,18 +54,18 @@ async function withFakeDom(fn) {
       // still find the previous iframe.
       get innerHTML() { return this._innerHTML; },
       set innerHTML(v) { this._innerHTML = String(v); if (String(v) === '') this.children = []; },
-      setAttribute(k, v) { this.attrs[k] = String(v); },
-      getAttribute(k) { return Object.prototype.hasOwnProperty.call(this.attrs, k) ? this.attrs[k] : null; },
-      appendChild(c) { this.children.push(c); return c; },
+      setAttribute(k: string, v: unknown) { this.attrs[k] = String(v); },
+      getAttribute(k: string) { return Object.prototype.hasOwnProperty.call(this.attrs, k) ? this.attrs[k] ?? null : null; },
+      appendChild(c: FakeNode) { this.children.push(c); return c; },
       querySelectorAll() { return []; },
       // depth-first search by tag, so a test can find the iframe wherever it's nested
-      find(t) {
+      find(t: string): FakeNode | null {
         if (this.tagName === t) return this;
         for (const c of this.children) { const hit = c.find && c.find(t); if (hit) return hit; }
         return null;
       },
       // depth-first search by className (buttons are nested inside the toolbar)
-      findClass(cls) {
+      findClass(cls: string): FakeNode | null {
         if (this.className === cls) return this;
         for (const c of this.children) { const hit = c.findClass && c.findClass(cls); if (hit) return hit; }
         return null;
@@ -44,12 +73,22 @@ async function withFakeDom(fn) {
     };
     return node;
   };
-  const prevDoc = global.document, prevAtob = global.atob;
-  global.document = { createElement: mk, createTextNode: (t) => ({ tagName: '#text', textContent: t, children: [], find: () => null }) };
+  const prevDoc = globalThis.document, prevAtob = globalThis.atob;
+  const fakeDocument = {
+    createElement: mk,
+    createTextNode: (text: string): FakeNode => ({
+      tagName: '#text', textContent: text, children: [], attrs: {}, style: { cssText: '' },
+      className: '', _innerHTML: '',
+      get innerHTML() { return this._innerHTML; }, set innerHTML(value: string) { this._innerHTML = value; },
+      setAttribute() {}, getAttribute() { return null; }, appendChild(child: FakeNode) { return child; },
+      querySelectorAll() { return []; }, find: () => null, findClass: () => null,
+    }),
+  };
+  globalThis.document = fakeDocument as unknown as Document;
   if (typeof global.atob !== 'function') {
     global.atob = (b64) => Buffer.from(b64, 'base64').toString('binary');
   }
-  try { return await fn(mk); } finally { global.document = prevDoc; global.atob = prevAtob; }
+  try { return await fn(mk); } finally { globalThis.document = prevDoc; globalThis.atob = prevAtob; }
 }
 
 // TC-FV1 extension detection
@@ -168,11 +207,11 @@ test('TC-FV10 binary .html is not previewed', () => {
 test('TC-FV11 html preview is sandboxed and never touches app-origin innerHTML', async () => {
   const hostile = '<html><body><script>alert(1)</script><img src=x onerror=alert(2)></body></html>';
   const data_b64 = Buffer.from(hostile, 'utf8').toString('base64');
-  await withFakeDom(async () => {
-    const root = global.document.createElement('div');
+  await withFakeDom(async (mk) => {
+    const root = mk('div');
     const api = { readRemoteFile: async () => ({ data_b64, size: hostile.length, truncated: false }) };
     const tab = createFileViewerTab({ id: 's1', path: '/tmp/eek.html', api }, { setStatus() {} });
-    await tab.mount(root);
+    await tab.mount(root as unknown as HTMLElement);
 
     const frame = root.find('iframe');
     assert.ok(frame, 'html mode renders an <iframe>');
@@ -182,7 +221,7 @@ test('TC-FV11 html preview is sandboxed and never touches app-origin innerHTML',
     assert.ok(!/allow-same-origin/.test(sandbox), 'never allow-same-origin: no reach into our origin');
     // the untrusted markup is srcdoc, and is NOT assigned to any app-origin innerHTML
     assert.equal(frame.srcdoc, hostile, 'markup delivered via srcdoc');
-    const noInnerHtml = (n) => {
+    const noInnerHtml = (n: FakeNode): void => {
       assert.ok(!String(n.innerHTML || '').includes('<script>'),
         `hostile markup must not reach innerHTML (${n.tagName})`);
       n.children.forEach(noInnerHtml);
@@ -192,25 +231,25 @@ test('TC-FV11 html preview is sandboxed and never touches app-origin innerHTML',
 });
 
 // Helper: mount an html viewer and return { root, tab, calls } for the opt-in tests.
-async function mountHtml(api, path = '/tmp/page.html') {
+async function mountHtml(api: Partial<FileViewerApi>, path = '/tmp/page.html') {
   const src = '<html><body><script>ran()</script></body></html>';
   const data_b64 = Buffer.from(src, 'utf8').toString('base64');
-  const calls = [];
-  const full = Object.assign({
+  const calls: string[] = [];
+  const full: FileViewerApi = Object.assign({
     readRemoteFile: async () => ({ data_b64, size: src.length, truncated: false }),
   }, api);
   const wrapped = new Proxy(full, {
     get(t, k) {
-      const v = t[k];
+      const v = Reflect.get(t, k) as unknown;
       if (typeof v === 'function' && k !== 'readRemoteFile') {
-        return (...a) => { calls.push(k); return v(...a); };
+        return (...args: unknown[]) => { calls.push(String(k)); return Reflect.apply(v, t, args); };
       }
       return v;
     },
   });
-  const root = global.document.createElement('div');
+  const root = globalThis.document.createElement('div') as unknown as FakeNode;
   const tab = createFileViewerTab({ id: 's1', path, api: wrapped }, { setStatus() {} });
-  await tab.mount(root);
+  await tab.mount(root as unknown as HTMLElement);
   return { root, tab, calls, src };
 }
 
@@ -220,7 +259,7 @@ test('TC-FV12 scripts are never enabled without an explicit click', async () => 
   await withFakeDom(async () => {
     const { root, calls } = await mountHtml({ enableHtmlScripts: async () => ({ url: 'buoyhtml://localhost/tok' }) });
     assert.ok(!calls.includes('enableHtmlScripts'), 'mount must not opt in by itself');
-    assert.equal(root.find('iframe').getAttribute('sandbox'), '', 'still the static sandbox');
+    assert.equal(root.find('iframe')?.getAttribute('sandbox'), '', 'still the static sandbox');
     // the opt-in affordance is offered
     const btn = root.findClass('fv-scripts');
     assert.ok(btn, 'an Enable-scripts button is present for html');
@@ -235,10 +274,12 @@ test('TC-FV13 enabling scripts uses a separate origin and stays cross-origin', a
     const URL_ = 'buoyhtml://localhost/abc123';
     const { root, calls } = await mountHtml({ enableHtmlScripts: async () => ({ url: URL_ }) });
     const btn = root.findClass('fv-scripts');
+    assert.ok(btn?.onclick);
     await btn.onclick();
 
     assert.ok(calls.includes('enableHtmlScripts'), 'the click drives the opt-in command');
     const frame = root.find('iframe');
+    assert.ok(frame);
     const sandbox = frame.getAttribute('sandbox');
     assert.equal(sandbox, 'allow-scripts', 'scripts allowed, and nothing else');
     assert.ok(!/allow-same-origin/.test(sandbox),
@@ -258,11 +299,12 @@ test('TC-FV14 script opt-in does not leak to a new tab', async () => {
     const api = { enableHtmlScripts: async () => ({ url: 'buoyhtml://localhost/t1' }) };
     const first = await mountHtml(api);
     const btn = first.root.findClass('fv-scripts');
+    assert.ok(btn?.onclick);
     await btn.onclick();
-    assert.equal(first.root.find('iframe').getAttribute('sandbox'), 'allow-scripts');
+    assert.equal(first.root.find('iframe')?.getAttribute('sandbox'), 'allow-scripts');
 
     const second = await mountHtml(api);            // same path, fresh tab
-    assert.equal(second.root.find('iframe').getAttribute('sandbox'), '', 'new tab starts static');
+    assert.equal(second.root.find('iframe')?.getAttribute('sandbox'), '', 'new tab starts static');
     assert.ok(!second.calls.includes('enableHtmlScripts'), 'and does not auto-opt-in');
   });
 });
@@ -279,7 +321,7 @@ test('TC-FV15 no scripts opt-in for non-html modes', async () => {
   });
 });
 
-// TC-FV16 the viewer's root must be free to be a flex column. renderer.js reveals a tab by CLEARING
+// TC-FV16 the viewer's root must be free to be a flex column. renderer.ts reveals a tab by CLEARING
 // the inline display ('') rather than setting 'block' — an inline display:block outranks the
 // stylesheet's `.fv-root { display:flex }`, which breaks `.fv-body { flex:1 }` and collapses the
 // preview iframe to the CSS default 150px regardless of the tab's real height (measured: 150px in a

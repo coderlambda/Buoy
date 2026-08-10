@@ -33,6 +33,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Install frontend dependencies
+        run: npm ci
+
       # Linux build deps: WebKitGTK (the webview) + the bundling tools Tauri shells out to.
       # tauri-action installs most, but the webkit/gtk dev libs must be present first.
       - name: Install Linux dependencies
@@ -99,8 +106,8 @@ jobs:
             | grep -F 'Developer ID Application: Yitong Jiang (P8MQ54R68J)'
 
       # Builds the app and, when a tag triggered the run, creates a GitHub Release and uploads
-      # every bundle produced (dmg/app, deb/rpm/AppImage, msi/exe). No npm build step: the
-      # frontend is the static ui/ directory (frontendDist), so there's nothing to compile there.
+      # every bundle produced (dmg/app, deb/rpm/AppImage, msi/exe). Tauri's beforeBuildCommand
+      # type-checks and bundles the strict TypeScript frontend before the native build.
       - name: Build & release
         uses: tauri-apps/tauri-action@v0
         env:

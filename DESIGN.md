@@ -95,7 +95,7 @@ we are wrapping a UI around it.
 | Layer | Choice | Rationale |
 |---|---|---|
 | **Shell / windows** | **Electron** | One bundled Chromium → *far less rendering variance* than Tauri's 3 webviews (NOT pixel-identical — glyphs still route through per-OS rasterizers CoreText/DirectWrite/FreeType). Most mature terminal stack (VS Code, Hyper, Tabby). Trade binary size/RAM for consistency. **Rendering consistency ≠ feature parity:** the OOB channel needs a local tmux binary, so Windows has a materially degraded feature set (§9.0) — resolve platform scope in §9 Q5. |
-| **Terminal view** | **xterm.js** (`@xterm/xterm`, current scoped pkg) + **`@xterm/addon-webgl`** + **`@xterm/addon-fit`** | Engine **and** renderer for web/Electron. **WebGL only for the focused/visible terminal** — Chromium caps live WebGL contexts (~8–16, LRU-evicted), so a per-session WebGL context would evict older panes' contexts and fire `webglcontextlost` on them. Background sessions use the **DOM renderer** (the canvas addon is no longer part of current xterm.js — WebGL and DOM are the only renderers) or dispose their WebGL addon on hide. See §8. |
+| **Terminal view** | **xterm.js 5.5.0** + **`@xterm/addon-canvas` 0.7.0** + **`@xterm/addon-fit` 0.10.0** | Canvas is the default for every pane: it removes per-cell DOM rendering cost without consuming a scarce WebGL context. Attach failure falls back to xterm's DOM renderer. WebGL remains gated on measured need; WKWebView's measured ceiling is 16 live contexts, oldest-first eviction. Vendored versions/hashes live in `ui/vendor/README.md`; see §8 and `RENDERER_MEASUREMENT.md`. |
 | **PTY** | **node-pty** | Spawns the pty in the main process; battle-tested (VS Code uses it). |
 | **Connection layer** | **`et` (Eternal Terminal)** ⚠️ *confirm* | Best auto-reconnect. Needs `etserver` + open port on remote. Alternatives: `mosh` (UDP, roams networks), `ssh`+`autossh` (no remote install, crudest). |
 | **Frontend framework** | **React + TypeScript** ⚠️ *confirm* | Good ergonomics for sidebar/session list/tabs. Alt: plain TS (lighter). |
@@ -682,11 +682,12 @@ interface WebTerminalView {                 // web-renderer-only; NOT the native
 
 - **Throughput** — addressed as a v1 correctness requirement via backpressure (§4.1), not
   deferred. Without it, output is *discarded* past the ~50MB write buffer, not merely slow.
-- **WebGL context cap** — a *routine* constraint here, not a rare fallback: Chromium caps
-  live WebGL contexts (~8–16, LRU-evicted), so many sessions ⇒ background panes lose their
-  context. Mitigation: WebGL for the focused pane only; **DOM renderer** (or disposed WebGL
-  addon) for background panes — the canvas addon is **no longer part of current xterm.js**,
-  so DOM is the only non-WebGL renderer (§3). Still handle `webglcontextlost` defensively.
+- **WebGL context cap** — Buoy now runs in OS webviews, not Chromium. The shipping WKWebView was
+  measured at exactly 16 live WebGL2 contexts with oldest-first eviction. CanvasAddon exists and is
+  the default for all panes, avoiding this cap entirely; WebGL is deferred unless repeatable Canvas
+  measurements show a user-visible deficit (`RENDERER_MEASUREMENT.md`). A per-tab raw-stream TUI
+  tracker is already available for diagnostics and to gate any future WebGL corrective sweep; it
+  decays after 10 seconds and deliberately ignores single-row redraws and horizontal cursor motion.
 - **Ligatures**: addon-based, imperfect (interacts awkwardly with WebGL).
 - **Images**: Sixel via addon; iTerm/Kitty image protocols not first-class.
 - **Electron tax**: Chromium memory/CPU overhead.
@@ -772,8 +773,8 @@ cross-platform).
    replaces this.)
 4. **Persistence**: disk-backed session list (re-validated on load), lazy restore on launch,
    detect-lost-session via persisted remote `#{session_created}` over the OOB channel (§5.2).
-5. **Polish**: focused-pane WebGL + background DOM renderer (§3), `webglcontextlost` handling,
-   keybindings, theming.
+5. **Polish**: Canvas rendering for every pane with DOM fallback, repaint recovery on
+   reveal/focus/visibility/wake, keybindings, theming. WebGL remains measurement-gated (§3/§8).
 6. **(Later, gated on measured need)** Native renderer — a render-layer *rewrite* (§8),
    reusing only the transport-contract-coupled code.
 
@@ -928,9 +929,9 @@ A small, in-process extension framework so features are contributed, not hardcod
 extension point: **link matchers** (clickable URLs/paths and beyond).
 
 ### Architecture
-- `src/shared/plugins.js` — `PluginRegistry` (PURE, unit-tested): holds registered link
+- `ui/src/plugins.ts` — `PluginRegistry` (PURE, unit-tested): holds registered link
   plugins and a `findMatches(line)` engine (priority-ordered, non-overlapping).
-- `src/renderer/builtinPlugins.js` — the built-in **url** and **path** plugins, written
+- `ui/src/builtinPlugins.ts` — the built-in **url** and **path** plugins, written
   against the same public API a third party would use (examples as much as features).
 - Renderer wires the registry into an xterm `registerLinkProvider` per terminal; a match's
   `activate` calls the plugin's `onClick(text, ctx)`.
@@ -1063,7 +1064,7 @@ window.dtPlugins.registerTabKind({
   create(spec, ctx) { /* return a TabContent */ },
 });   // -> unregister()
 ```
-- Built-in: **'terminal'** (`src/renderer/terminalTab.js`) wraps xterm.js as a TabContent —
+- Built-in: **'terminal'** (`ui/src/terminalTab.ts`) wraps xterm.js as a TabContent —
   the reference implementation.
 - The project/tab code creates content via `registry.createTabContent(kind, spec, ctx)` and
   manages mount/show-hide/dispose generically. A non-terminal kind simply doesn't wire to a
@@ -1220,7 +1221,7 @@ path, never a remembered preference — turns scripts on, for **that one documen
 - **Not persisted, not inherited.** Reopening the same path starts static again (TC-FV14). The app's
   own `script-src 'self'` is unchanged; the only app-CSP edit is `frame-src 'self' buoyhtml:`.
 - **Verified on the motivating file end-to-end** in a real WKWebView, driving the shipped
-  `fileViewerTab.js` under the shipped CSP: static → 0 scripts ran; after the click → inline script
+  `fileViewerTab.ts` under the shipped CSP: static → 0 scripts ran; after the click → inline script
   ran, the 8 `esm.sh` imports resolved, and the page built **9198 DOM nodes / 24 React-Flow nodes /
   33 SVGs** with its real title.
 
@@ -1259,7 +1260,7 @@ exists as the opt-in above.)
 
 Makes `ls`-style output clickable and opens relatives correctly.
 
-- **Matcher (ui/builtinPlugins.js):** besides slash paths + `~//./..`, also match bare filenames
+- **Matcher (`ui/src/builtinPlugins.ts`):** besides slash paths + `~//./..`, also match bare filenames
   **with an extension** (`README.md`), relative paths with an interior slash + extension
   (`src/main.rs`), and known extension-less names (`Makefile`, `Dockerfile`, `LICENSE`, `README`).
   Plain words (no slash, no extension, not known) stay unmatched to avoid underlining noise.
@@ -1424,8 +1425,8 @@ Measured in a real Chromium (`A dblclick fired on gen=2 (current gen=3)`,
 ### Why this survived to a user report
 A synthetic `el.dispatchEvent(new MouseEvent('dblclick'))` **passes against the broken code**: it
 skips the two `click` events entirely, so nothing re-renders and the closed-over node is still live.
-Only a real click sequence — `sendInputEvent` with `clickCount` 1 then 2, as the OS delivers — can
-observe the defect. Any test for this class of bug must drive real input events.
+Only a real click sequence — click 1, click 2, then `dblclick`, as the OS delivers — can observe the
+defect. Any test for this class of bug must preserve that event ordering.
 
 ### The fix: the edit is view state, not a DOM node a handler mutates
 The rename *intent* lives on the view (`v.renaming` / `v.renameDraft` / `v.renameSel` /
@@ -1467,14 +1468,13 @@ Project rename treats empty as **cancel** (a project must keep a label). Tab ren
 **meaningful** — it clears the manual name so tmux resumes `automatic-rename` for that window — so it
 sends on any change from current, including to `""`.
 
-### Testing (`test/gui-rename.js`, real Electron, 41 checks)
-Loads the **real** `ui/index.html` (minus the `tauri-api.js` tag, which needs `window.__TAURI__`) and
-the **real** `ui/renderer.js` against a preload stub of `window.terminalAPI`, then drives genuine
-OS-level double-clicks. Not in the `npm test` glob (`test/*.test.js`) because it needs an Electron
-binary; run it directly:
+### Testing (`test/gui-rename.ts`, real Tauri platform webview, 41 checks)
+Loads the **real** Vite build of `ui/index.html`, `ui/src/tauri-api.ts`, and `ui/src/renderer.ts` in a test-only Tauri binary,
+then drives the interaction through the embedded Tauri WebDriver. It is not in the `npm test` glob
+(`test/*.test.ts`); run it directly:
 
 ```
-node_modules/.bin/electron test/gui-rename.js
+npm run gui-rename
 ```
 
 - **TC-R1** the active row's editor is present, **connected**, visible, seeded, focused. `connected`
@@ -1531,7 +1531,7 @@ rewrite below costs nothing and leaves native config and capabilities untouched.
 
 ### The fix: implement dragging on pointer events
 Pointer events are ordinary input; the native drag machinery never sees them. So `wirePointerDrag`
-in `ui/renderer.js` drives the gesture directly, shared by the project list (`axis: 'y'`) and the tab
+in `ui/src/renderer.ts` drives the gesture directly, shared by the project list (`axis: 'y'`) and the tab
 strip (`axis: 'x'`):
 
 ```
@@ -1614,14 +1614,15 @@ selection planted in the terminal area: a reorder must not throw away output the
 On the same measurement the clear is redundant in Chromium (no caret is set at all once
 `user-select:none` is unconditional) and is kept only as WKWebView insurance; the comment says so.
 
-### Testing (`test/gui-reorder.js`, real Electron, 48 checks)
-Same shape as §23's suite and for the same reason: a synthetic `dispatchEvent` proves nothing about
-a gesture whose whole difficulty is event sequencing and hit-testing. This drives real OS-level
-`mouseDown` / `mouseMove` × 8 / `mouseUp` through `webContents.sendInputEvent` against the real
-`ui/index.html` + `ui/renderer.js`. Not in the `npm test` glob:
+### Testing (`test/gui-reorder.ts`, real Tauri platform webview, 48 checks)
+Same shape as §23's suite and for the same reason: the gesture's difficulty is event sequencing and
+hit-testing. WebdriverIO drives down / move × 8 / up sequences against the real `ui/index.html` +
+`ui/src/renderer.ts` in Tauri's native webview. The macOS embedded driver currently emits native mouse
+events without WebKit's usual PointerEvent promotion, so the suite supplies that narrow test-only
+promotion after native hit-testing. Not in the `npm test` glob:
 
 ```
-node_modules/.bin/electron test/gui-reorder.js
+npm run gui-reorder
 ```
 
 Cases: TC-D0 (rows are not HTML5-draggable — the bug's own fingerprint) through TC-D10; see

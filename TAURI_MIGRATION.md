@@ -4,10 +4,10 @@ Ports the durable terminal from **Electron + Node main process** to **Tauri v2 +
 backend**, keeping the exact same UX and the xterm.js renderer.
 
 > **The migration is complete and the Electron app has been deleted from this branch**
-> (`src/` and its tests; recoverable from git history or the `main` branch). `electron`
-> survives only as a devDependency because `test/gui-*.js` use it as a scriptable headless
-> browser to drive the real `ui/` frontend. This file is kept as the record of what moved
-> where; the tables below use the old `src/` paths as historical references.
+> (`src/` and its tests; recoverable from git history). The `test/gui-*.ts` suites now run
+> inside the real Tauri platform webview through the test-only embedded WebDriver feature;
+> Electron is no longer a dependency. This file is kept as the record of what moved where;
+> the tables below use the old `src/` paths as historical references.
 
 ## Why xterm.js stays
 
@@ -33,9 +33,9 @@ unchanged; only the **backend** moved to Rust.
 | `plain_backend.rs` | `main/backends/sshTmuxBackend.js` | raw ssh+tmux stream |
 | `lib.rs` | `main/main.js` + `preload/preload.js` | Tauri commands + event emission |
 
-The renderer (`ui/renderer.js`, `terminalTab.js`, `builtinPlugins.js`, `plugins.js`) is copied
-verbatim; `ui/tauri-api.js` recreates `window.terminalAPI` over Tauri `invoke`/`listen`, so
-`renderer.js` didn't change. xterm is vendored under `ui/vendor/` (CSP is `'self'`).
+The renderer was initially copied verbatim, then migrated to strict TypeScript under `ui/src/`.
+`ui/src/tauri-api.ts` recreates `window.terminalAPI` over Tauri `invoke`/`listen`; Vite bundles the
+frontend while xterm remains vendored under `ui/vendor/` (CSP is `'self'`).
 
 ## IPC surface (Tauri commands)
 
@@ -60,7 +60,7 @@ DT_LIVE_HOST=user@host DT_TMUX=/home/u/.local/bin/tmux \
 
 ## Status / verification
 
-- **114 Rust unit tests pass** (parser, registry, reply channel, tmux keys, socket, validation,
+- **132 Rust unit tests pass** (parser, registry, reply channel, tmux keys, socket, validation,
   probe, supervisor, session store, local backend, tunnels, PATH augmentation) — ports of the
   JS suites plus the features added since (see DESIGN.md §16–§24).
 - **Live suites** (`#[ignore]`d, opt-in with `DT_LIVE_HOST`): control-mode end-to-end,
@@ -75,6 +75,6 @@ DT_LIVE_HOST=user@host DT_TMUX=/home/u/.local/bin/tmux \
 
 ## Still not ported (deferred)
 
-- `backpressure` ACK flow — `ack` is a no-op in `ui/tauri-api.js` (webview keeps up for
+- `backpressure` ACK flow — `ack` is a no-op in `ui/src/tauri-api.ts` (webview keeps up for
   interactive use). The Electron implementation is in git history (`src/shared/backpressure.js`).
 - mosh/et transports — ssh only for now (argv-verified JS backends are in git history).
