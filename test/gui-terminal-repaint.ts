@@ -136,4 +136,33 @@ describe('Tauri UI: terminal reconnect repaint', () => {
       `TC-R2 Canvas failure keeps a working DOM-rendered pane (got ${JSON.stringify(fallback)})`);
     finish();
   });
+
+  it('keeps app chrome fixed while xterm owns terminal scrollback', async () => {
+    const { check, finish } = createChecks();
+    const layout = await js(`(() => {
+      const dimensions = (element) => ({
+        clientHeight: element.clientHeight,
+        scrollHeight: element.scrollHeight,
+        overflowY: getComputedStyle(element).overflowY,
+      });
+      const main = document.querySelector('#main');
+      const term = document.querySelector('#term');
+      const viewport = Array.from(document.querySelectorAll('#term .xterm-viewport'))
+        .find((element) => element.getBoundingClientRect().height > 0);
+      return {
+        root: dimensions(document.documentElement),
+        body: dimensions(document.body),
+        main: dimensions(main),
+        term: dimensions(term),
+        viewport: dimensions(viewport),
+      };
+    })()`);
+    check(layout.root.overflowY === 'hidden' && layout.body.overflowY === 'hidden',
+    `TC-L1 the page does not create an outer scrollbar (got ${JSON.stringify(layout)})`);
+    check(layout.main.overflowY === 'hidden' && layout.term.overflowY === 'hidden',
+    `TC-L1 main and terminal hosts do not become competing scroll containers (got ${JSON.stringify(layout)})`);
+    check(layout.viewport.clientHeight > 0 && layout.viewport.overflowY === 'scroll',
+      `TC-L1 xterm remains the terminal scrollback owner (got ${JSON.stringify(layout.viewport)})`);
+    finish();
+  });
 });

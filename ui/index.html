@@ -7,11 +7,14 @@
   <style>
     :root { --bg:#1e1e2e; --panel:#181825; --fg:#cdd6f4; --muted:#6c7086; --accent:#89b4fa; }
     * { box-sizing: border-box; }
-    html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    html, body { margin:0; height:100%; overflow:hidden; background:var(--bg); color:var(--fg);
       font: 13px -apple-system, system-ui, sans-serif; }
-    #app { display:flex; height:100vh; }
+    /* The app shell is viewport chrome, not a document scroller. WebKit can round the stacked tab,
+       terminal, and status flex items one pixel taller than the viewport; contain that rounding at
+       each shell boundary so xterm's own viewport remains the only terminal scrollbar. */
+    #app { display:flex; height:100%; min-height:0; overflow:hidden; }
     #sidebar { width:240px; min-width:240px; background:var(--panel); border-right:1px solid #313244;
-      display:flex; flex-direction:column; }
+      display:flex; flex-direction:column; min-height:0; }
     #sidebar h1 { font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted);
       padding:12px 14px 6px; margin:0; }
     #sessions { list-style:none; margin:0; padding:0 6px; overflow-y:auto; flex:1; }
@@ -102,7 +105,7 @@
     #new { margin:10px; padding:8px; border:1px dashed #45475a; border-radius:6px; text-align:center;
       color:var(--muted); cursor:pointer; }
     #new:hover { color:var(--fg); border-color:var(--accent); }
-    #main { flex:1; display:flex; flex-direction:column; min-width:0; }
+    #main { flex:1; display:flex; flex-direction:column; min-width:0; min-height:0; overflow:hidden; }
     #tabs { display:none; gap:2px; padding:4px 6px 0; background:var(--panel); }
     #tabs.on { display:flex; }
     #tabs .tab { display:flex; align-items:center; gap:6px; padding:4px 10px; font-size:12px;
@@ -130,7 +133,7 @@
     /* the "+" new-tab button is a compact affordance, not a real tab: drop the min-width. */
     #tabs .tab.plus { min-width:0; color:var(--muted); font-weight:bold; padding:4px 10px; }
     #tabs .tab.plus:hover { color:var(--accent); }
-    #term { flex:1; padding:6px; min-height:0; position:relative; }
+    #term { flex:1; padding:6px; min-height:0; position:relative; overflow:hidden; }
     /* §22: while the active session is connecting or its link is broken, blur the console and
        block interaction so the user can't type into a session that can't receive it. The blur
        applies to the project containers (#term's direct children); .term-gate overlays a badge. */
