@@ -1,43 +1,43 @@
-'use strict';
+
 // 'fileviewer' tab kind (DESIGN.md §16): renders a fetched remote/local file in-app as text,
 // markdown, or image, with a Download-to-local button. It is APP-LOCAL — no tmux window — so the
 // tab machinery must never send tmux window commands for it (gated on real @N ids elsewhere).
 //
 // spec: { id (session id), path, api }   ctx: { setStatus }
 // The tab fetches its own content on mount (via api.readRemoteFile) so opening is one call.
-/* global module */
+import type { RemoteFileResult } from './types.js';
 
 // Tiered size caps: rendering cost, not the network, is the limit (§16). Over the render cap we
 // show a download-only panel instead of freezing the webview.
-const TEXT_RENDER_CAP = 1 * 1024 * 1024;   // text/markdown -> DOM
-const IMAGE_RENDER_CAP = 5 * 1024 * 1024;  // image -> data: URL decode
+export const TEXT_RENDER_CAP = 1 * 1024 * 1024;   // text/markdown -> DOM
+export const IMAGE_RENDER_CAP = 5 * 1024 * 1024;  // image -> data: URL decode
 // HTML gets a HIGHER cap than text even though it's also text: it goes to a real browser parser in
 // an iframe (not our hand-rolled markdown -> DOM path), and the whole point of the feature is
 // SELF-CONTAINED files, whose size is dominated by inlined base64 images/fonts. Exported notebooks
 // and plot reports routinely land in the 2-5 MB range and render fine.
-const HTML_RENDER_CAP = 5 * 1024 * 1024;
+export const HTML_RENDER_CAP = 5 * 1024 * 1024;
 
-const IMAGE_EXT = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+const IMAGE_EXT: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
   webp: 'image/webp', bmp: 'image/bmp', svg: 'image/svg+xml', ico: 'image/x-icon' };
-const MD_EXT = { md: 1, markdown: 1, mdown: 1, mkd: 1 };
-const HTML_EXT = { html: 1, htm: 1, xhtml: 1 };
+const MD_EXT: Record<string, number> = { md: 1, markdown: 1, mdown: 1, mkd: 1 };
+const HTML_EXT: Record<string, number> = { html: 1, htm: 1, xhtml: 1 };
 
-function extOf(path) {
+export function extOf(path: string): string {
   const base = String(path).split('/').pop() || '';
   const dot = base.lastIndexOf('.');
   return dot > 0 ? base.slice(dot + 1).toLowerCase() : '';
 }
-function baseName(path) { return (String(path).split('/').pop() || 'file'); }
+function baseName(path: string): string { return (String(path).split('/').pop() || 'file'); }
 
 // base64 -> Uint8Array (bytes), and a UTF-8 decode for text.
-function b64ToBytes(b64) {
+function b64ToBytes(b64: string): Uint8Array {
   const bin = atob(b64);
   const arr = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
   return arr;
 }
 // Binary sniff: NUL byte or invalid UTF-8 => not text.
-function looksBinary(bytes) {
+function looksBinary(bytes: Uint8Array): boolean {
   const n = Math.min(bytes.length, 4096);
   for (let i = 0; i < n; i++) if (bytes[i] === 0) return true;
   try { new TextDecoder('utf-8', { fatal: true }).decode(bytes.slice(0, n)); return false; }
@@ -48,7 +48,11 @@ function looksBinary(bytes) {
 // Returns { mode: 'image'|'markdown'|'html'|'text'|'toobig'|'binary', mime? }. mode 'toobig' means
 // the content exceeds its type's render cap -> download-only panel; 'binary' means non-image,
 // non-text -> download-only.
-function classify(path, size, bytes) {
+export type FileClassification =
+  | { mode: 'image'; mime: string }
+  | { mode: 'markdown' | 'html' | 'text' | 'toobig' | 'binary' };
+
+export function classify(path: string, size: number, bytes: Uint8Array): FileClassification {
   const ext = extOf(path);
   if (IMAGE_EXT[ext]) {
     return size > IMAGE_RENDER_CAP ? { mode: 'toobig' } : { mode: 'image', mime: IMAGE_EXT[ext] };
@@ -60,19 +64,20 @@ function classify(path, size, bytes) {
   return MD_EXT[ext] ? { mode: 'markdown' } : { mode: 'text' };
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+function escapeHtml(s: string): string {
+  const entities: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' };
+  return String(s).replace(/[&<>"]/g, (c) => entities[c] ?? c);
 }
 
 // Minimal, SAFE markdown -> HTML (headings, lists, code fences/spans, links, bold/italic). Every
 // piece is escaped first; NO raw-HTML passthrough (untrusted file content, CSP stays strict).
-function renderMarkdown(md) {
+export function renderMarkdown(md: string): string {
   const lines = md.split(/\r?\n/);
-  const out = [];
+  const out: string[] = [];
   let inCode = false, inUl = false;
   const closeUl = () => { if (inUl) { out.push('</ul>'); inUl = false; } };
   for (let i = 0; i < lines.length; i++) {
-    const raw = lines[i];
+    const raw = lines[i] ?? '';
     if (/^```/.test(raw)) {
       if (inCode) { out.push('</code></pre>'); inCode = false; }
       else { closeUl(); out.push('<pre class="mdcode"><code>'); inCode = true; }
@@ -80,17 +85,20 @@ function renderMarkdown(md) {
     }
     if (inCode) { out.push(escapeHtml(raw) + '\n'); continue; }
     const h = /^(#{1,6})\s+(.*)$/.exec(raw);
-    if (h) { closeUl(); out.push(`<h${h[1].length}>${inline(h[2])}</h${h[1].length}>`); continue; }
+    if (h) {
+      const level = h[1] ?? '';
+      closeUl(); out.push(`<h${level.length}>${inline(h[2] ?? '')}</h${level.length}>`); continue;
+    }
     // GFM table: a header row followed by a |---|:--:|--- separator row, then body rows.
-    if (isTableRow(raw) && i + 1 < lines.length && isTableSeparator(lines[i + 1])) {
+    if (isTableRow(raw) && i + 1 < lines.length && isTableSeparator(lines[i + 1] ?? '')) {
       closeUl();
-      const aligns = parseAligns(lines[i + 1]);
+      const aligns = parseAligns(lines[i + 1] ?? '');
       out.push(`<table class="mdtable"><thead><tr>${
         splitRow(raw).map((cell, j) => `<th${alignAttr(aligns[j])}>${inline(cell)}</th>`).join('')
       }</tr></thead><tbody>`);
       i += 2;   // consumed header + separator
-      while (i < lines.length && isTableRow(lines[i])) {
-        out.push(`<tr>${splitRow(lines[i]).map((cell, j) => `<td${alignAttr(aligns[j])}>${inline(cell)}</td>`).join('')}</tr>`);
+      while (i < lines.length && isTableRow(lines[i] ?? '')) {
+        out.push(`<tr>${splitRow(lines[i] ?? '').map((cell, j) => `<td${alignAttr(aligns[j])}>${inline(cell)}</td>`).join('')}</tr>`);
         i++;
       }
       i--;      // for-loop will ++ back to the first non-row line
@@ -98,7 +106,7 @@ function renderMarkdown(md) {
       continue;
     }
     const li = /^\s*[-*]\s+(.*)$/.exec(raw);
-    if (li) { if (!inUl) { out.push('<ul>'); inUl = true; } out.push(`<li>${inline(li[1])}</li>`); continue; }
+    if (li) { if (!inUl) { out.push('<ul>'); inUl = true; } out.push(`<li>${inline(li[1] ?? '')}</li>`); continue; }
     if (raw.trim() === '') { closeUl(); continue; }
     closeUl();
     out.push(`<p>${inline(raw)}</p>`);
@@ -108,38 +116,38 @@ function renderMarkdown(md) {
   return out.join('\n');
 
   // A table row has at least one unescaped '|' and isn't a code/heading line.
-  function isTableRow(s) { return /\|/.test(s) && s.trim() !== ''; }
+  function isTableRow(s: string): boolean { return /\|/.test(s) && s.trim() !== ''; }
   // Separator: cells of only -, :, spaces, with at least one '-' per cell, e.g. |---|:--:|--:|
-  function isTableSeparator(s) {
+  function isTableSeparator(s: string): boolean {
     if (!/\|/.test(s)) return false;
     const cells = splitRow(s);
     return cells.length > 0 && cells.every((c) => /^:?-+:?$/.test(c.trim()));
   }
   // Split "| a | b |" -> ["a","b"], tolerating optional leading/trailing pipes. A backslash-escaped
   // \| is kept as a literal pipe inside a cell (not a delimiter).
-  function splitRow(s) {
-    let t = s.trim().replace(/^\|/, '').replace(/\|$/, '');
-    const cells = [];
+  function splitRow(s: string): string[] {
+    const t = s.trim().replace(/^\|/, '').replace(/\|$/, '');
+    const cells: string[] = [];
     let cur = '';
     for (let k = 0; k < t.length; k++) {
       if (t[k] === '\\' && t[k + 1] === '|') { cur += '|'; k++; }
       else if (t[k] === '|') { cells.push(cur.trim()); cur = ''; }
-      else cur += t[k];
+      else cur += t[k] ?? '';
     }
     cells.push(cur.trim());
     return cells;
   }
-  function parseAligns(sep) {
+  function parseAligns(sep: string): string[] {
     return splitRow(sep).map((c) => {
       const t = c.trim();
       const l = t.startsWith(':'), r = t.endsWith(':');
       return r && l ? 'center' : r ? 'right' : l ? 'left' : '';
     });
   }
-  function alignAttr(a) { return a ? ` style="text-align:${a}"` : ''; }
+  function alignAttr(a: string | undefined): string { return a ? ` style="text-align:${a}"` : ''; }
 
   // inline spans: escape THEN apply a small set of patterns on the escaped text.
-  function inline(s) {
+  function inline(s: string): string {
     let t = escapeHtml(s);
     t = t.replace(/`([^`]+)`/g, (_m, c) => `<code>${c}</code>`);
     t = t.replace(/\*\*([^*]+)\*\*/g, (_m, c) => `<strong>${c}</strong>`);
@@ -151,28 +159,43 @@ function renderMarkdown(md) {
   }
 }
 
-function createFileViewerTab(spec, ctx) {
+export interface FileViewerApi {
+  readRemoteFile(id: string, path: string): Promise<RemoteFileResult>;
+  saveFile?(dataB64: string, suggestedName: string): Promise<{ ok?: boolean }>;
+  enableHtmlScripts?(dataB64: string): Promise<{ url?: string }>;
+  openExternal?(url: string): unknown;
+}
+
+export interface FileViewerTabSpec { id: string; path: string; api: FileViewerApi }
+export interface FileViewerTabContext { setStatus(message: string): void }
+
+export function createFileViewerTab(spec: FileViewerTabSpec, ctx: FileViewerTabContext) {
   const { id: sessionId, path, api } = spec;
-  let el = null;
+  let el: HTMLDivElement | null = null;
   let mounted = false;
-  let fetched = null;   // { data_b64, size, truncated } once loaded
+  let fetched: RemoteFileResult | null = null;   // { data_b64, size, truncated } once loaded
   // Scripted-HTML opt-in (§16), per TAB and per SESSION — never persisted, so reopening a file
   // starts static again and the choice can't silently carry over to a different file.
   let scripted = false;
-  let scriptedUrl = null;
+  let scriptedUrl: string | null = null;
 
-  function h(tag, attrs, ...kids) {
+  function h<K extends keyof HTMLElementTagNameMap>(
+    tag: K,
+    attrs: Record<string, string> | null,
+    ...kids: Array<string | Node>
+  ): HTMLElementTagNameMap[K] {
     const e = document.createElement(tag);
     if (attrs) for (const k in attrs) {
-      if (k === 'style') e.style.cssText = attrs[k];
-      else if (k === 'class') e.className = attrs[k];
-      else e.setAttribute(k, attrs[k]);
+      const value = attrs[k] ?? '';
+      if (k === 'style') e.style.cssText = value;
+      else if (k === 'class') e.className = value;
+      else e.setAttribute(k, value);
     }
     for (const kid of kids) e.appendChild(typeof kid === 'string' ? document.createTextNode(kid) : kid);
     return e;
   }
 
-  function toolbar(size, note, mode) {
+  function toolbar(size: number, note: string, mode: FileClassification['mode']): HTMLDivElement {
     const bar = h('div', { class: 'fv-bar' });
     bar.appendChild(h('span', { class: 'fv-name' }, baseName(path)));
     const meta = h('span', { class: 'fv-meta' }, fmtSize(size) + (note ? ' · ' + note : ''));
@@ -180,7 +203,8 @@ function createFileViewerTab(spec, ctx) {
     // "Enable scripts" — opt THIS document into a scripted preview. Only offered for html, and only
     // while still static: running a remote file's JS is a per-file decision, so there is no
     // remembered preference and no auto-enable. See the fv-html branch for the isolation.
-    if (mode === 'html' && !scripted && api.enableHtmlScripts) {
+    const enableHtmlScripts = api.enableHtmlScripts;
+    if (mode === 'html' && !scripted && enableHtmlScripts) {
       const en = h('button', { class: 'fv-scripts', title:
         'Run this file\'s scripts in an isolated frame (it will be able to load code from the network)' },
         'Enable scripts');
@@ -188,40 +212,41 @@ function createFileViewerTab(spec, ctx) {
         if (!fetched) return;
         en.disabled = true; en.textContent = 'Enabling…';
         try {
-          const res = await api.enableHtmlScripts(fetched.data_b64);
+          const res = await enableHtmlScripts(fetched.data_b64);
           if (!res || !res.url) throw new Error('no preview url');
           scriptedUrl = res.url;
           scripted = true;
           ctx.setStatus('scripts enabled for ' + baseName(path));
           if (el) renderInto(el);   // re-render into the scripted frame
         } catch (e) {
-          ctx.setStatus('enable scripts failed: ' + (e && e.message || e));
+          ctx.setStatus('enable scripts failed: ' + errorMessage(e));
           en.disabled = false; en.textContent = 'Enable scripts';
         }
       };
       bar.appendChild(en);
     }
+    const saveFile = api.saveFile;
     const dl = h('button', { class: 'fv-dl' }, 'Download to local');
     dl.onclick = async () => {
-      if (!fetched) return;
+      if (!fetched || !saveFile) return;
       dl.disabled = true; dl.textContent = 'Saving…';
       try {
-        const res = await api.saveFile(fetched.data_b64, baseName(path));
+        const res = await saveFile(fetched.data_b64, baseName(path));
         ctx.setStatus(res && res.ok ? `saved ${baseName(path)}` : 'save canceled');
-      } catch (e) { ctx.setStatus('save failed: ' + (e && e.message || e)); }
+      } catch (e) { ctx.setStatus('save failed: ' + errorMessage(e)); }
       dl.disabled = false; dl.textContent = 'Download to local';
     };
     bar.appendChild(dl);
     return bar;
   }
 
-  function fmtSize(n) {
+  function fmtSize(n: number): string {
     if (n < 1024) return n + ' B';
     if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
     return (n / 1024 / 1024).toFixed(1) + ' MB';
   }
 
-  function renderInto(container) {
+  function renderInto(container: HTMLElement): void {
     container.innerHTML = '';
     const body = h('div', { class: 'fv-body' });
     if (!fetched) { body.appendChild(h('div', { class: 'fv-msg' }, 'Loading…')); container.appendChild(body); return; }
@@ -229,7 +254,7 @@ function createFileViewerTab(spec, ctx) {
     const bytes = b64ToBytes(fetched.data_b64);
     const c = classify(path, fetched.size, bytes);
     // Classify BEFORE building the toolbar: the mode contributes a note and the Enable-scripts button.
-    const notes = [];
+    const notes: string[] = [];
     if (fetched.truncated) notes.push('truncated');
     // Say which of the two html modes is in effect, so an inert page reads as intended rather than
     // as a bug, and a scripted one is never silent about it.
@@ -279,14 +304,18 @@ function createFileViewerTab(spec, ctx) {
         // Empty allow-list: no camera/mic/geolocation/etc even in scripted mode.
         allow: '',
       });
-      if (scripted) frame.src = scriptedUrl;
+      if (scripted && scriptedUrl) frame.src = scriptedUrl;
       else frame.srcdoc = new TextDecoder('utf-8').decode(bytes);
       body.appendChild(frame);
     } else if (c.mode === 'markdown') {
       const md = h('div', { class: 'fv-md' });
       md.innerHTML = renderMarkdown(new TextDecoder('utf-8').decode(bytes));  // renderMarkdown escapes all content
-      md.querySelectorAll('a.mdlink').forEach((a) => {
-        a.onclick = (e) => { e.preventDefault(); api.openExternal(a.getAttribute('data-url')); };
+      md.querySelectorAll<HTMLAnchorElement>('a.mdlink').forEach((a) => {
+        a.onclick = (e) => {
+          e.preventDefault();
+          const url = a.getAttribute('data-url');
+          if (url) api.openExternal?.(url);
+        };
       });
       body.appendChild(md);
     } else {
@@ -301,7 +330,7 @@ function createFileViewerTab(spec, ctx) {
     kind: 'fileviewer',
     get mounted() { return mounted; },
 
-    async mount(container) {
+    async mount(container: HTMLElement) {
       el = h('div', { class: 'fv-root', style: 'width:100%;height:100%;overflow:auto;' });
       container.appendChild(el);
       mounted = true;
@@ -311,7 +340,7 @@ function createFileViewerTab(spec, ctx) {
           fetched = await api.readRemoteFile(sessionId, path);
         } catch (e) {
           el.innerHTML = '';
-          el.appendChild(h('div', { class: 'fv-msg fv-err' }, 'Could not open: ' + (e && e.message || e)));
+          el.appendChild(h('div', { class: 'fv-msg fv-err' }, 'Could not open: ' + errorMessage(e)));
           ctx.setStatus('open failed: ' + baseName(path));
           return;
         }
@@ -328,5 +357,6 @@ function createFileViewerTab(spec, ctx) {
   };
 }
 
-if (typeof module !== 'undefined' && module.exports) module.exports = { createFileViewerTab, renderMarkdown, extOf, classify, TEXT_RENDER_CAP, IMAGE_RENDER_CAP, HTML_RENDER_CAP };
-if (typeof window !== 'undefined') window.DTFileViewerTab = { createFileViewerTab, renderMarkdown, extOf, classify };
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

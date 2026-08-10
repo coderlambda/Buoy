@@ -5,7 +5,8 @@ persist server-side (tmux) and **resurface after network drops** — like a buoy
 by a wave, the connection always pops back up. ssh + tmux control mode for native tabs,
 clickable paths/URLs, and localhost port-forwarding.
 
-The app is **Tauri v2 + Rust** (`src-tauri/`) with a vanilla-JS frontend (`ui/`). See
+The app is **Tauri v2 + Rust** (`src-tauri/`) with a strict TypeScript frontend (`ui/src/`),
+bundled by Vite. See
 `DESIGN.md` for the full, adversarially-reviewed design,
 `OSC_NOTIFICATIONS_DESIGN.md` for terminal notification behavior, `TAURI_MIGRATION.md` for
 the history of the port from the original Electron MVP (deleted from this branch; it
@@ -36,7 +37,7 @@ survives in git history and on `main`), and `TEST_PLAN.md` for the test matrix.
 ## Run
 
 ```bash
-npm run tauri:dev      # develop (compiles the Rust backend, loads ui/ with hot reload)
+npm run tauri:dev      # develop (Vite hot reload + the Rust/Tauri backend)
 npm run tauri:build    # release bundle -> src-tauri/target/release/bundle/
                        #   macos/Buoy.app + dmg/Buoy_<version>_<arch>.dmg
 ```
@@ -49,22 +50,23 @@ still works, as a plain non-persistent pty). **Remote** sessions need `ssh` acce
 ## Test
 
 ```bash
-npm run tauri:test     # Rust unit tests (128): validation, supervisor state machine,
+npm run tauri:test     # Rust unit tests (132): validation, supervisor state machine,
                        # persistence, control-mode parser + reply routing, window registry,
                        # tunnels/sticky ports, local pty backend, Claude launcher integration
-npm test               # JS unit tests for the ui/ frontend modules (clipboard, file
+npm run typecheck      # strict TypeScript checks for UI, tests, config, and test bridge
+npm test               # TypeScript unit tests for the ui/ frontend modules (clipboard, file
                        # viewer, link plugins)
-npm run gui-rename     # full-GUI inline-rename suite (real ui/ in a real browser)
-npm run gui-reorder    # full-GUI drag-to-reorder suite (real ui/ in a real browser)
+npm run test:ui        # all full-GUI suites in the real Tauri platform webview
+npm run gui-rename     # full-GUI inline-rename suite (single-suite shortcut)
+npm run gui-reorder    # full-GUI drag-to-reorder suite (single-suite shortcut)
 npm run gui-notifications # full-GUI OSC/BEL notification-dot and acknowledgement suite
 npm run gui-terminal-repaint # reconnect repaint/cursor and command-echo ordering in real xterm
 ```
 
-The `gui-*` suites drive the REAL `ui/index.html` + `ui/renderer.js` with browser/OS-level
-input events. They use Electron purely as a scriptable headless browser (that is the only
-reason `electron` remains in devDependencies — the app itself has no Electron in it);
-`cd src-tauri && cargo test` additionally has `#[ignore]`d live-host suites — see
-TEST_PLAN.md.
+The `gui-*` suites build a test-only Tauri binary and drive the Vite build of `ui/index.html` +
+`ui/src/renderer.ts` in WKWebView/WebView2/WebKitGTK through WebdriverIO's embedded Tauri driver.
+The embedded driver and fixture bridge are excluded from production builds. `cd src-tauri &&
+cargo test` additionally has `#[ignore]`d live-host suites — see TEST_PLAN.md.
 
 ## Debug logging
 

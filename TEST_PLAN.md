@@ -1,7 +1,7 @@
 # Test Plan
 
-The app is Tauri + Rust (`src-tauri/`) with a vanilla-JS frontend (`ui/`). The Electron MVP
-and its JS test suites were deleted when the migration completed (git history has both; the
+The app is Tauri + Rust (`src-tauri/`) with a strict TypeScript frontend (`ui/src/`). The Electron MVP
+and its original JavaScript test suites were deleted when the migration completed (git history has both; the
 old plan's TC-V/TC-B/TC-S/TC-P/TC-L case lists went with them — their Rust ports below carry
 their own case IDs). Tests are split by what runs **headless & deterministically** here vs.
 what needs a **live remote** (opt-in `#[ignore]`d suites).
@@ -16,8 +16,8 @@ what needs a **live remote** (opt-in `#[ignore]`d suites).
 | Session persistence | `src-tauri/src/session_store.rs` | unit (tmp dir) | ✅ |
 | Local tmux backend | `src-tauri/src/local_backend.rs` | integration (real pty + real tmux) | ✅ |
 | Tunnels / sticky ports | `src-tauri/src/tunnel.rs` | unit (real sockets, no remote) | ✅ |
-| Frontend modules (clipboard, file viewer, link plugins) | `ui/*.js` | JS unit (`npm test`) | ✅ |
-| Full GUI (rename, drag-to-reorder, OSC/BEL notifications) | `ui/index.html` + `ui/renderer.js` | real browser, OS-level input | ✅ |
+| Frontend modules (clipboard, file viewer, link plugins) | `ui/src/*.ts` | TypeScript unit (`npm test`) | ✅ |
+| Full GUI (rename, reorder, notifications, new-session form, reconnect repaint) | `ui/index.html` + `ui/src/renderer.ts` | real Tauri platform webview + WebDriver | ✅ |
 | Real ssh+tmux end-to-end | `src-tauri/tests/live_*.rs` | live host, `#[ignore]`d | ❌ needs `DT_LIVE_HOST` |
 
 Deferred with the feature: backpressure watermarks (the `ack` bridge call is a no-op in the
@@ -25,11 +25,11 @@ Tauri port; the Electron-era module and its TC-B suite are in git history).
 
 ---
 
-## JS unit tests (`npm test` — the `ui/` frontend modules)
+## TypeScript unit tests (`npm test` — the `ui/src/` frontend modules)
 
-- **clipboard.test.js** — OSC 52 / clipboard handling in `ui/terminalTab.js`.
-- **fileViewer.test.js** — markdown/table/HTML-preview rendering in `ui/fileViewerTab.js` (§16).
-- **plugins.test.js** — `ui/plugins.js` registry + `ui/builtinPlugins.js` link detection
+- **clipboard.test.ts** — OSC 52 / clipboard handling in `ui/src/terminalTab.ts`.
+- **fileViewer.test.ts** — markdown/table/HTML-preview rendering in `ui/src/fileViewerTab.ts` (§16).
+- **plugins.test.ts** — `ui/src/plugins.ts` registry + `ui/src/builtinPlugins.ts` link detection
   (URLs, paths, OSC 8, loopback-URL routing, §17–18), plus streaming OSC 9/99/777
   notification parsing (`OSC_NOTIFICATIONS_DESIGN.md`).
 
@@ -80,20 +80,29 @@ DT_LIVE_HOST=user@host cargo test --test live_tunnel -- --ignored --nocapture
 
 ---
 
-## Automated GUI tests (real Electron; NOT in the `npm test` glob)
+## Automated GUI tests (real Tauri webview; NOT in the `npm test` glob)
 
-### TC-R — Inline rename (`test/gui-rename.js`, DESIGN.md §23)
-Run directly — it needs an Electron binary, and `npm test`'s `test/*.test.js` glob deliberately
-skips it:
+Build the test-only Tauri binary and run every GUI suite with:
 
 ```
-node_modules/.bin/electron test/gui-rename.js
+npm run test:ui
 ```
 
-Loads the real `ui/index.html` + `ui/renderer.js` against a preload stub of `window.terminalAPI` and
-drives **real OS-level double-clicks** (`sendInputEvent`, `clickCount` 1 then 2). That fidelity is the
-point: a synthetic `dispatchEvent(new MouseEvent('dblclick'))` skips the two preceding `click` events
-and *passes against the broken code*.
+The `ui-test` Cargo feature embeds Tauri's WebDriver plugin and a deterministic backend fixture.
+It is absent from production binaries. WebdriverIO launches the actual app webview for the host
+platform, so the suites exercise the shipped engine rather than Electron/Chromium.
+
+### TC-R — Inline rename (`test/gui-rename.ts`, DESIGN.md §23)
+Run this suite alone with:
+
+```
+npm run gui-rename
+```
+
+Loads the real Vite build of `ui/index.html` + `ui/src/renderer.ts` through the production Tauri adapter and drives the
+first click through native WebDriver input. The embedded WKWebView driver does not synthesize the
+second click/double-click detail, so the harness completes that OS event sequence in-page after the
+native first click; this retains the click/rerender/double-click ordering that pins the original bug.
 
 - **TC-R1** double-clicking the active project's name yields an editor that is present, **connected to
   the live document**, visible, seeded with the current title, and focused. (`connected` is the
@@ -111,15 +120,16 @@ and *passes against the broken code*.
 Mutation-verified — see the table in DESIGN.md §23 for the six mutations and the failures each
 produced.
 
-### TC-D — Drag-to-reorder (`test/gui-reorder.js`, DESIGN.md §24)
+### TC-D — Drag-to-reorder (`test/gui-reorder.ts`, DESIGN.md §24)
 ```
-node_modules/.bin/electron test/gui-reorder.js
+npm run gui-reorder
 ```
-Same harness as TC-R (real `ui/index.html` + `ui/renderer.js`, preload stub of `window.terminalAPI`),
-with **three** fake projects — the minimum that distinguishes "moved one slot" from "swapped with the
-neighbour". Drags are real OS-level input: `mouseDown`, eight `mouseMove` steps, `mouseUp`. Every
-drag travels `pitch + 6`px, because `dropIndexAt` compares strictly and travelling *exactly* one
-pitch lands the pointer on the neighbour's midpoint (see §24).
+Same Tauri harness as TC-R, with **three** fake projects — the minimum that distinguishes "moved one
+slot" from "swapped with the neighbour". Drags are WebDriver input sequences: down, eight move
+steps, up. On macOS the embedded driver injects native mouse events but does not promote them back to
+PointerEvents, so this suite bridges that automation-only gap in-page while preserving native
+hit-testing. Every drag travels `pitch + 6`px because `dropIndexAt` compares strictly and travelling
+*exactly* one pitch lands on the neighbour's midpoint (see §24).
 
 - **TC-D0** the rows are **not** HTML5-draggable. This is the shipped bug's fingerprint: `draggable`
   hands the gesture back to the native machinery that swallows it (`+` badge, immovable card).
@@ -153,16 +163,37 @@ pitch lands the pointer on the neighbour's midpoint (see §24).
 Mutation-verified — see the table in DESIGN.md §24 for the eleven mutations, including the three that
 passed and what was corrected in response.
 
-### TC-N — terminal notification dots (`test/gui-notifications.js`, `OSC_NOTIFICATIONS_DESIGN.md`)
+### TC-NS — new-session dialog (`test/gui-new-session.ts`)
+
 ```
-node_modules/.bin/electron test/gui-notifications.js
+npm run gui-new-session
+```
+
+- **TC-NS1** the native Type select uses the themed input geometry/chrome and switches between
+  remote fields and the local-shell explanation.
+- **TC-NS2** a blank remote host keeps the dialog open, shows an inline validation message, and
+  never invokes `create_session`.
+- **TC-NS3** Cancel creates nothing; reopening clears stale errors and restores Native tabs to its
+  default enabled state.
+- **TC-NS4** host history loads through the Tauri adapter, preserves recency order, filters as the
+  user types, and selects on mousedown before input blur hides the menu.
+- **TC-NS5** remote values are trimmed and mapped to `{ transport:'ssh' }`; a backend downgrade to
+  plain mode and returned tmux path/version are adopted without a duplicate create call.
+- **TC-NS6** local creation maps to `{ transport:'local' }`, drops a stale hidden Host value, uses
+  the default `local` title, and adopts a bare-pty downgrade without showing native tabs.
+- **TC-NS7** a rejected Rust create command keeps the dialog open with the backend reason, produces
+  no unhandled rejection or phantom row, and can be retried successfully in place.
+
+### TC-N — terminal notification dots (`test/gui-notifications.ts`, `OSC_NOTIFICATIONS_DESIGN.md`)
+```
+npm run gui-notifications
 ```
 Loads the real UI with one native-tab session and one plain/single-tab session. Backend events are
-injected through the same `terminalAPI` listener surface used by Tauri.
+injected through the same adapter boundary used by Tauri.
 
 - **TC-N1** the UI starts with no session or tab notification dots.
-- **TC-N1b** xterm's OSC 10 colour-query reply is tagged with the tmux window that emitted the
-  query, preventing a tab-switch race from injecting `10;rgb:…` text into a neighbouring tab.
+- **TC-N1b** xterm's device-attributes reply is tagged with the tmux window that emitted the query,
+  preventing a tab-switch race from injecting a protocol reply into a neighbouring tab.
 - **TC-N2** an OSC 777 split across data chunks creates no dot until its terminator, then marks only
   the emitting tab and its session.
 - **TC-N3** two unread tabs roll up to one session dot and survive unrelated rerenders.

@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "DOM"],
+    "types": [],
+    "target": "ES2019",
+    "module": "none",
+    "outFile": "src-tauri/src/ui_test_init.js",
+    "removeComments": false
+  },
+  "files": ["src-tauri/ui_test_init.ts"]
+}

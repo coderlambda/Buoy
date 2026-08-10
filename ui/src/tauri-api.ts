@@ -1,16 +1,26 @@
-'use strict';
+
 // Tauri adapter: recreates the `window.terminalAPI` surface the renderer expects (formerly
 // provided by Electron's preload.js), implemented over Tauri's invoke() + event listen().
-// This is the ONE place that knows we're on Tauri; renderer.js is unchanged.
-const { invoke } = window.__TAURI__.core;
-const { listen } = window.__TAURI__.event;
+// This is the ONE place that knows we're on Tauri; renderer.ts stays transport-agnostic.
+// A feature-gated Tauri test binary installs this bridge as a webview initialization script. It
+// supplies deterministic invoke/event behavior before this production adapter loads, so UI tests
+// exercise the real adapter and native webview without touching live ssh/tmux sessions.
+import type { TerminalAPI } from './types.js';
 
-// Bridge a Tauri event -> the callback shape renderer.js registers (it expects the payload obj).
-function on(event, cb) {
-  listen(event, (e) => cb(e.payload));
+const uiTestBridge = window.__BUOY_UI_TEST__;
+const invoke: TauriCore['invoke'] = uiTestBridge
+  ? uiTestBridge.invoke.bind(uiTestBridge)
+  : window.__TAURI__.core.invoke.bind(window.__TAURI__.core);
+const listen: TauriEvents['listen'] = uiTestBridge
+  ? uiTestBridge.listen.bind(uiTestBridge)
+  : window.__TAURI__.event.listen.bind(window.__TAURI__.event);
+
+// Bridge a Tauri event -> the callback shape renderer.ts registers (it expects the payload obj).
+function on<T>(event: string, cb: (payload: T) => void): void {
+  void listen<T>(event, (e) => cb(e.payload));
 }
 
-window.terminalAPI = {
+export const terminalAPI: TerminalAPI = {
   // session CRUD — the Rust side owns all argv/validation.
   listSessions: () => invoke('list_sessions'),
   createSession: (meta) => invoke('create_session', { meta }),
@@ -20,7 +30,7 @@ window.terminalAPI = {
   // wrong program and make its payload appear as typed text.
   input: (id, data, win) => invoke('session_input', { id, data, win }),
   resize: (id, cols, rows) => invoke('session_resize', { id, cols, rows }),
-  ack: (_id, _bytes) => {},   // backpressure ACK is a no-op in the Tauri port (deferred)
+  ack: (_id: string, _bytes: number) => {},   // backpressure ACK is a no-op in the Tauri port (deferred)
   close: (id) => invoke('session_close', { id }),   // detach (remote keeps running)
   kill: (id) => invoke('session_kill', { id }),     // terminate remote tmux session
   retry: (id) => invoke('session_retry', { id }),   // manual reconnect from a dead session
@@ -66,14 +76,16 @@ window.terminalAPI = {
   onWindow: (cb) => on('session:window', cb),
   onReady: (cb) => on('session:ready', cb),
   onTunnels: (cb) => on('session:tunnels', cb),   // §18: { id, tunnels:[{remote,local}] }
-  log: (msg) => { try { console.log('[DT ui]', msg); } catch (_) {} try { invoke('ui_log', { msg: String(msg) }); } catch (_) {} },
+  log: (msg) => { try { console.log('[DT ui]', msg); } catch (_) {} try { void invoke('ui_log', { msg: String(msg) }); } catch (_) {} },
 };
+window.terminalAPI = terminalAPI;
 
 // Surface uncaught renderer errors to the log file too (a thrown handler would otherwise be
 // invisible and look like "stuck connecting").
 window.addEventListener('error', (e) => {
-  try { invoke('ui_log', { msg: 'window.error: ' + (e && e.message) + ' @ ' + (e && e.filename) + ':' + (e && e.lineno) }); } catch (_) {}
+  try { void invoke('ui_log', { msg: 'window.error: ' + e.message + ' @ ' + e.filename + ':' + e.lineno }); } catch (_) {}
 });
 window.addEventListener('unhandledrejection', (e) => {
-  try { invoke('ui_log', { msg: 'unhandledrejection: ' + (e && e.reason && (e.reason.message || e.reason)) }); } catch (_) {}
+  const reason = e.reason instanceof Error ? e.reason.message : String(e.reason);
+  try { void invoke('ui_log', { msg: 'unhandledrejection: ' + reason }); } catch (_) {}
 });

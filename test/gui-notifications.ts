@@ -1,49 +1,22 @@
-'use strict';
-// Full renderer regression test for OSC/BEL notification dots. It exercises real ui/index.html
-// and ui/renderer.js in Chromium while driving the same backend events Tauri delivers.
-//
-// Usage: node_modules/.bin/electron test/gui-notifications.js
-const { app, BrowserWindow } = require('electron');
-const fs = require('fs');
-const path = require('path');
 
-let failures = 0;
-const check = (condition, message) => {
-  console.log((condition ? 'ok   ' : 'FAIL ') + message);
-  if (!condition) failures++;
-};
+// Full renderer regression test for OSC/BEL notification dots in Buoy's real Tauri webview.
+import {
+  createChecks, fire, js, loadFixture, screenshotIfRequested, session,
+} from './tauri-ui-harness.js';
 
-const UI = path.join(__dirname, '..', 'ui');
-const SCREENSHOT_DIR = process.env.BUOY_GUI_SCREENSHOT_DIR || '';
-
-function writeTestPage() {
-  const html = fs.readFileSync(path.join(UI, 'index.html'), 'utf8');
-  const stripped = html.replace(/\s*<script src="tauri-api\.js"><\/script>/, '');
-  if (stripped === html) throw new Error('tauri-api.js script tag not found in ui/index.html');
-  const out = path.join(UI, '.gui-notifications-test.html');
-  fs.writeFileSync(out, stripped);
-  return out;
-}
-
-app.disableHardwareAcceleration();
-app.whenReady().then(async () => {
-  const page = writeTestPage();
-  const cleanup = () => { try { fs.unlinkSync(page); } catch (_) {} };
-  const win = new BrowserWindow({
-    width: 1000, height: 700, show: false,
-    webPreferences: { offscreen: true, contextIsolation: false,
-      preload: path.join(__dirname, 'gui-notifications-preload.js') },
+describe('Tauri UI: terminal notification dots', () => {
+  before(async () => {
+    await browser.setWindowSize(1000, 700);
+    await loadFixture([
+      { ...session(1, 'native project'), host: 'me@native' },
+      { ...session(2, 'plain project', 'plain'), host: 'me@plain' },
+    ]);
   });
-  const wc = win.webContents;
-  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  const js = (code) => wc.executeJavaScript(code);
-  const fire = (event, payload) => js(
-    `window.__fire(${JSON.stringify(event)}, ${JSON.stringify(payload)})`);
-  const snapshot = async (name) => {
-    if (!SCREENSHOT_DIR) return;
-    fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
-    fs.writeFileSync(path.join(SCREENSHOT_DIR, name), (await wc.capturePage()).toPNG());
-  };
+
+  it('aggregates, ignores, and acknowledges OSC/BEL attention', async () => {
+    const { check, finish } = createChecks();
+    const sleep = (ms: number) => browser.pause(ms);
+    const snapshot = (name: string) => screenshotIfRequested(name, 'BUOY_GUI_SCREENSHOT_DIR');
 
   function dotState() {
     return js(`(() => ({
@@ -69,7 +42,7 @@ app.whenReady().then(async () => {
     }))()`);
   }
 
-  const clickTab = (title) => js(`(() => {
+  const clickTab = (title: string) => js(`(() => {
     const tab = Array.from(document.querySelectorAll('#tabs .tab:not(.plus)')).find(
       (node) => (node.querySelector('.ttext') || {}).textContent === ${JSON.stringify(title)});
     if (!tab) return false;
@@ -100,9 +73,6 @@ app.whenReady().then(async () => {
     return true;
   })()`);
 
-  await win.loadFile(page);
-  await sleep(800);
-
   check((await js('window.__errs || []')).length === 0, 'no uncaught renderer errors');
 
   // Build the native tmux tab strip exactly as control-mode backend events do.
@@ -117,16 +87,16 @@ app.whenReady().then(async () => {
   check(state.sessionS1 === 0 && state.tabDots.length === 0,
     'TC-N1 starts with no session or tab notification dots');
 
-  // xterm answers OSC colour queries through onData, the same path as keyboard input. The reply
+  // xterm answers device-attributes queries through onData, the same path as keyboard input. The reply
   // must carry the xterm's own window id: while switching tabs, the backend's active-window event
-  // can still name the previous tab, which used to inject `10;rgb:...` into that other program.
-  await js('window.__inputs = []');
-  await fire('data', { id: 's1', window: '@0', data: '\u001b]10;?\u0007' });
+  // can still name the previous tab, which used to inject a terminal reply into that other program.
+  await js('window.__inputs.length = 0');
+  await fire('data', { id: 's1', window: '@0', data: '\u001b[c' });
   await sleep(100);
-  const colourReplies = await js('window.__inputs || []');
-  check(colourReplies.some((args) => args[0] === 's1' && args[2] === '@0'
-      && String(args[1]).includes(']10;rgb:')),
-    `TC-N1b OSC colour reply is addressed to its source tab (got ${JSON.stringify(colourReplies)})`);
+  const protocolReplies = await js('window.__inputs || []');
+  check(protocolReplies.some((args: unknown[]) => args[0] === 's1' && args[2] === '@0'
+      && String(args[1]).includes('[?1;2c')),
+    `TC-N1b terminal reply is addressed to its source tab (got ${JSON.stringify(protocolReplies)})`);
 
   // A notification from the terminal the user is already viewing is not unread work.
   await fire('data', { id: 's1', window: '@0', data: '\u001b]9;Visible work finished\u0007' });
@@ -205,7 +175,7 @@ app.whenReady().then(async () => {
   await fire('window', { id: 's1', action: 'active', window: '@1', order: ['@0', '@1'] });
   await fire('data', { id: 's1', window: '@0', data: '\u001b]9;Type to acknowledge\u0007' });
   await fire('window', { id: 's1', action: 'active', window: '@0', order: ['@0', '@1'] });
-  await fire('data', { id: 's1', window: '@0', data: '\u001b]10;?\u0007' });
+  await fire('data', { id: 's1', window: '@0', data: '\u001b[c' });
   await sleep(100);
   state = await dotState();
   check(state.sessionS1 === 1 && JSON.stringify(state.tabDots) === JSON.stringify(['shell']),
@@ -217,7 +187,7 @@ app.whenReady().then(async () => {
 
   // The same rule applies to a mounted background xterm.
   await fire('data', { id: 's1', window: '@1', data: '\u001b]9;Background work\u0007' });
-  await fire('data', { id: 's1', window: '@1', data: '\u001b]10;?\u0007' });
+  await fire('data', { id: 's1', window: '@1', data: '\u001b[c' });
   await sleep(100);
   state = await dotState();
   check(state.sessionS1 === 1 && JSON.stringify(state.tabDots) === JSON.stringify(['agent']),
@@ -265,7 +235,6 @@ app.whenReady().then(async () => {
   const errors = await js('window.__errs || []');
   check(errors.length === 0, `no renderer errors after notification interactions (got ${JSON.stringify(errors)})`);
 
-  cleanup();
-  console.log(failures ? `\n${failures} check(s) FAILED` : '\nall ok');
-  app.exit(failures ? 1 : 0);
+    finish();
+  });
 });
