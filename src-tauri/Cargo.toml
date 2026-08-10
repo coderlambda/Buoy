@@ -1,6 +1,6 @@
 [package]
 name = "buoy"
-version = "0.1.0"
+version = "0.1.1"
 description = "Buoy — durable remote terminal (ssh + tmux control mode) whose sessions resurface after network drops"
 edition = "2021"
 rust-version = "1.77.2"
