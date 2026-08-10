@@ -29,5 +29,6 @@ performance profile remains the authoritative live-TUI check.
 
 Canvas showed no measured user-visible deficit relative to DOM in this gate. It slightly improved the
 fixed write completion and the noisy in-place-frame sample, while memory and input latency were within
-run-to-run noise. Phase 2 WebGL is therefore **not justified**, and TUI detection remains deferred
-because its only committed consumer is the unshipped WebGL corrective sweep.
+run-to-run noise. Phase 2 WebGL is therefore **not justified**. The renderer-independent TUI activity
+primitive is implemented for diagnostics and future consumers, but it does not enable a WebGL sweep
+or add a second UI indicator.

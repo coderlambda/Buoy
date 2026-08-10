@@ -16,7 +16,7 @@ what needs a **live remote** (opt-in `#[ignore]`d suites).
 | Session persistence | `src-tauri/src/session_store.rs` | unit (tmp dir) | ✅ |
 | Local tmux backend | `src-tauri/src/local_backend.rs` | integration (real pty + real tmux) | ✅ |
 | Tunnels / sticky ports | `src-tauri/src/tunnel.rs` | unit (real sockets, no remote) | ✅ |
-| Frontend modules (clipboard, file viewer, link plugins) | `ui/src/*.ts` | TypeScript unit (`npm test`) | ✅ |
+| Frontend modules (clipboard, file viewer, link plugins, TUI detection) | `ui/src/*.ts` | TypeScript unit (`npm test`) | ✅ |
 | Full GUI (rename, reorder, notifications, new-session form, reconnect/reveal repaint, Canvas fallback) | `ui/index.html` + `ui/src/renderer.ts` | real Tauri platform webview + WebDriver | ✅ |
 | Real ssh+tmux end-to-end | `src-tauri/tests/live_*.rs` | live host, `#[ignore]`d | ❌ needs `DT_LIVE_HOST` |
 
@@ -31,7 +31,9 @@ Tauri port; the Electron-era module and its TC-B suite are in git history).
 - **fileViewer.test.ts** — markdown/table/HTML-preview rendering in `ui/src/fileViewerTab.ts` (§16).
 - **plugins.test.ts** — `ui/src/plugins.ts` registry + `ui/src/builtinPlugins.ts` link detection
   (URLs, paths, OSC 8, loopback-URL routing, §17–18), plus streaming OSC 9/99/777
-  notification parsing (`OSC_NOTIFICATIONS_DESIGN.md`).
+  notification parsing (`OSC_NOTIFICATIONS_DESIGN.md`) and TC-T1…T9 repaint-in-place/TUI activity
+  detection. The TUI cases include raw Claude Code and plain-zsh captures, split CSI delivery,
+  false-positive boundaries, and deterministic decay/re-arm behavior.
 
 ---
 

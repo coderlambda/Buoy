@@ -1,6 +1,10 @@
 
 import type { LinkContext, LinkModifiers, LinkPlugin } from './plugins.js';
-import type { OscNotificationParser } from './types.js';
+import type {
+  OscNotificationParser,
+  TuiActivityOptions,
+  TuiActivityTracker,
+} from './types.js';
 
 // Built-in link plugins: URL and filesystem path. They use the SAME registry API a
 // third-party plugin would (see plugins.ts), so they are examples as much as
@@ -187,6 +191,51 @@ export function isOscNotification(payload: string): boolean {
   if (fields.d === '0') return false;
   const part = fields.p || 'title';
   return part === 'title' || part === 'body';
+}
+
+// A TUI proves it is repainting previous rows through explicit frame markers, two-argument cursor
+// positioning/margins, or vertical movement over at least two rows. Deliberately do NOT match CHA
+// (`CSI n G`): Claude emits it heavily, but so do ordinary prompts and carriage-return progress
+// bars. `CSI 1 A` is excluded for the same reason—single-line readline redraws are normal shell use.
+const TUI_SEQ_SOURCE = String.raw`\x1b\[(?:\?2026h|\d+;\d+[Hr]|(?:[2-9]|\d{2,})A)`;
+const TUI_SEQ = new RegExp(TUI_SEQ_SOURCE);
+const TUI_SEQ_GLOBAL = new RegExp(TUI_SEQ_SOURCE, 'g');
+const TUI_CARRY_CHARS = 16;
+
+export function containsTuiRepaint(data: string): boolean {
+  return TUI_SEQ.test(data);
+}
+
+export function createTuiActivityTracker(options?: TuiActivityOptions): TuiActivityTracker {
+  const { decayMs = 10_000, now: clock = Date.now } = options ?? {};
+  const decay = Math.max(0, decayMs);
+  let carry = '';
+  let activeUntil = Number.NEGATIVE_INFINITY;
+
+  return {
+    write(data: string, now = clock()): boolean {
+      if (data) {
+        const combined = carry + data;
+        // Rescan the overlap so split CSI sequences are detected, but ignore a match wholly inside
+        // the old carry: re-counting it on every small chunk would incorrectly extend the decay.
+        TUI_SEQ_GLOBAL.lastIndex = 0;
+        let match: RegExpExecArray | null;
+        while ((match = TUI_SEQ_GLOBAL.exec(combined)) !== null) {
+          if (match.index + match[0].length > carry.length) {
+            activeUntil = now + decay;
+            break;
+          }
+        }
+        carry = combined.slice(-TUI_CARRY_CHARS);
+      }
+      return now < activeUntil;
+    },
+    active(now = clock()): boolean { return now < activeUntil; },
+    reset(): void {
+      carry = '';
+      activeUntil = Number.NEGATIVE_INFINITY;
+    },
+  };
 }
 
 export function builtinLinkPlugins(): LinkPlugin[] {

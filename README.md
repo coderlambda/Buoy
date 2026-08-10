@@ -55,7 +55,7 @@ npm run tauri:test     # Rust unit tests (132): validation, supervisor state mac
                        # tunnels/sticky ports, local pty backend, Claude launcher integration
 npm run typecheck      # strict TypeScript checks for UI, tests, config, and test bridge
 npm test               # TypeScript unit tests for the ui/ frontend modules (clipboard, file
-                       # viewer, link plugins)
+                       # viewer, link plugins, TUI activity detection)
 npm run test:ui        # all full-GUI suites in the real Tauri platform webview
 npm run gui-rename     # full-GUI inline-rename suite (single-suite shortcut)
 npm run gui-reorder    # full-GUI drag-to-reorder suite (single-suite shortcut)

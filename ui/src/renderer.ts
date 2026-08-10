@@ -20,6 +20,7 @@ import type {
   SessionMeta,
   SessionState,
   TabContent,
+  TuiActivityTracker,
   TunnelInfo,
 } from './types.js';
 
@@ -49,6 +50,8 @@ interface AppTab {
   viewer?: boolean;
   unreadNotification?: boolean;
   notificationParser?: OscNotificationParser;
+  tuiTracker?: TuiActivityTracker;
+  tuiReportedActive?: boolean;
   pre?: string[] | null;
   backfilled?: boolean;
   closing?: boolean;
@@ -300,6 +303,9 @@ function ensureTab(v: View, winId: string): AppTab {
     // Keeping it on the tab also prevents an unfinished OSC in one tmux window from consuming
     // bytes from another window.
     notificationParser: DTBuiltinPlugins.createOscNotificationParser(),
+    // TUI repaint state is per tmux window: one Claude/vim tab must not mark sibling shells active.
+    tuiTracker: DTBuiltinPlugins.createTuiActivityTracker(),
+    tuiReportedActive: false,
   };
   v.tabs.set(winId, tab);
   return tab;
@@ -334,6 +340,22 @@ function harvestOscNotifications(v: View, tab: AppTab | null | undefined, data: 
   if (!v || !tab || !tab.notificationParser) return;
   if (tab.notificationParser.write(data) < 1) return;
   markTabNotification(v, tab);
+}
+
+// Observe repaint-in-place activity on the resolved tab. Expiry is deliberately passive: the next
+// output after the 10s decay records the lapsed transition, avoiding a wake-up timer per tab solely
+// for diagnostics. A future live consumer can query tuiTracker.active() at its own scheduling seam.
+function trackTuiActivity(v: View, tab: AppTab, data: string): void {
+  const tracker = tab.tuiTracker;
+  if (!tracker) return;
+  if (tab.tuiReportedActive && !tracker.active()) {
+    tab.tuiReportedActive = false;
+    dbg(`tui inactive session=${v.meta.id} window=${tab.winId}`);
+  }
+  if (tracker.write(data) && !tab.tuiReportedActive) {
+    tab.tuiReportedActive = true;
+    dbg(`tui active session=${v.meta.id} window=${tab.winId}`);
+  }
 }
 
 // Common endpoint for explicit notification OSCs and xterm's standalone BEL event. BEL is the
@@ -1332,6 +1354,7 @@ function deliver(v: View, tab: AppTab | null, data: string): void {
   harvestOsc8FileLinks(v, data);
   harvestOscNotifications(v, tab, data);
   if (!tab) { (v.pending = v.pending || []).push(data); return; }
+  trackTuiActivity(v, tab, data);
   // If this tab isn't mounted yet but its project is the active one, mount it now so the
   // data (e.g. scrollback back-fill on reattach) is displayed, not just buffered.
   if (!tab.mounted && v.meta.id === activeId && v.el) { showActiveTab(v); renderTabs(v); }

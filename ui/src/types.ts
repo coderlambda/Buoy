@@ -140,3 +140,16 @@ export interface OscNotificationParser {
   write(data: unknown): number;
   reset(): void;
 }
+
+export interface TuiActivityTracker {
+  /** Feed a raw PTY chunk and report whether the pane is TUI-active at `now`. */
+  write(data: string, now?: number): boolean;
+  /** Query activity without feeding output. */
+  active(now?: number): boolean;
+  reset(): void;
+}
+
+export interface TuiActivityOptions {
+  decayMs?: number;
+  now?: () => number;
+}

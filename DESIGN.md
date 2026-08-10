@@ -685,7 +685,9 @@ interface WebTerminalView {                 // web-renderer-only; NOT the native
 - **WebGL context cap** — Buoy now runs in OS webviews, not Chromium. The shipping WKWebView was
   measured at exactly 16 live WebGL2 contexts with oldest-first eviction. CanvasAddon exists and is
   the default for all panes, avoiding this cap entirely; WebGL is deferred unless repeatable Canvas
-  measurements show a user-visible deficit (`RENDERER_MEASUREMENT.md`).
+  measurements show a user-visible deficit (`RENDERER_MEASUREMENT.md`). A per-tab raw-stream TUI
+  tracker is already available for diagnostics and to gate any future WebGL corrective sweep; it
+  decays after 10 seconds and deliberately ignores single-row redraws and horizontal cursor motion.
 - **Ligatures**: addon-based, imperfect (interacts awkwardly with WebGL).
 - **Images**: Sixel via addon; iTerm/Kitty image protocols not first-class.
 - **Electron tax**: Chromium memory/CPU overhead.
