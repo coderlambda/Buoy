@@ -3,7 +3,7 @@
 // TabContent so the project/tab machinery can host it generically alongside future tab kinds
 // (markdown, browser, ...). Only terminal tabs bind to the tmux backend; other kinds ignore
 // onData/resize. This module is the reference implementation of the TabContent interface.
-/* global Terminal, FitAddon */
+/* global Terminal, FitAddon, CanvasAddon */
 
 // spec: { id, meta, linkProvider, linkHandler }  ctx: { input(bytes), ack(id,bytes), onReady?, ... }
 // Returns a TabContent: { kind, mount(el), onData(d), resize(c,r), focus(), dispose(),
@@ -21,6 +21,19 @@ export interface TerminalTabContext {
   onBell?(): void;
   onInteract?(): void;
 }
+
+let repaintCount = 0;
+let inputLatencyStarted: number | null = null;
+let inputLatencyResult: number | null = null;
+
+// Diagnostic used by the native webview suite. Incrementing only after refresh succeeds makes the
+// counter detect both a missed call site and a renderer whose refresh primitive stopped working.
+export function getTerminalRepaintCount(): number { return repaintCount; }
+export function armTerminalInputLatency(): void {
+  inputLatencyStarted = performance.now();
+  inputLatencyResult = null;
+}
+export function getTerminalInputLatency(): number | null { return inputLatencyResult; }
 
 export function createTerminalTab(spec: TerminalTabSpec, ctx: TerminalTabContext) {
   const options: XtermTerminalOptions = {
@@ -63,6 +76,7 @@ export function createTerminalTab(spec: TerminalTabSpec, ctx: TerminalTabContext
 
   let mounted = false;
   let el: HTMLDivElement | null = null;
+  let rendererKind: 'dom' | 'canvas' = 'dom';
   const preOpen: string[] = [];   // bytes buffered until the xterm is opened
 
   // input up (gating is applied by the caller via ctx.input, which may buffer)
@@ -94,6 +108,16 @@ export function createTerminalTab(spec: TerminalTabSpec, ctx: TerminalTabContext
       el.style.width = '100%'; el.style.height = '100%';
       container.appendChild(el);
       term.open(el);
+      // Canvas draws the grid with 2D canvas calls instead of per-cell DOM nodes and holds no
+      // scarce WebGL context. Construction/load failure deliberately leaves xterm's DOM renderer
+      // active: the pane remains correct, only slower.
+      try {
+        term.loadAddon(new CanvasAddon.CanvasAddon());
+        rendererKind = 'canvas';
+        // A freshly attached renderer has no dirty rows. Without this mandatory repaint an idle
+        // terminal can remain blank until the user types or resizes it.
+        this.repaintAllRows();
+      } catch (_) { /* DOM renderer fallback */ }
       mounted = true;
       // Observe real DOM gestures instead of term.onData: xterm uses onData for both user input and
       // automatic terminal protocol replies, and a reply must not acknowledge unread work.
@@ -113,12 +137,30 @@ export function createTerminalTab(spec: TerminalTabSpec, ctx: TerminalTabContext
 
     onData(data: string) {
       if (!mounted) { preOpen.push(data); return; }
-      term.write(data, () => { if (ctx.ack) ctx.ack(byteLen(data)); });
+      term.write(data, () => {
+        if (ctx.ack) ctx.ack(byteLen(data));
+        const started = inputLatencyStarted;
+        if (started != null) {
+          inputLatencyStarted = null;
+          requestAnimationFrame(() => requestAnimationFrame(() => {
+            inputLatencyResult = performance.now() - started;
+          }));
+        }
+      });
     },
 
     fit() { try { fit.fit(); } catch (_) {} return { cols: term.cols, rows: term.rows }; },
     resize(cols: number, rows: number) { try { term.resize(cols, rows); } catch (_) {} },
     focus() { try { term.focus(); } catch (_) {} },
+    // Force xterm to re-render every row of the current buffer. This does not resize the grid,
+    // touch the PTY, or alter scrollback, so it is safe on reveal/focus/wake recovery paths.
+    repaintAllRows() {
+      try {
+        term.refresh(0, Math.max(0, term.rows - 1));
+        repaintCount += 1;
+      } catch (_) { /* renderer not ready */ }
+    },
+    rendererKind() { return rendererKind; },
 
     readBuffer() {   // test hook
       const buf = term.buffer.active; let out = '';

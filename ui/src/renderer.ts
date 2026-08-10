@@ -5,7 +5,12 @@
 import { PluginRegistry } from './plugins.js';
 import type { LinkContext } from './plugins.js';
 import * as DTBuiltinPlugins from './builtinPlugins.js';
-import { createTerminalTab } from './terminalTab.js';
+import {
+  armTerminalInputLatency,
+  createTerminalTab,
+  getTerminalInputLatency,
+  getTerminalRepaintCount,
+} from './terminalTab.js';
 import type { TerminalTabContext, TerminalTabSpec } from './terminalTab.js';
 import { createFileViewerTab } from './fileViewerTab.js';
 import type { FileViewerTabContext, FileViewerTabSpec } from './fileViewerTab.js';
@@ -637,6 +642,9 @@ function showActiveTab(v: View): void {
   for (const [, t] of v.tabs) { const el = t.content.element && t.content.element(); if (el) el.style.display = (t === tab) ? '' : 'none'; }
   requestAnimationFrame(() => {
     const size = tab.content.fit();
+    // A same-size reveal does not make FitAddon dirty any rows. Force a full-buffer repaint after
+    // layout settles so a pane that received writes while display:none cannot remain blank/stale.
+    tab.content.repaintAllRows?.();
     // Always re-assert size on show (a switched-to session/tab must be told its dimensions), and
     // keep _lastSize in sync so the debounced window-resize handler's change check stays correct.
     let resizeResult = null;
@@ -661,6 +669,30 @@ function showActiveTab(v: View): void {
     if (!shouldDropInput(v)) tab.content.focus();
   });
 }
+
+// Repaint only the visible pane when the app becomes visible/focused again. Hidden tabs receive the
+// same recovery when showActiveTab reveals them, so walking every live terminal would be wasted work.
+function repaintActivePane(): void {
+  const v = activeId ? views.get(activeId) : undefined;
+  if (!v) return;
+  activeTab(v)?.content.repaintAllRows?.();
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') repaintActivePane();
+});
+window.addEventListener('focus', () => repaintActivePane());
+
+// Timers do not fire while the machine sleeps. A substantially late tick is therefore a wake signal
+// even when the document stayed visible throughout suspend; defer until the webview paints again.
+const WAKE_POLL_MS = 10_000;
+const WAKE_GAP_MS = WAKE_POLL_MS + 5_000;
+let lastWakeTick = Date.now();
+setInterval(() => {
+  const now = Date.now();
+  if (now - lastWakeTick > WAKE_GAP_MS) requestAnimationFrame(() => repaintActivePane());
+  lastWakeTick = now;
+}, WAKE_POLL_MS);
 
 function renderSidebar() {
   sessionsEl.innerHTML = '';
@@ -1328,6 +1360,68 @@ window.__testReadBuffer = () => {
   const tab = activeTab(v);
   return tab ? tab.content.readBuffer() : '';
 };
+window.__testRepaintCount = getTerminalRepaintCount;
+window.__testRendererKind = () => {
+  const v = activeId ? views.get(activeId) : undefined;
+  const tab = v && activeTab(v);
+  return tab?.content.rendererKind?.() ?? null;
+};
+
+function activeTerminalForTest(): XtermTerminal {
+  const v = activeId ? views.get(activeId) : undefined;
+  const term = v && activeTab(v)?.content.term;
+  if (!term) throw new Error('no active terminal');
+  return term;
+}
+
+const afterTestPaint = (): Promise<void> => new Promise((resolve) => {
+  requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+});
+
+// Opt-in renderer measurements. These bypass the backend so both renderer kinds receive identical
+// bytes and the timing covers xterm parsing plus the webview's scheduled paint, not IPC variance.
+window.__testBenchmarkWrite = async (lines: number) => {
+  const term = activeTerminalForTest();
+  const count = Math.max(1, Math.floor(lines));
+  const data = 'renderer benchmark 0123456789 abcdefghijklmnopqrstuvwxyz\r\n'.repeat(count);
+  const bytes = byteLength(data);
+  const started = performance.now();
+  const parsedAt = await new Promise<number>((resolve) => {
+    term.write(data, () => resolve(performance.now()));
+  });
+  await afterTestPaint();
+  return { bytes, lines: count, parseMs: parsedAt - started, totalMs: performance.now() - started };
+};
+
+window.__testBenchmarkFrames = async (frames: number) => {
+  const term = activeTerminalForTest();
+  const count = Math.max(1, Math.floor(frames));
+  const samples: number[] = [];
+  for (let frame = 0; frame < count; frame++) {
+    let data = '';
+    for (let row = 0; row < term.rows; row++) {
+      const line = `frame ${frame.toString().padStart(3, '0')} row ${row.toString().padStart(2, '0')} `
+        .padEnd(term.cols, String(frame % 10));
+      data += `\x1b[${row + 1};1H${line.slice(0, term.cols)}`;
+    }
+    const started = performance.now();
+    await new Promise<void>((resolve) => term.write(data, () => resolve()));
+    await afterTestPaint();
+    samples.push(performance.now() - started);
+  }
+  const sorted = samples.slice().sort((a, b) => a - b);
+  const p95Index = Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95));
+  return {
+    frames: count,
+    meanMs: samples.reduce((sum, sample) => sum + sample, 0) / samples.length,
+    p95Ms: sorted[p95Index] ?? 0,
+    maxMs: sorted[sorted.length - 1] ?? 0,
+  };
+};
+
+window.__testArmInputLatency = armTerminalInputLatency;
+window.__testSendInput = (data: string) => activeTerminalForTest().input(data, true);
+window.__testInputLatency = getTerminalInputLatency;
 // Exact xterm cursor/viewport inspection for reconnect-repaint regressions. The public app never
 // calls this; GUI tests use it to distinguish a backend cursor from where xterm will echo input.
 window.__testTerminalState = () => {

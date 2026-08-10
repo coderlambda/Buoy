@@ -26,7 +26,28 @@ interface Window {
   __tabRenames: unknown[][];
   __cancelNextTestPointer?: boolean;
   __testReset(): Promise<void>;
+  __testRepaintCount(): number;
+  __testRendererKind(): string | null;
+  __testBenchmarkWrite(lines: number): Promise<RendererWriteBenchmark>;
+  __testBenchmarkFrames(frames: number): Promise<RendererFrameBenchmark>;
+  __testArmInputLatency(): void;
+  __testSendInput(data: string): void;
+  __testInputLatency(): number | null;
   __BUOY_UI_TEST__: { setFixture(fixture: Record<string, unknown>): void };
+}
+
+interface RendererWriteBenchmark {
+  bytes: number;
+  lines: number;
+  parseMs: number;
+  totalMs: number;
+}
+
+interface RendererFrameBenchmark {
+  frames: number;
+  meanMs: number;
+  p95Ms: number;
+  maxMs: number;
 }
 
 declare namespace WebdriverIO {

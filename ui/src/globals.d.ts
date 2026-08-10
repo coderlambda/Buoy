@@ -39,8 +39,11 @@ interface XtermTerminal {
   getSelection(): string;
   hasSelection(): boolean;
   open(element: HTMLElement): void;
+  input(data: string, wasUserInput?: boolean): void;
   write(data: string, callback?: () => void): void;
   resize(cols: number, rows: number): void;
+  /** Re-render rows start..end of the current buffer. */
+  refresh(start: number, end: number): void;
   focus(): void;
   blur(): void;
   dispose(): void;
@@ -60,6 +63,12 @@ declare namespace FitAddon {
     fit(): void;
   }
 }
+declare namespace CanvasAddon {
+  class CanvasAddon {
+    dispose(): void;
+    clearTextureAtlas(): void;
+  }
+}
 
 interface TauriEvent<T> { payload: T }
 interface TauriCore {
@@ -67,6 +76,20 @@ interface TauriCore {
 }
 interface TauriEvents {
   listen<T>(event: string, callback: (event: TauriEvent<T>) => void): Promise<() => void>;
+}
+
+interface RendererWriteBenchmark {
+  bytes: number;
+  lines: number;
+  parseMs: number;
+  totalMs: number;
+}
+
+interface RendererFrameBenchmark {
+  frames: number;
+  meanMs: number;
+  p95Ms: number;
+  maxMs: number;
 }
 
 interface Window {
@@ -85,6 +108,13 @@ interface Window {
   __testMount(id: string): void;
   __testDispose(id: string): void;
   __testReadBuffer(): string;
+  __testRepaintCount(): number;
+  __testRendererKind(): string | null;
+  __testBenchmarkWrite(lines: number): Promise<RendererWriteBenchmark>;
+  __testBenchmarkFrames(frames: number): Promise<RendererFrameBenchmark>;
+  __testArmInputLatency(): void;
+  __testSendInput(data: string): void;
+  __testInputLatency(): number | null;
   __testTerminalState(): {
     cols: number;
     rows: number;

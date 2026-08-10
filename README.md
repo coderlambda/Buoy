@@ -61,6 +61,7 @@ npm run gui-rename     # full-GUI inline-rename suite (single-suite shortcut)
 npm run gui-reorder    # full-GUI drag-to-reorder suite (single-suite shortcut)
 npm run gui-notifications # full-GUI OSC/BEL notification-dot and acknowledgement suite
 npm run gui-terminal-repaint # reconnect repaint/cursor and command-echo ordering in real xterm
+npm run measure:renderer  # opt-in Canvas-vs-DOM WKWebView measurements (fresh process each)
 ```
 
 The `gui-*` suites build a test-only Tauri binary and drive the Vite build of `ui/index.html` +

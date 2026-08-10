@@ -95,7 +95,7 @@ we are wrapping a UI around it.
 | Layer | Choice | Rationale |
 |---|---|---|
 | **Shell / windows** | **Electron** | One bundled Chromium → *far less rendering variance* than Tauri's 3 webviews (NOT pixel-identical — glyphs still route through per-OS rasterizers CoreText/DirectWrite/FreeType). Most mature terminal stack (VS Code, Hyper, Tabby). Trade binary size/RAM for consistency. **Rendering consistency ≠ feature parity:** the OOB channel needs a local tmux binary, so Windows has a materially degraded feature set (§9.0) — resolve platform scope in §9 Q5. |
-| **Terminal view** | **xterm.js** (`@xterm/xterm`, current scoped pkg) + **`@xterm/addon-webgl`** + **`@xterm/addon-fit`** | Engine **and** renderer for web/Electron. **WebGL only for the focused/visible terminal** — Chromium caps live WebGL contexts (~8–16, LRU-evicted), so a per-session WebGL context would evict older panes' contexts and fire `webglcontextlost` on them. Background sessions use the **DOM renderer** (the canvas addon is no longer part of current xterm.js — WebGL and DOM are the only renderers) or dispose their WebGL addon on hide. See §8. |
+| **Terminal view** | **xterm.js 5.5.0** + **`@xterm/addon-canvas` 0.7.0** + **`@xterm/addon-fit` 0.10.0** | Canvas is the default for every pane: it removes per-cell DOM rendering cost without consuming a scarce WebGL context. Attach failure falls back to xterm's DOM renderer. WebGL remains gated on measured need; WKWebView's measured ceiling is 16 live contexts, oldest-first eviction. Vendored versions/hashes live in `ui/vendor/README.md`; see §8 and `RENDERER_MEASUREMENT.md`. |
 | **PTY** | **node-pty** | Spawns the pty in the main process; battle-tested (VS Code uses it). |
 | **Connection layer** | **`et` (Eternal Terminal)** ⚠️ *confirm* | Best auto-reconnect. Needs `etserver` + open port on remote. Alternatives: `mosh` (UDP, roams networks), `ssh`+`autossh` (no remote install, crudest). |
 | **Frontend framework** | **React + TypeScript** ⚠️ *confirm* | Good ergonomics for sidebar/session list/tabs. Alt: plain TS (lighter). |
@@ -682,11 +682,10 @@ interface WebTerminalView {                 // web-renderer-only; NOT the native
 
 - **Throughput** — addressed as a v1 correctness requirement via backpressure (§4.1), not
   deferred. Without it, output is *discarded* past the ~50MB write buffer, not merely slow.
-- **WebGL context cap** — a *routine* constraint here, not a rare fallback: Chromium caps
-  live WebGL contexts (~8–16, LRU-evicted), so many sessions ⇒ background panes lose their
-  context. Mitigation: WebGL for the focused pane only; **DOM renderer** (or disposed WebGL
-  addon) for background panes — the canvas addon is **no longer part of current xterm.js**,
-  so DOM is the only non-WebGL renderer (§3). Still handle `webglcontextlost` defensively.
+- **WebGL context cap** — Buoy now runs in OS webviews, not Chromium. The shipping WKWebView was
+  measured at exactly 16 live WebGL2 contexts with oldest-first eviction. CanvasAddon exists and is
+  the default for all panes, avoiding this cap entirely; WebGL is deferred unless repeatable Canvas
+  measurements show a user-visible deficit (`RENDERER_MEASUREMENT.md`).
 - **Ligatures**: addon-based, imperfect (interacts awkwardly with WebGL).
 - **Images**: Sixel via addon; iTerm/Kitty image protocols not first-class.
 - **Electron tax**: Chromium memory/CPU overhead.
@@ -772,8 +771,8 @@ cross-platform).
    replaces this.)
 4. **Persistence**: disk-backed session list (re-validated on load), lazy restore on launch,
    detect-lost-session via persisted remote `#{session_created}` over the OOB channel (§5.2).
-5. **Polish**: focused-pane WebGL + background DOM renderer (§3), `webglcontextlost` handling,
-   keybindings, theming.
+5. **Polish**: Canvas rendering for every pane with DOM fallback, repaint recovery on
+   reveal/focus/visibility/wake, keybindings, theming. WebGL remains measurement-gated (§3/§8).
 6. **(Later, gated on measured need)** Native renderer — a render-layer *rewrite* (§8),
    reusing only the transport-contract-coupled code.
 

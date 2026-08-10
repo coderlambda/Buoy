@@ -17,7 +17,7 @@ what needs a **live remote** (opt-in `#[ignore]`d suites).
 | Local tmux backend | `src-tauri/src/local_backend.rs` | integration (real pty + real tmux) | ✅ |
 | Tunnels / sticky ports | `src-tauri/src/tunnel.rs` | unit (real sockets, no remote) | ✅ |
 | Frontend modules (clipboard, file viewer, link plugins) | `ui/src/*.ts` | TypeScript unit (`npm test`) | ✅ |
-| Full GUI (rename, reorder, notifications, new-session form, reconnect repaint) | `ui/index.html` + `ui/src/renderer.ts` | real Tauri platform webview + WebDriver | ✅ |
+| Full GUI (rename, reorder, notifications, new-session form, reconnect/reveal repaint, Canvas fallback) | `ui/index.html` + `ui/src/renderer.ts` | real Tauri platform webview + WebDriver | ✅ |
 | Real ssh+tmux end-to-end | `src-tauri/tests/live_*.rs` | live host, `#[ignore]`d | ❌ needs `DT_LIVE_HOST` |
 
 Deferred with the feature: backpressure watermarks (the `ack` bridge call is a no-op in the
@@ -86,6 +86,7 @@ Build the test-only Tauri binary and run every GUI suite with:
 
 ```
 npm run test:ui
+npm run measure:renderer     # opt-in Canvas-vs-DOM measurement; not a regression gate
 ```
 
 The `ui-test` Cargo feature embeds Tauri's WebDriver plugin and a deterministic backend fixture.
@@ -240,6 +241,9 @@ cd src-tauri && DT_LIVE_HOST=user@host cargo test --test <name> -- --ignored --n
   added newline (the Codex/Claude Code reconnect cursor regression).
 - **gui-terminal-repaint TC-CR1–3** — the real xterm is fitted/resized before backfill, restores the
   tmux cursor, and echoes the first command beside its prompt instead of on the following row.
+- **gui-terminal-repaint TC-P1–5 / TC-R1–4** — hidden-tab writes repaint on same-size reveal;
+  visibility/focus recover only the active pane; ordinary output does not invoke recovery; Canvas
+  attaches and repaints, while a forced addon failure retains a working DOM pane.
 - **control_backend tmux-title regressions** — the exact physical-Enter burst containing
   `ESC k ls ESC \\` never exposes `ls` as terminal text, at every possible chunk split; unrelated
   escape sequences remain byte-for-byte intact.

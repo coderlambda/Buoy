@@ -24,6 +24,7 @@ interface TestBackend {
   createSessionResult?: CreateResult;
   tunnels?: Record<string, unknown[]>;
   hosts?: string[];
+  echoInput?: boolean;
 }
 
 interface TestFixture {
@@ -165,7 +166,12 @@ interface Window {
             ? configured.tmuxVersion : [3, 6],
         };
       }
-      case 'session_input': calls.inputs.push([args.id, args.data, args.win]); return null;
+      case 'session_input':
+        calls.inputs.push([args.id, args.data, args.win]);
+        if (backend.echoInput && args.id && args.data) {
+          window.setTimeout(() => emit('session:data', { id: args.id, data: args.data, window: args.win }), 0);
+        }
+        return null;
       case 'session_resize': calls.terminal.push(['resize', args.id, args.cols, args.rows]); return null;
       case 'tab_capture': calls.terminal.push(['capture', args.id, args.win]); return null;
       case 'session_rename': calls.renames.push([args.id, args.title]); return { ok: true, title: args.title };

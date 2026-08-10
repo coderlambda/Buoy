@@ -128,6 +128,10 @@ export interface TabContent {
   fit(): TerminalSize | null;
   resize(cols: number, rows: number): void;
   focus(): void;
+  /** Re-render every row of the current buffer. Absent for tab kinds with no cell grid. */
+  repaintAllRows?(): void;
+  /** Active terminal renderer backend, exposed for diagnostics and measurement. */
+  rendererKind?(): string;
   readBuffer(): string;
   dispose(): void;
 }
