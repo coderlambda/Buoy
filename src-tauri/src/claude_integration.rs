@@ -165,7 +165,14 @@ IFS=:
 for entry in ${PATH:-}; do
   case "$entry" in
     */buoy-cli-shims/*|*/buoy-cli-shims) continue ;;
+    */cmux-cli-shims/*|*/cmux-cli-shims) continue ;;
   esac
+  # The persistent Buoy launcher is invoked by absolute path below. Keep its directory out of the
+  # delegated PATH too, otherwise another tool's Claude wrapper can resolve back to Buoy and form
+  # a wrapper cycle.
+  if [ -n "${BUOY_CLAUDE_LAUNCHER:-}" ] && [ "$entry" = "${BUOY_CLAUDE_LAUNCHER%/*}" ]; then
+    continue
+  fi
   if [ -z "$clean_path" ]; then clean_path=$entry; else clean_path=$clean_path:$entry; fi
 done
 IFS=$old_ifs
@@ -356,19 +363,49 @@ for dir in ${PATH:-}; do
   esac
   [ -x "$candidate" ] || continue
   [ "$candidate" -ef "$0" ] 2>/dev/null && continue
+  is_cmux_claude=
+  if [ -n "${CMUX_CLAUDE_WRAPPER_SHIM:-}" ] &&
+     [ -e "$CMUX_CLAUDE_WRAPPER_SHIM" ] &&
+     [ "$candidate" -ef "$CMUX_CLAUDE_WRAPPER_SHIM" ] 2>/dev/null; then
+    is_cmux_claude=1
+  elif [ -n "${CMUX_CLAUDE_WRAPPER_SHIM_ROOT:-}" ] &&
+       [ "$candidate" = "${CMUX_CLAUDE_WRAPPER_SHIM_ROOT%/}/claude" ]; then
+    is_cmux_claude=1
+  else
+    case "$candidate" in
+      */cmux-cli-shims/*/claude|*/cmux-cli-shims/claude) is_cmux_claude=1 ;;
+    esac
+  fi
+  if [ -n "$is_cmux_claude" ]; then
+    # A cmux surface owns its wrapper; a Buoy pane owns this one. Skip cmux's managed shim and
+    # continue to the actual Claude executable so the two integrations never nest.
+    continue
+  fi
   real_claude=$candidate
   break
 done
 IFS=$old_ifs
+
+# Outside Buoy, on a nested Buoy invocation, or after cmux has already injected its settings, skip
+# every wrapper and go straight to Claude. Current cmux exports both the lowercase re-exec guard and
+# CMUX_AGENT_LAUNCH_KIND before it enters another shim; either marker supports older PATH layouts.
+if [ "${BUOY_TERMINAL:-}" != 1 ] || [ "${BUOY_CLAUDE_SHIM_ACTIVE:-}" = 1 ] ||
+   [ -n "${cmux_claude_wrapper_reexec_guard:-}" ] ||
+   [ "${CMUX_AGENT_LAUNCH_KIND:-}" = claude ]; then
+  if [ -z "$real_claude" ]; then
+    echo "buoy: could not find the real claude executable on PATH" >&2
+    exit 127
+  fi
+  exec "$real_claude" "$@"
+fi
 
 if [ -z "$real_claude" ]; then
   echo "buoy: could not find the real claude executable on PATH" >&2
   exit 127
 fi
 
-# Never change behavior outside Buoy, on a nested shim invocation, or after an explicit opt-out.
-if [ "${BUOY_TERMINAL:-}" != 1 ] || [ "${BUOY_CLAUDE_SHIM_ACTIVE:-}" = 1 ] || \
-   [ "${BUOY_CLAUDE_NOTIFICATIONS_DISABLED:-}" = 1 ]; then
+# An explicit opt-out disables Buoy's plugin when there is no existing owner.
+if [ "${BUOY_CLAUDE_NOTIFICATIONS_DISABLED:-}" = 1 ]; then
   exec "$real_claude" "$@"
 fi
 
@@ -863,6 +900,55 @@ mod tests {
                 .collect::<String>();
             assert_eq!(String::from_utf8(passthrough.stdout).unwrap(), expected);
         }
+
+        // cmux installs a per-surface `claude` shim and injects its own hooks/settings. Inside a
+        // Buoy terminal, skip that foreign terminal wrapper and inject only Buoy's plugin.
+        let cmux_dir = root.join("cmux-cli-shims").join("surface-1");
+        fs::create_dir_all(&cmux_dir).unwrap();
+        let cmux = cmux_dir.join("claude");
+        fs::write(&cmux, b"#!/bin/sh\nfor arg do printf 'CMUX_ARG=<%s>\\n' \"$arg\"; done\n")
+            .unwrap();
+        fs::set_permissions(&cmux, fs::Permissions::from_mode(0o755)).unwrap();
+        let cmux_path = format!(
+            "{}:{}:{}:/usr/bin:/bin",
+            cmux_dir.display(),
+            shim_dir.display(),
+            real_dir.display()
+        );
+        let cmux_present = Command::new(&shim)
+            .arg("hello")
+            .env("PATH", &cmux_path)
+            .env("HOME", root.join("home"))
+            .env("BUOY_TERMINAL", "1")
+            .env("CMUX_CLAUDE_WRAPPER_SHIM", &cmux)
+            .output()
+            .unwrap();
+        assert!(cmux_present.status.success());
+        let cmux_present_output = String::from_utf8(cmux_present.stdout).unwrap();
+        assert!(!cmux_present_output.contains("CMUX_ARG="),
+            "Buoy incorrectly entered cmux's wrapper: {cmux_present_output:?}");
+        assert_eq!(cmux_present_output.matches("<--plugin-dir>\n").count(), 1,
+            "Buoy must inject exactly one plugin: {cmux_present_output:?}");
+        assert!(cmux_present_output.contains("<hello>\n"),
+            "user argv did not reach the real Claude binary: {cmux_present_output:?}");
+
+        // If an older PATH arrangement makes cmux bounce into Buoy after cmux has already injected
+        // its settings, the chain marker reaches the real binary unchanged and does not loop.
+        let bounced = Command::new(&shim)
+            .arg("hello")
+            .env("PATH", &cmux_path)
+            .env("HOME", root.join("home"))
+            .env("BUOY_TERMINAL", "1")
+            .env("cmux_claude_wrapper_reexec_guard", "1")
+            .env("CMUX_CLAUDE_WRAPPER_SHIM", &cmux)
+            .output()
+            .unwrap();
+        assert!(bounced.status.success());
+        assert_eq!(
+            String::from_utf8(bounced.stdout).unwrap(),
+            "<hello>\n",
+            "a cmux-to-Buoy bounce reaches the real Claude binary exactly once"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1445,6 +1531,70 @@ mod tests {
         assert!(output.contains("ARG=<--plugin-dir>"), "Buoy plugin argument was injected: {output:?}");
         assert!(output.contains(&format!("ARG=<{}>", plugin.display())), "exact plugin loaded: {output:?}");
         assert!(output.contains("ARG=<hello>"), "user argument preserved: {output:?}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tc_cn10_zsh_replaces_cmux_wrapper_inside_a_buoy_terminal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !Path::new("/bin/zsh").is_file() {
+            eprintln!("SKIP TC-CN10: no /bin/zsh");
+            return;
+        }
+        let root = temp_dir("cmux coexistence");
+        let bin = root.join("bin");
+        let home = root.join("home");
+        let zdotdir = root.join("zdotdir");
+        let temporary = root.join("temporary");
+        let real_dir = root.join("real");
+        let cmux_dir = root.join("cmux managed");
+        for dir in [&home, &zdotdir, &temporary, &real_dir, &cmux_dir] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        ensure_local_shim_in(&bin).unwrap();
+        let real_claude = real_dir.join("claude");
+        fs::write(
+            &real_claude,
+            b"#!/bin/sh\nfor arg do printf 'ARG=<%s>\\n' \"$arg\"; done\n",
+        )
+        .unwrap();
+        fs::set_permissions(&real_claude, fs::Permissions::from_mode(0o755)).unwrap();
+        let cmux_shim = cmux_dir.join("claude");
+        fs::write(
+            &cmux_shim,
+            b"#!/bin/sh\nfor arg do printf 'CMUX_ARG=<%s>\\n' \"$arg\"; done\n",
+        )
+        .unwrap();
+        fs::set_permissions(&cmux_shim, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(
+            zdotdir.join(".zshrc"),
+            b"export PATH=\"$BUOY_TEST_REAL_DIR:/usr/bin:/bin\"\nexport CMUX_CLAUDE_WRAPPER_SHIM=\"$BUOY_TEST_CMUX_SHIM\"\nclaude() { \"$CMUX_CLAUDE_WRAPPER_SHIM\" \"$@\"; }\nPS1='BUOY_CMUX> '\n",
+        )
+        .unwrap();
+
+        let output = run_interactive_shell(
+            &bin.join(SHELL_LAUNCHER_NAME),
+            "/bin/zsh",
+            &home,
+            &temporary,
+            &real_dir,
+            &[("ZDOTDIR", &zdotdir), ("BUOY_TEST_CMUX_SHIM", &cmux_shim)],
+            "functions claude\nclaude hello\nprintf '__BUOY_SHELL_DONE__\\n'\nexit\n",
+        );
+        assert!(
+            output.contains("BUOY_CLAUDE_SHIM"),
+            "Buoy did not take ownership from cmux inside its terminal: {output:?}"
+        );
+        assert!(
+            !output.contains("CMUX_ARG="),
+            "the invocation still entered cmux's wrapper: {output:?}"
+        );
+        assert!(
+            output.matches("ARG=<--plugin-dir>").count() == 1 && output.contains("ARG=<hello>"),
+            "the real Claude binary did not receive exactly one Buoy plugin: {output:?}"
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

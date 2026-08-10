@@ -58,6 +58,16 @@ multiple `--settings` flags and avoids requiring Node, Python, or `jq` on SSH ho
 Claude notification preference may coexist with the plugin; duplicate terminal requests are
 idempotent while the tab's unread state is already true.
 
+cmux is different from a settings-file hook: when its Claude integration is enabled, it installs a
+managed per-surface `claude` shim and wrapper that owns session tracking and hooks. A cmux context
+can be inherited when Buoy is launched from that host, but `BUOY_TERMINAL=1` means the Claude
+process now belongs to a Buoy pane. Buoy recognizes cmux's exported
+`CMUX_CLAUDE_WRAPPER_SHIM` / `CMUX_CLAUDE_WRAPPER_SHIM_ROOT` contract and managed
+`cmux-cli-shims` path, skips that wrapper, and invokes the real Claude binary with only Buoy's
+plugin. Conversely, if cmux has already entered Buoy through an older PATH arrangement, cmux's
+re-exec/agent-launch marker makes Buoy pass through without adding its plugin. Thus the current
+terminal owns exactly one wrapper, and a PATH scrub prevents cycles in already-open shells.
+
 The launcher is deliberately scoped and conservative:
 
 - it is active only when `BUOY_TERMINAL=1` is inherited from a Buoy shell;
@@ -262,6 +272,7 @@ not reuse this OSC dot as proof that a real agent issued a permission request.
 | New tmux window after reconnect | tmux default command launches the same post-rc integration |
 | Claude Code with explicit `--settings` or another `--plugin-dir` | User arguments are unchanged; Buoy hook also loads |
 | Claude Code with an explicit native notification channel | Native channel and idempotent Buoy hook may coexist |
+| Claude Code with cmux's managed shim on PATH | Buoy skips cmux inside its pane; exactly one Buoy plugin, no wrapper cycle |
 | Encoded SSH bootstrap under a real pty | Final tmux process retains tty stdin and emits its control handshake |
 
 ## 10. Non-goals
