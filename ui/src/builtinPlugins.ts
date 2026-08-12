@@ -102,6 +102,28 @@ export function stripOsc8Sequences(data: string): string {
   return data.replace(OSC8_SEQUENCE_RE, '');
 }
 
+// Claude Code can leave dotted-underline cells in tmux's history. They are easy to miss while the
+// live TUI is repainting, but `capture-pane -e` serializes them as SGR 4:4 and a reconnect makes the
+// dots permanently visible beneath restored text. Disable only that underline variant in snapshots;
+// preserve every other SGR parameter, including ordinary underline styles and color attributes.
+const SGR_RE = /\x1b\[([0-9:;]*)m/g;
+
+export function sanitizeReconnectSnapshot(data: string): string {
+  const withoutLinks = stripOsc8Sequences(data);
+  if (withoutLinks.indexOf('4:4') === -1) return withoutLinks;
+  return withoutLinks.replace(SGR_RE, (sequence, params: string) => {
+    const parts = params.split(';');
+    let changed = false;
+    for (let i = 0; i < parts.length; i++) {
+      if (parts[i] === '4:4') {
+        parts[i] = '24'; // SGR 24: explicitly clear underline so prior terminal state cannot leak in
+        changed = true;
+      }
+    }
+    return changed ? `\x1b[${parts.join(';')}m` : sequence;
+  });
+}
+
 // Notification OSCs are a STREAM protocol: the ESC introducer, payload, and terminator can arrive
 // in separate PTY chunks. Keep the small amount of unfinished protocol state here instead of
 // regexing each renderer chunk independently (which silently misses split notifications).

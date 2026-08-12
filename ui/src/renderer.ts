@@ -1341,7 +1341,7 @@ function mountTabRenameInput(v: View, wid: string, labelEl: HTMLElement): void {
 api.onData(({ id, data, window, repaint }) => {
   // A reconnect snapshot is one complete backend payload, so remove only its OSC 8 wrappers before
   // buffering/rendering. tmux's capture still retains colors and every other text attribute.
-  const renderedData = repaint ? DTBuiltinPlugins.stripOsc8Sequences(data) : data;
+  const renderedData = repaint ? DTBuiltinPlugins.sanitizeReconnectSnapshot(data) : data;
   const v = views.get(id);
   if (!v) { dbg('onData: NO VIEW id=' + id + ' (buffering)'); (pendingData[id] = pendingData[id] || []).push(renderedData); return; }
   const tab = (v.meta.mode === 'control') ? (window ? ensureTab(v, window) : activeTab(v)) : activeTab(v);

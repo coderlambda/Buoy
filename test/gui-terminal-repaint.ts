@@ -88,6 +88,26 @@ describe('Tauri UI: terminal reconnect repaint', () => {
       `TC-CR4 reconnect history keeps link text without dotted underline (got ${JSON.stringify(restoredLink)})`);
     check(restoredLink.path === '/tmp/history-link.txt',
       `TC-CR4 reconnect history keeps its clickable absolute path (got ${JSON.stringify(restoredLink)})`);
+
+    await fire('data', {
+      id: 's1', window: '@0',
+      data: E + '[H' + E + '[2J' + E + '[4:4mLIVE_DOTTED' + E + '[0m',
+    });
+    await browser.pause(100);
+    check(await js(`window.__testTextIsUnderlined('LIVE_DOTTED')`) === true,
+      'TC-CR5 live SGR 4:4 retains its explicit dotted underline');
+
+    await fire('data', {
+      id: 's1', window: '@0', repaint: true,
+      data: E + '[H' + E + '[2J' + E + '[2;4:4;32mRESTORED_TEXT' + E + '[0m' + E + '[2;1H',
+    });
+    await browser.pause(100);
+    const restoredStyle = await js(`({
+      buffer: window.__testReadBuffer(),
+      underlined: window.__testTextIsUnderlined('RESTORED_TEXT'),
+    })`);
+    check(restoredStyle.buffer.includes('RESTORED_TEXT') && restoredStyle.underlined === false,
+      `TC-CR5 reconnect history removes tmux SGR 4:4 dots (got ${JSON.stringify(restoredStyle)})`);
     finish();
   });
 
