@@ -30,7 +30,9 @@ const MAX_BUFFER: usize = 4096;
 #[derive(Debug, Clone)]
 pub enum BackendEvent {
     /// Terminal output tagged with the window it belongs to.
-    Data { window: String, data: String },
+    /// `repaint` distinguishes a capture-pane snapshot from live PTY output. The frontend uses it
+    /// for snapshot-only normalization that must not alter live terminal protocol traffic.
+    Data { window: String, data: String, repaint: bool },
     WindowAdd { window: String, order: Vec<String> },
     WindowClose { window: String, order: Vec<String> },
     WindowRename { window: String, name: String },
@@ -522,7 +524,7 @@ impl Inner {
         let batch = std::mem::take(&mut self.out_buf);
         for (window, data) in batch {
             if !data.is_empty() {
-                (self.sink)(BackendEvent::Data { window, data });
+                (self.sink)(BackendEvent::Data { window, data, repaint: false });
             }
         }
     }
@@ -655,7 +657,7 @@ impl Inner {
         let data = capture_repaint(&body, cursor_x, cursor_y);
         let mut g = inner.lock().unwrap();
         g.flush_output();   // paint scrollback AFTER any buffered live output, never before
-        g.emit(BackendEvent::Data { window: window.clone(), data });
+        g.emit(BackendEvent::Data { window: window.clone(), data, repaint: true });
         // The repaint event is emitted before buffered input reaches tmux, so its later echo is
         // ordered after the restored screen/cursor in the frontend.
         g.finish_capture(&window);
@@ -842,7 +844,7 @@ mod tests {
 
     // Build an Inner with a capturing writer and a no-op sink, for driving the input/ready/topology
     // state machine directly (no ssh/pty).
-    fn test_inner() -> (Arc<Mutex<Inner>>, Arc<Mutex<Vec<u8>>>) {
+    fn test_inner_with_sink(sink: BackendSink) -> (Arc<Mutex<Inner>>, Arc<Mutex<Vec<u8>>>) {
         let sent = Arc::new(Mutex::new(Vec::<u8>::new()));
         let mut reply = ReplyChannel::new();
         reply.start();
@@ -851,7 +853,7 @@ mod tests {
             reg: WindowRegistry::new(),
             reply,
             writer: Box::new(CaptureWriter(sent.clone())),
-            sink: Arc::new(|_| {}),
+            sink,
             session: "s".into(),
             ready: false,
             attached: false,
@@ -865,6 +867,10 @@ mod tests {
             stopped: false,
         }));
         (inner, sent)
+    }
+
+    fn test_inner() -> (Arc<Mutex<Inner>>, Arc<Mutex<Vec<u8>>>) {
+        test_inner_with_sink(Arc::new(|_| {}))
     }
 
     fn sent_str(sent: &Arc<Mutex<Vec<u8>>>) -> String {
@@ -961,6 +967,26 @@ mod tests {
             "\x1b[H\x1b[2Jhistory\r\n> prompt\r\nfooter\r\n\x1b[2;3H"
         );
         assert!(!data.ends_with("\r\n"), "repaint must finish at the reported cursor");
+    }
+
+    #[test]
+    fn tc_cb_capture_is_tagged_as_repaint_but_live_output_is_not() {
+        let events = Arc::new(Mutex::new(Vec::<BackendEvent>::new()));
+        let captured = events.clone();
+        let (inner, _) = test_inner_with_sink(Arc::new(move |event| {
+            captured.lock().unwrap().push(event);
+        }));
+
+        {
+            let mut g = inner.lock().unwrap();
+            g.out_buf.insert("@4".into(), "live".into());
+            g.flush_output();
+        }
+        Inner::paint_capture(&inner, "@4".into(), vec!["history".into()], 0, 0);
+
+        let events = events.lock().unwrap();
+        assert!(matches!(events.first(), Some(BackendEvent::Data { repaint: false, .. })));
+        assert!(matches!(events.get(1), Some(BackendEvent::Data { repaint: true, .. })));
     }
 
     #[test]

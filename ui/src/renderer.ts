@@ -1338,28 +1338,31 @@ function mountTabRenameInput(v: View, wid: string, labelEl: HTMLElement): void {
 // --- events from main ---
 // Control-mode data is tagged with the WINDOW it belongs to (the backend owns pane->window
 // resolution). Plain/local data has no window -> the single tab. The renderer never maps panes.
-api.onData(({ id, data, window }) => {
+api.onData(({ id, data, window, repaint }) => {
+  // A reconnect snapshot is one complete backend payload, so remove only its OSC 8 wrappers before
+  // buffering/rendering. tmux's capture still retains colors and every other text attribute.
+  const renderedData = repaint ? DTBuiltinPlugins.sanitizeReconnectSnapshot(data) : data;
   const v = views.get(id);
-  if (!v) { dbg('onData: NO VIEW id=' + id + ' (buffering)'); (pendingData[id] = pendingData[id] || []).push(data); return; }
+  if (!v) { dbg('onData: NO VIEW id=' + id + ' (buffering)'); (pendingData[id] = pendingData[id] || []).push(renderedData); return; }
   const tab = (v.meta.mode === 'control') ? (window ? ensureTab(v, window) : activeTab(v)) : activeTab(v);
-  deliver(v, tab, data);
+  deliver(v, tab, data, renderedData);
 });
 
 const pendingData: Record<string, string[]> = {};   // id -> [data] buffered before the view exists
 
 // Deliver a data chunk to a resolved tab (mounting/revealing it if it's the active one).
-function deliver(v: View, tab: AppTab | null, data: string): void {
+function deliver(v: View, tab: AppTab | null, data: string, renderedData = data): void {
   // §21: harvest OSC 8 file:// links from the raw stream into the project's path map BEFORE xterm
   // consumes the data (xterm strips the hyperlink from scrollback, so this is our only capture point).
   harvestOsc8FileLinks(v, data);
   harvestOscNotifications(v, tab, data);
-  if (!tab) { (v.pending = v.pending || []).push(data); return; }
+  if (!tab) { (v.pending = v.pending || []).push(renderedData); return; }
   trackTuiActivity(v, tab, data);
   // If this tab isn't mounted yet but its project is the active one, mount it now so the
   // data (e.g. scrollback back-fill on reattach) is displayed, not just buffered.
   if (!tab.mounted && v.meta.id === activeId && v.el) { showActiveTab(v); renderTabs(v); }
-  if (!tab.mounted) { (tab.pre = tab.pre || []).push(data); return; }
-  tab.content.onData(data);
+  if (!tab.mounted) { (tab.pre = tab.pre || []).push(renderedData); return; }
+  tab.content.onData(renderedData);
 }
 
 // --- test hooks (used by the TypeScript GUI suites to drive/inspect the real xterm) ---
@@ -1382,6 +1385,25 @@ window.__testReadBuffer = () => {
   if (!v) return '';
   const tab = activeTab(v);
   return tab ? tab.content.readBuffer() : '';
+};
+window.__testTextIsUnderlined = (text: string) => {
+  const term = activeTerminalForTest();
+  const buf = term.buffer.active;
+  for (let y = 0; y < buf.length; y++) {
+    const line = buf.getLine(y);
+    if (!line) continue;
+    const start = line.translateToString(false).indexOf(text);
+    if (start < 0) continue;
+    for (let x = start; x < start + text.length; x++) {
+      if (line.getCell(x)?.isUnderline()) return true;
+    }
+    return false;
+  }
+  return null;
+};
+window.__testLinkPath = (text: string) => {
+  const v = activeId ? views.get(activeId) : undefined;
+  return v?.linkMap.get(text) ?? null;
 };
 window.__testRepaintCount = getTerminalRepaintCount;
 window.__testRendererKind = () => {

@@ -14,6 +14,8 @@ import {
   isOscNotification,
   openUrlSmart,
   parseFileUri,
+  sanitizeReconnectSnapshot,
+  stripOsc8Sequences,
 } from '../ui/src/builtinPlugins.js';
 
 function reg() {
@@ -188,6 +190,44 @@ test('TC-PL4g extractOsc8FileLinks', () => {
   assert.deepEqual(extractOsc8FileLinks(http), []);
   // no OSC 8 at all -> empty
   assert.deepEqual(extractOsc8FileLinks('just plain text README.md'), []);
+});
+
+// TC-PL4g2: capture-pane snapshots retain OSC 8 wrappers, which xterm renders as persistent
+// dotted/dashed link underlines. Removing just those wrappers keeps the text and all SGR styling.
+test('TC-PL4g2 stripOsc8Sequences removes hyperlink wrappers only', () => {
+  const E = '\x1b';
+  const st = E + ']8;id=one;file:///a/README.md' + E + '\\README.md' + E + ']8;;' + E + '\\';
+  const bel = E + ']8;;https://example.com\x07example' + E + ']8;;\x07';
+  const styled = E + '[31m' + st + E + '[0m ' + E + '[4:4mkept dotted style' + E + '[0m';
+
+  assert.equal(stripOsc8Sequences(styled),
+    E + '[31mREADME.md' + E + '[0m ' + E + '[4:4mkept dotted style' + E + '[0m');
+  assert.equal(stripOsc8Sequences(bel), 'example');
+  assert.equal(stripOsc8Sequences('plain text'), 'plain text');
+  assert.equal(stripOsc8Sequences(E + ']2;window title\x07text'), E + ']2;window title\x07text',
+    'unrelated OSC protocols are preserved');
+});
+
+// TC-PL4g3: tmux capture-pane -e serializes dotted underline cells as SGR 4:4. Reconnect
+// normalization clears that one style without flattening the rest of the captured formatting.
+test('TC-PL4g3 sanitizeReconnectSnapshot clears only dotted underline', () => {
+  const E = '\x1b';
+  assert.equal(
+    sanitizeReconnectSnapshot(E + '[4:4mdotted' + E + '[0m'),
+    E + '[24mdotted' + E + '[0m',
+  );
+  assert.equal(
+    sanitizeReconnectSnapshot(E + '[2;4:4;38:2::10:20:30mstyled' + E + '[0m'),
+    E + '[2;24;38:2::10:20:30mstyled' + E + '[0m',
+    'combined dim and RGB color attributes survive',
+  );
+  assert.equal(
+    sanitizeReconnectSnapshot(E + '[4mplain underline' + E + '[24m ' + E + '[4:3mwavy' + E + '[0m'),
+    E + '[4mplain underline' + E + '[24m ' + E + '[4:3mwavy' + E + '[0m',
+    'non-dotted underline variants survive',
+  );
+  const link = E + ']8;;file:///tmp/a.txt' + E + '\\a.txt' + E + ']8;;' + E + '\\';
+  assert.equal(sanitizeReconnectSnapshot(link), 'a.txt', 'OSC 8 snapshot wrappers are still removed');
 });
 
 // TC-PL4h notification OSC detection covers the protocols advertised by modern agent terminals.

@@ -57,7 +57,13 @@ export interface RemoteFileResult {
   truncated?: boolean;
 }
 
-export interface TerminalDataEvent { id: string; data: string; window?: string | null }
+export interface TerminalDataEvent {
+  id: string;
+  data: string;
+  window?: string | null;
+  /** True only for a tmux capture-pane snapshot used to restore a reconnecting terminal. */
+  repaint?: boolean;
+}
 export interface TerminalStateEvent { id: string; state: SessionState }
 export interface TerminalExitEvent { id: string }
 export interface TerminalReadyEvent { id: string }
