@@ -90,6 +90,18 @@ export function extractOsc8FileLinks(data: string): Osc8FileLink[] {
   return out;
 }
 
+// tmux `capture-pane -e` preserves OSC 8 hyperlinks. Replaying those snapshots into xterm marks
+// every captured link cell with xterm's persistent dashed/dotted underline, even though Buoy's
+// regex link provider can already rediscover and activate the visible path. Strip only the OSC 8
+// wrappers from reconnect snapshots after extractOsc8FileLinks has harvested their targets. Live
+// output must keep OSC 8 intact, and all other SGR styling in the snapshot remains untouched.
+const OSC8_SEQUENCE_RE = /\x1b\]8;[^\x07\x1b]*(?:\x07|\x1b\\)/g;
+
+export function stripOsc8Sequences(data: string): string {
+  if (!data || data.indexOf('\x1b]8;') === -1) return data;
+  return data.replace(OSC8_SEQUENCE_RE, '');
+}
+
 // Notification OSCs are a STREAM protocol: the ESC introducer, payload, and terminator can arrive
 // in separate PTY chunks. Keep the small amount of unfinished protocol state here instead of
 // regexing each renderer chunk independently (which silently misses split notifications).

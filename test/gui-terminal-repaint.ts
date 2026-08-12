@@ -46,7 +46,7 @@ describe('Tauri UI: terminal reconnect repaint', () => {
     const history = Array.from({ length: 12 }, (_, i) => `history ${i + 1}`);
     const repaint = '\x1b[H\x1b[2J' + history.concat(screen).join('\r\n')
       + `\x1b[${cursorY + 1};${prompt.length + 1}H`;
-    await fire('data', { id: 's1', window: '@0', data: repaint });
+    await fire('data', { id: 's1', window: '@0', data: repaint, repaint: true });
     await browser.pause(100);
 
     let state = await js('window.__testTerminalState()');
@@ -62,6 +62,32 @@ describe('Tauri UI: terminal reconnect repaint', () => {
     state = await js('window.__testTerminalState()');
     check(state.line === '$ echo MARK' && !state.next.includes('echo MARK'),
       `TC-CR3 command echo remains beside prompt, not on following row (got ${JSON.stringify(state)})`);
+
+    // tmux capture-pane -e includes OSC 8 link wrappers. Live OSC 8 remains native and underlined,
+    // while the same bytes tagged as a reconnect snapshot keep their text/path but lose xterm's
+    // persistent dotted/dashed hyperlink cell decoration.
+    const E = '\x1b';
+    const osc8 = (label: string) => E + ']8;;file:///tmp/' + label + E + '\\'
+      + label + E + ']8;;' + E + '\\';
+    await fire('data', { id: 's1', window: '@0', data: '\r\n' + osc8('live-link.txt') });
+    await browser.pause(100);
+    check(await js(`window.__testTextIsUnderlined('live-link.txt')`) === true,
+      'TC-CR4 live OSC 8 links retain xterm native hyperlink decoration');
+
+    await fire('data', {
+      id: 's1', window: '@0', repaint: true,
+      data: E + '[H' + E + '[2J' + osc8('history-link.txt') + E + '[2;1H',
+    });
+    await browser.pause(100);
+    const restoredLink = await js(`({
+      buffer: window.__testReadBuffer(),
+      underlined: window.__testTextIsUnderlined('history-link.txt'),
+      path: window.__testLinkPath('history-link.txt'),
+    })`);
+    check(restoredLink.buffer.includes('history-link.txt') && restoredLink.underlined === false,
+      `TC-CR4 reconnect history keeps link text without dotted underline (got ${JSON.stringify(restoredLink)})`);
+    check(restoredLink.path === '/tmp/history-link.txt',
+      `TC-CR4 reconnect history keeps its clickable absolute path (got ${JSON.stringify(restoredLink)})`);
     finish();
   });
 

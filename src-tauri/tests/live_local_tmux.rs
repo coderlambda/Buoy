@@ -48,7 +48,7 @@ fn sink(rec: Arc<Mutex<Rec>>) -> buoy_lib::control_backend::BackendSink {
     Arc::new(move |ev: BackendEvent| {
         let mut r = rec.lock().unwrap();
         match ev {
-            BackendEvent::Data { window, data } => { r.by_window.entry(window).or_default().push_str(&data); }
+            BackendEvent::Data { window, data, .. } => { r.by_window.entry(window).or_default().push_str(&data); }
             BackendEvent::WindowAdd { order, .. } => { r.windows = order; }
             BackendEvent::WindowClose { order, .. } => { r.windows = order; }
             BackendEvent::WindowActive { order, .. } => { r.windows = order; }

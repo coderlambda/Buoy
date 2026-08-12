@@ -1,5 +1,9 @@
 interface XtermBufferLine {
   translateToString(trimRight?: boolean): string;
+  getCell(index: number): {
+    getChars(): string;
+    isUnderline(): boolean | number;
+  } | undefined;
 }
 
 interface XtermBuffer {
@@ -108,6 +112,8 @@ interface Window {
   __testMount(id: string): void;
   __testDispose(id: string): void;
   __testReadBuffer(): string;
+  __testTextIsUnderlined(text: string): boolean | null;
+  __testLinkPath(text: string): string | null;
   __testRepaintCount(): number;
   __testRendererKind(): string | null;
   __testBenchmarkWrite(lines: number): Promise<RendererWriteBenchmark>;
