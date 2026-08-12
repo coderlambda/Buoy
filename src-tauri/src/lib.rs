@@ -158,7 +158,7 @@ fn sanitize_color(c: Option<&str>) -> Option<String> {
 }
 
 #[derive(Serialize, Clone)]
-struct DataPayload { id: String, window: Option<String>, data: String }
+struct DataPayload { id: String, window: Option<String>, data: String, repaint: bool }
 
 #[derive(Serialize, Clone)]
 struct WindowPayload {
@@ -190,8 +190,10 @@ fn user_data_dir() -> std::path::PathBuf {
 
 fn emit_backend_event(app: &AppHandle, id: &str, ev: BackendEvent) {
     match ev {
-        BackendEvent::Data { window, data } => {
-            let _ = app.emit("session:data", DataPayload { id: id.into(), window: Some(window), data });
+        BackendEvent::Data { window, data, repaint } => {
+            let _ = app.emit("session:data", DataPayload {
+                id: id.into(), window: Some(window), data, repaint,
+            });
         }
         BackendEvent::WindowAdd { window, order } => {
             let _ = app.emit("session:window", WindowPayload {
@@ -442,7 +444,7 @@ fn create_session(app: AppHandle, state: State<AppState>, meta: CreateArgs) -> R
         let sink: local_backend::LocalSink = Arc::new(move |ev| match ev {
             LocalEvent::Data { data } => {
                 let _ = app_for_sink.emit("session:data",
-                    DataPayload { id: id_for_sink.clone(), window: None, data });
+                    DataPayload { id: id_for_sink.clone(), window: None, data, repaint: false });
             }
             // The shell exited (the user typed `exit`, or it crashed). Same event the renderer
             // already handles for plain mode, so the session closes instead of hanging "connected".
@@ -524,7 +526,9 @@ fn create_session(app: AppHandle, state: State<AppState>, meta: CreateArgs) -> R
                     // Plain mode has no Ready event; the first byte of output is the equivalent
                     // proof that this tmux path/version actually attached.
                     mark_attach_proven(&app_for_sink, &id_for_sink, &proven_for_sink);
-                    let _ = app_for_sink.emit("session:data", DataPayload { id: id_for_sink.clone(), window: None, data });
+                    let _ = app_for_sink.emit("session:data", DataPayload {
+                        id: id_for_sink.clone(), window: None, data, repaint: false,
+                    });
                 }
                 PlainEvent::Exit => { let _ = app_for_sink.emit("session:exit", json!({ "id": id_for_sink })); }
             }
