@@ -1,0 +1,20 @@
+{
+  "name": "@buoy/mobile",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "tauri": "tauri",
+    "dev:frontend": "vite --config ../../vite.mobile.config.ts",
+    "build:frontend": "vite build --config ../../vite.mobile.config.ts",
+    "android:init": "tauri android init",
+    "android:dev": "tauri android dev",
+    "android:build": "tauri android build",
+    "ios:init": "tauri ios init",
+    "ios:dev": "PATH=\"$HOME/.cargo/bin:$PATH\" tauri ios dev",
+    "ios:build": "PATH=\"$HOME/.cargo/bin:$PATH\" tauri ios build",
+    "check:rust": "cargo check --manifest-path src-tauri/Cargo.toml"
+  },
+  "dependencies": {
+    "@buoy/contracts": "*"
+  }
+}

@@ -20,9 +20,12 @@ import type {
   RecoveryTabSnapshot,
   SessionMeta,
   SessionState,
+  TerminalDataEvent,
+  RuntimeCapabilities,
   TabContent,
   TuiActivityTracker,
   TunnelInfo,
+  WindowEvent,
 } from './types.js';
 
 const DTPlugins = { PluginRegistry };
@@ -114,17 +117,27 @@ function errorMessage(error: unknown): string {
 }
 
 const api = window.terminalAPI;
+let runtimeCapabilities: RuntimeCapabilities = {
+  platform: 'desktop', localShell: true, nativeTabs: true, portForwarding: true,
+  backgroundConnection: true, fileDownload: true, sshHostKeyVerification: true,
+};
 const sessionsEl = requiredElement<HTMLElement>('sessions');
 const historyEl = requiredElement<HTMLElement>('history');
 const historyPanel = requiredElement<HTMLElement>('history-panel');
 const statusEl = requiredElement<HTMLElement>('status');
 const termHost = requiredElement<HTMLElement>('term');
+const mobileTitle = requiredElement<HTMLElement>('mobile-title');
+const mobileAuthDialog = requiredElement<HTMLDialogElement>('mobile-auth-dialog');
+const mobileAuthHost = requiredElement<HTMLElement>('mobile-auth-host');
+const mobileAuthPassword = requiredElement<HTMLInputElement>('mobile-auth-password');
+const mobileEmpty = document.getElementById('mobile-empty');
+const mobileSessionCount = document.getElementById('session-count');
 const recoverButton = requiredElement<HTMLButtonElement>('recover');
 
 function trackCommandInput(tab: AppTab | null, data: string): void {
   if (!tab || !data) return;
-  // Remove terminal protocol and arrow-key escape sequences. Human text and paste content remain;
-  // xterm device replies must never become a recoverable shell command.
+  // Remove terminal protocol/arrow-key escape sequences. Human text and paste content remain;
+  // device replies emitted by xterm's onData must never become a recoverable shell command.
   const text = data
     .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '');
@@ -145,6 +158,60 @@ function trackCommandInput(tab: AppTab | null, data: string): void {
   }
   tab.commandDraft = draft;
 }
+
+function requestMobileSshPassword(host: string): Promise<string | null> {
+  // Only one credential request can own the shared modal. A second session can be retried after the
+  // first finishes; replacing an open prompt could otherwise deliver a password to the wrong host.
+  if (mobileAuthDialog.open) return Promise.resolve(null);
+  mobileAuthHost.textContent = host;
+  mobileAuthPassword.value = '';
+  return new Promise((resolve) => {
+    mobileAuthDialog.addEventListener('close', () => {
+      const password = mobileAuthDialog.returnValue === 'ok' ? mobileAuthPassword.value : null;
+      mobileAuthPassword.value = '';
+      resolve(password);
+    }, { once: true });
+    mobileAuthDialog.showModal();
+    requestAnimationFrame(() => mobileAuthPassword.focus());
+  });
+}
+
+function showMobileTerminal(title: string): void {
+  if (runtimeCapabilities.platform !== 'mobile') return;
+  document.documentElement.dataset.mobileView = 'terminal';
+  mobileTitle.textContent = title;
+}
+
+function showMobileSessions(): void {
+  if (runtimeCapabilities.platform !== 'mobile') return;
+  document.documentElement.dataset.mobileView = 'sessions';
+}
+
+requiredElement<HTMLButtonElement>('mobile-back').onclick = showMobileSessions;
+document.getElementById('mobile-empty-new')?.addEventListener('click', () => {
+  requiredElement<HTMLElement>('new').click();
+});
+const mobileKeyValues: Record<string, string> = {
+  '\\u001b': '\x1b',
+  '\\u0003': '\x03',
+  '\\t': '\t',
+  '\\u001b[A': '\x1b[A',
+  '\\u001b[B': '\x1b[B',
+  '\\u001b[D': '\x1b[D',
+  '\\u001b[C': '\x1b[C',
+};
+requiredElement<HTMLElement>('mobile-keys').querySelectorAll<HTMLButtonElement>('button[data-input]')
+  .forEach((button) => {
+    button.onclick = () => {
+      if (!activeId) return;
+      const encoded = button.dataset.input ?? '';
+      const view = views.get(activeId);
+      const input = mobileKeyValues[encoded] ?? encoded;
+      trackCommandInput(view ? activeTab(view) : null, input);
+      api.input(activeId, input, view?.activeWindow);
+      if (view) activeTab(view)?.content.focus();
+    };
+  });
 
 // §22: console gate overlay — a blurred, non-interactive scrim shown while the active session is
 // connecting or its link is broken, so the user can't type into a session that can't receive it.
@@ -294,9 +361,27 @@ function makeView(meta: SessionMeta): View {
   views.set(meta.id, v);
   // For non-control (plain/local) there are no tmux window events; use a single implicit tab.
   if (meta.mode !== 'control') ensureTab(v, '@single');
-  // Flush any data that arrived before this view existed (reconnect race).
+  // A newly-created mobile connection can finish its initial tmux handshake before the invoke
+  // result crosses the webview boundary. Replay topology before data so every early capture keeps
+  // its real window instead of being painted into whichever tab happens to become active first.
+  const windows = pendingWindows[meta.id];
+  if (windows) {
+    delete pendingWindows[meta.id];
+    for (const event of windows) applyWindowEvent(event);
+  }
   const pending = pendingData[meta.id];
-  if (pending) { v.pending = (v.pending || []).concat(pending); delete pendingData[meta.id]; }
+  if (pending) {
+    delete pendingData[meta.id];
+    for (const event of pending) {
+      const tab = v.meta.mode === 'control'
+        ? (event.window ? ensureTab(v, event.window) : activeTab(v))
+        : activeTab(v);
+      const renderedData = event.repaint
+        ? DTBuiltinPlugins.sanitizeReconnectSnapshot(event.data)
+        : event.data;
+      deliver(v, tab, event.data, renderedData);
+    }
+  }
   return v;
 }
 
@@ -325,13 +410,20 @@ function ensureTab(v: View, winId: string): AppTab {
     // tab wires both through here. copyText -> system clipboard; setStatus -> status line feedback.
     copyText: (text: string) => void api.copyText(text),
     setStatus: (m: string) => setStatus(m),
+    log: (message: string) => api.log(message),
     // A standalone terminal BEL is Codex's zero-config fallback when its auto notification backend
     // does not recognize the terminal. xterm consumes BEL, so receive it through term.onBell.
     onBell: () => markTabNotification(v, tab),
     // Pointer, keyboard, and paste gestures inside the terminal explicitly acknowledge it.
     onInteract: () => acknowledgeTerminalInteraction(v, tab),
   };
-  const content = registry.createTabContent('terminal', { id: v.meta.id, meta: v.meta, linkProvider, linkHandler }, ctx);
+  const content = registry.createTabContent('terminal', {
+    id: v.meta.id,
+    meta: v.meta,
+    linkProvider,
+    linkHandler,
+    mobileTextInput: runtimeCapabilities.platform === 'mobile',
+  }, ctx);
   tab = {
     winId, title: winId, content, mounted: false,
     unreadNotification: false,
@@ -624,6 +716,7 @@ async function mount(id: string, userInitiated = false): Promise<void> {
   // during the connect was dropped for UI purposes — the console gate and tab strip stayed stale
   // over a live terminal until some later unrelated event re-rendered them.
   activeId = id;
+  showMobileTerminal(v.meta.title || v.meta.host || v.meta.session);
   // Non-control sessions have no inner tab strip to click. Treat clicking their session card as
   // viewing/acknowledging the sole implicit tab. Native-tab sessions keep each dot until that exact
   // tab header is clicked, so a session-level rollup never clears unrelated child notifications.
@@ -636,7 +729,7 @@ async function mount(id: string, userInitiated = false): Promise<void> {
   renderSidebar();
   updateConsoleGate();     // §22: blur/allow the console per this session's connection state
   // §18: pull the forwarded-port status (persisted + live, probed) for this session.
-  refreshTunnels(id);
+  if (runtimeCapabilities.portForwarding) refreshTunnels(id);
 
   // Connect the project once (reattaches the SAME tmux session; tmux replays windows -> tabs).
   if (!v.started) {
@@ -649,14 +742,26 @@ async function mount(id: string, userInitiated = false): Promise<void> {
     // createSession REJECTS on a spawn failure (bad host, ssh missing). Unhandled, that rejection
     // escaped this async fn and left the UI on "connecting…" forever with no error shown, since the
     // backend has no session:error event to fall back on.
+    const createMeta: CreateSessionMeta = {
+      id: v.meta.id, kind: v.meta.kind || 'remote', transport: v.meta.transport,
+      host: v.meta.host, session: v.meta.session, title: v.meta.title ?? '', mode: v.meta.mode,
+    };
+    if (v.meta.tmuxPath) createMeta.tmuxPath = v.meta.tmuxPath;
+    if (v.meta.tmuxVersion) createMeta.tmuxVersion = v.meta.tmuxVersion;
     try {
-      const createMeta: CreateSessionMeta = {
-        id: v.meta.id, kind: v.meta.kind || 'remote', transport: v.meta.transport,
-        host: v.meta.host, session: v.meta.session, title: v.meta.title ?? '', mode: v.meta.mode,
-      };
-      if (v.meta.tmuxPath) createMeta.tmuxPath = v.meta.tmuxPath;
-      if (v.meta.tmuxVersion) createMeta.tmuxVersion = v.meta.tmuxVersion;
-      const res = await api.createSession(createMeta);
+      let res;
+      try {
+        res = await api.createSession(createMeta);
+      } catch (firstError) {
+        const firstMessage = errorMessage(firstError) || 'unknown error';
+        // Credentials deliberately are not persisted. A restored mobile session first tries the
+        // server's `none` method; if that is rejected, request the password for this reconnect only.
+        if (runtimeCapabilities.platform !== 'mobile'
+          || !firstMessage.toLowerCase().includes('authentication')) throw firstError;
+        const password = await requestMobileSshPassword(v.meta.host);
+        if (password == null) throw firstError;
+        res = await api.createSession({ ...createMeta, sshPassword: password });
+      }
       dbg('mount->createSession returned ' + JSON.stringify(res));
       // The backend may have re-probed (unproven tmux path) or downgraded control -> plain. Adopt
       // what it actually used so the next createSession doesn't re-send the stale pair, and so the
@@ -667,6 +772,11 @@ async function mount(id: string, userInitiated = false): Promise<void> {
         if (res.mode && res.mode !== v.meta.mode) {
           dbg('mount->createSession mode changed ' + v.meta.mode + ' -> ' + res.mode);
           v.meta.mode = res.mode;
+        }
+        if (res.ready) {
+          v.state = 'connected';
+          v.inputReady = true;
+          if (id === activeId) { setStatus(statusLine(v, v.state)); updateConsoleGate(); }
         }
         renderSidebar();
       }
@@ -803,10 +913,10 @@ function renderSidebar() {
     // version when known — a local session runs a real tmux too (§5.3b), so it earns the same badge;
     // its absence is the visible signal that this machine has no tmux and the session isn't durable.
     const ver = v.tmuxVersion ? ` · tmux ${v.tmuxVersion.join('.')}` : '';
-    const detachedState = v.meta.detached
+    const remoteState = v.meta.detached
       ? ` · detached${v.remoteOpen === true ? ' · open' : v.remoteOpen === false ? ' · not found' : ''}`
       : '';
-    const sub = (v.meta.host ? escapeHtml(v.meta.host) : 'local shell') + ver + detachedState;
+    const sub = (v.meta.host ? escapeHtml(v.meta.host) : 'local shell') + ver + remoteState;
     // §18: forwarded ports under the project name. Active rows show the local port and open on
     // click; inactive (grey) rows are persisted-but-not-serving — click re-opens the tunnel.
     // String is short: ":<remote> → :<local>" (local shows "—" when not currently mapped).
@@ -841,6 +951,7 @@ function renderSidebar() {
             <span class="act reconnect${reconnectBusy(id) ? ' busy' : ''}" title="${reconnectBusy(id) ? 'Reconnecting…' : 'Force reconnect now'}">⟳</span>
             <span class="act detach" title="Detach (keeps tmux running)">⤫</span>
             <span class="act kill" title="Close (ends tmux and saves recovery state)">⏻</span>
+            <span class="act more" title="Session actions">More</span>
           </span>
         </span>
         <span class="sub">${sub}</span>
@@ -855,6 +966,22 @@ function renderSidebar() {
     requiredDescendant<HTMLElement>(li, '.reconnect').onclick = (e) => { e.stopPropagation(); forceReconnect(id); };
     requiredDescendant<HTMLElement>(li, '.detach').onclick = (e) => { e.stopPropagation(); void detachSession(id); };
     requiredDescendant<HTMLElement>(li, '.kill').onclick = (e) => { e.stopPropagation(); void closeSession(id); };
+    requiredDescendant<HTMLElement>(li, '.more').onclick = (e) => {
+      e.stopPropagation();
+      const items: ChooserItem[] = [
+        ['Rename session', () => startRename(id)],
+      ];
+      if (v.state === 'dead') items.push(['Retry connection', () => {
+        if (!reconnectBusy(id)) { markReconnecting(id); api.retry(id); renderSidebar(); }
+      }]);
+      if (v.meta.mode === 'control') items.push(['Reconnect now', () => forceReconnect(id)]);
+      items.push(
+        ['Detach (keep tmux running)', () => void detachSession(id)],
+        [v.meta.mode === 'local' ? 'Close local shell' : 'Close and move to History', () => void closeSession(id)],
+        ['Delete permanently', () => void killSession(id)],
+      );
+      showChooser(v.meta.title || v.meta.host || v.meta.session, items);
+    };
     // tunnel rows: active -> open the local URL; inactive -> re-open; ⇄ force same-port; × close.
     li.querySelectorAll<HTMLElement>('.tunnel').forEach((el) => {
       const remote = Number(el.getAttribute('data-remote'));
@@ -902,7 +1029,15 @@ function renderSidebar() {
   }
   for (const [id, view] of archivedViews) renderHistorySession(id, view);
   historyPanel.toggleAttribute('hidden', archivedViews.length === 0);
+  if (mobileEmpty) mobileEmpty.classList.toggle('on', views.size === 0);
   sessionsEl.toggleAttribute('hidden', activeViews.length === 0);
+  if (mobileSessionCount) {
+    mobileSessionCount.textContent = views.size === 0
+      ? 'Your durable terminals'
+      : archivedViews.length
+        ? `${activeViews.length} active · ${archivedViews.length} in history`
+        : `${activeViews.length} durable session${activeViews.length === 1 ? '' : 's'}`;
+  }
 }
 
 // --- §20/§24: drag-to-reorder, on POINTER events (not HTML5 drag-and-drop) --------------------
@@ -1107,6 +1242,7 @@ function clearDragStyles(d: DragState): void {
 }
 
 function wireSidebarDnD(li: HTMLElement, _id: string): void {
+  if (runtimeCapabilities.platform === 'mobile') return;
   wirePointerDrag(li, sessionsEl, '.session', 'y', (from, to) => reorderProjectByIndex(from, to));
 }
 
@@ -1210,6 +1346,7 @@ function removeView(id: string): void {
   // Drop any output buffered for an id that will never get a view again — makeView is the only
   // drain, so leaving this would grow without bound for the app's lifetime.
   delete pendingData[id];
+  delete pendingWindows[id];
   if (activeId === id) {
     activeId = null;
     tabsEl.className = ''; tabsEl.innerHTML = '';
@@ -1231,10 +1368,11 @@ async function detachSession(id: string): Promise<void> {
     return;
   }
   // Keep locally observed per-tab commands across the detach/reattach UI teardown. The tmux
-  // window ids remain stable, so ensureTab can put them back on reconstructed AppTab objects.
+  // window ids remain stable, so ensureTab can put them back on the reconstructed AppTab objects.
   v.meta.recoveryTabs = recoveryHints(v);
   teardownViewUi(v);
   delete pendingData[id];          // late output for the connection we just dropped
+  delete pendingWindows[id];
   v.started = false;               // mount() will reattach on the next click
   v.state = 'idle';
   v.meta.detached = true;
@@ -1263,13 +1401,13 @@ function recoveryHints(v: View): RecoveryTabSnapshot[] {
   });
 }
 
-// Close snapshots each tmux window, ends the tmux session, and moves the durable metadata to
+// Close: snapshot each tmux window, end the tmux session, and move the durable metadata to
 // History. Resume later reconstructs windows/cwds and seeds bash/zsh history with lastCommand.
 async function closeSession(id: string): Promise<void> {
   const v = views.get(id);
   if (!v) return;
   if (v.meta.mode === 'local') {
-    if (!confirm('Close this local shell?\n\nIt is not backed by tmux and cannot be resumed.')) return;
+    if (!confirm('Close this local shell?\n\nThis shell is not backed by tmux and cannot be resumed.')) return;
     try { await api.kill(id); } catch (_) {}
     removeView(id);
     return;
@@ -1278,6 +1416,8 @@ async function closeSession(id: string): Promise<void> {
   const location = v.meta.transport === 'local' ? 'local' : 'remote';
   if (!confirm(`Close "${label}"?\n\nThis ends the ${location} tmux session. Buoy will save each tab's working directory and last command so it can be reconstructed from History.`)) return;
 
+  // Mobile needs an authenticated SSH runtime to take the snapshot. A detached/restored row is
+  // lazily reattached here (and may request its one-shot password) before the destructive close.
   if (!v.started) {
     await mount(id);
     if (!v.started || v.state === 'dead') {
@@ -1290,7 +1430,8 @@ async function closeSession(id: string): Promise<void> {
   try {
     await api.close(id, hints);
   } catch (error) {
-    // The backend detaches first to prevent the reconnect supervisor from recreating tmux.
+    // Both runtimes intentionally detach before/while attempting Close to prevent a reconnect
+    // supervisor from recreating tmux. On failure, reflect that truthful fallback state.
     teardownViewUi(v);
     v.started = false;
     v.state = 'idle';
@@ -1301,6 +1442,7 @@ async function closeSession(id: string): Promise<void> {
   }
   teardownViewUi(v);
   delete pendingData[id];
+  delete pendingWindows[id];
   v.started = false;
   v.state = 'idle';
   v.inputReady = false;
@@ -1316,6 +1458,7 @@ async function closeSession(id: string): Promise<void> {
     if (next) void mount(next); else termHost.innerHTML = '';
   }
   setStatus(`${label} closed and moved to History`);
+  showMobileSessions();
   renderSidebar();
   updateConsoleGate();
 }
@@ -1357,13 +1500,16 @@ async function checkOpenSessions(): Promise<void> {
     }
     renderSidebar();
     if (recoverable.length) {
-      showChooser('Open detached sessions', recoverable.map(([sessionId, view]) => [
+      showChooser('Open detached sessions', recoverable.map(([id, view]) => [
         `Reattach ${view.meta.title || view.meta.host || view.meta.session}`,
-        () => void mount(sessionId, true),
+        () => void mount(id, true),
       ] as const));
       setStatus(`${recoverable.length} detached session${recoverable.length === 1 ? '' : 's'} found`);
     } else if (errors) {
-      setStatus(`check finished with ${errors} host error${errors === 1 ? '' : 's'}`);
+      const mobileHint = runtimeCapabilities.platform === 'mobile'
+        ? '; password-only hosts must be opened first'
+        : '';
+      setStatus(`check finished with ${errors} host error${errors === 1 ? '' : 's'}${mobileHint}`);
     } else {
       const open = results.filter((result) => result.open).length;
       setStatus(`${open} tmux session${open === 1 ? '' : 's'} open; none need recovery`);
@@ -1558,17 +1704,23 @@ function mountTabRenameInput(v: View, wid: string, labelEl: HTMLElement): void {
 // --- events from main ---
 // Control-mode data is tagged with the WINDOW it belongs to (the backend owns pane->window
 // resolution). Plain/local data has no window -> the single tab. The renderer never maps panes.
-api.onData(({ id, data, window, repaint }) => {
+api.onData((event) => {
+  const { id, data, window, repaint } = event;
   // A reconnect snapshot is one complete backend payload, so remove only its OSC 8 wrappers before
   // buffering/rendering. tmux's capture still retains colors and every other text attribute.
   const renderedData = repaint ? DTBuiltinPlugins.sanitizeReconnectSnapshot(data) : data;
   const v = views.get(id);
-  if (!v) { dbg('onData: NO VIEW id=' + id + ' (buffering)'); (pendingData[id] = pendingData[id] || []).push(renderedData); return; }
+  if (!v) {
+    dbg('onData: NO VIEW id=' + id + ' (buffering)');
+    (pendingData[id] = pendingData[id] || []).push(event);
+    return;
+  }
   const tab = (v.meta.mode === 'control') ? (window ? ensureTab(v, window) : activeTab(v)) : activeTab(v);
   deliver(v, tab, data, renderedData);
 });
 
-const pendingData: Record<string, string[]> = {};   // id -> [data] buffered before the view exists
+const pendingData: Record<string, TerminalDataEvent[]> = {};
+const pendingWindows: Record<string, WindowEvent[]> = {};
 
 // Deliver a data chunk to a resolved tab (mounting/revealing it if it's the active one).
 function deliver(v: View, tab: AppTab | null, data: string, renderedData = data): void {
@@ -1743,10 +1895,10 @@ function statusLine(v: View, state: SessionState): string {
 // events (each with the full window `order`). The renderer just mirrors them into tabs — it
 // holds no pane/topology state of its own.
 const tabsEl = requiredElement<HTMLElement>('tabs');
-api.onWindow(({ id, action, window, name, order }) => {
+function applyWindowEvent({ id, action, window, name, order }: WindowEvent): void {
   dbg('onWindow id=' + id + ' action=' + action + ' window=' + window + ' order=' + JSON.stringify(order));
   const v = views.get(id);
-  if (!v) { dbg('onWindow: NO VIEW for id=' + id); return; }
+  if (!v) return;
   if (action === 'add') {
     ensureTab(v, window);
     if (!v.activeWindow) v.activeWindow = window;   // first window = active until told otherwise
@@ -1782,6 +1934,15 @@ api.onWindow(({ id, action, window, name, order }) => {
     if (target !== v.activeWindow) switchTab(v, target);
   }
   if (id === activeId) renderTabs(v);
+}
+
+api.onWindow((event) => {
+  if (!views.has(event.id)) {
+    dbg('onWindow: NO VIEW for id=' + event.id + ' (buffering)');
+    (pendingWindows[event.id] = pendingWindows[event.id] || []).push(event);
+    return;
+  }
+  applyWindowEvent(event);
 });
 
 // Lazy scrollback back-fill: ask the backend to capture a window's screen the first time it is
@@ -1922,10 +2083,13 @@ api.onReady(({ id }) => {
   dbg('onReady id=' + id + ' activeId=' + activeId);
   const v = views.get(id);
   if (!v) { dbg('onReady: NO VIEW for id=' + id); return; }
+  // Ready is authoritative even when a preceding Connected event raced ahead of view creation.
+  v.state = 'connected';
   v.inputReady = true;   // display flag only; the backend already flushed its buffered input
   if (id === activeId) { setStatus(statusLine(v, v.state)); updateConsoleGate(); }
+  renderSidebar();
   // §18: on (re)connect, refresh the forwarded-port status (active/inactive).
-  refreshTunnels(id);
+  if (runtimeCapabilities.portForwarding) refreshTunnels(id);
 });
 // §18: the backend pushes the updated forwarded-port list; mirror it into the view + sidebar.
 api.onTunnels(({ id, tunnels }) => {
@@ -1967,7 +2131,11 @@ const dialog = requiredElement<HTMLDialogElement>('dialog');
 const fKind = requiredElement<HTMLSelectElement>('f-kind');
 const remoteFields = requiredElement<HTMLElement>('remote-fields');
 const fHost = requiredElement<HTMLInputElement>('f-host');
+const fSshPassword = requiredElement<HTMLInputElement>('f-ssh-password');
 const fControl = requiredElement<HTMLButtonElement>('f-control');   // native-mode toggle button
+const nativeTabsRow = requiredElement<HTMLElement>('native-tabs-row');
+const mobileSshFields = requiredElement<HTMLElement>('mobile-ssh-fields');
+const localKindOption = requiredElement<HTMLOptionElement>('f-kind-local');
 const hostHistoryEl = requiredElement<HTMLElement>('host-history');
 const localHint = requiredElement<HTMLElement>('local-hint');
 const errorEl = requiredElement<HTMLElement>('f-err');
@@ -1989,6 +2157,8 @@ fKind.onchange = updateFields;
 
 requiredElement<HTMLButtonElement>('new').addEventListener('click', () => {
   errorEl.textContent = '';
+  if (!runtimeCapabilities.localShell) fKind.value = 'remote';
+  fSshPassword.value = '';
   setNative(true);                    // default to native mode each time the dialog opens
   updateFields();
   hideHostHistory();
@@ -2038,13 +2208,16 @@ sessionForm.addEventListener('submit', async (event) => {
     kind,
     // ssh is the only REMOTE transport; a local session's tmux is exec'd directly (no ssh).
     transport: kind === 'local' ? 'local' : 'ssh',
-    mode: fControl.classList.contains('on') ? 'control' : 'plain',
+    mode: runtimeCapabilities.nativeTabs && fControl.classList.contains('on') ? 'control' : 'plain',
     title: titleInput.value.trim() || (kind === 'local' ? 'local' : host),
     // The hidden Host input can retain a previous remote value after switching Type. Never persist
     // that stale value onto a local session or the sidebar will mislabel it as remote.
     host: kind === 'local' ? '' : host,
     // NOTE: no session name from the user — main.js generates & owns it.
   };
+  if (runtimeCapabilities.platform === 'mobile' && fSshPassword.value) {
+    meta.sshPassword = fSshPassword.value;
+  }
   let res;
   try {
     res = await api.createSession(meta);
@@ -2054,7 +2227,20 @@ sessionForm.addEventListener('submit', async (event) => {
     return;
   }
   const { id, session } = res;
-  const viewMeta: SessionMeta = { ...meta, id, session };
+  // Keep one-shot credentials out of the long-lived renderer session model. In particular, do not
+  // spread `meta` here: CreateSessionMeta intentionally contains fields that SessionMeta must never
+  // retain or later persist.
+  const viewMeta: SessionMeta = {
+    id,
+    session,
+    host: meta.host,
+    kind: meta.kind,
+    transport: meta.transport,
+    mode: meta.mode,
+    title: meta.title,
+  };
+  if (meta.tmuxPath) viewMeta.tmuxPath = meta.tmuxPath;
+  if (meta.tmuxVersion) viewMeta.tmuxVersion = meta.tmuxVersion;
   // Adopt what the backend ACTUALLY used. A local session is downgraded control -> plain on tmux
   // < 3.2, and all the way to mode 'local' (a bare pty, no tabs) when tmux isn't installed; the view
   // must know that or it would wait for %window events that never arrive.
@@ -2062,8 +2248,13 @@ sessionForm.addEventListener('submit', async (event) => {
   if (res.tmuxPath) viewMeta.tmuxPath = res.tmuxPath;
   if (res.tmuxVersion) viewMeta.tmuxVersion = res.tmuxVersion;
   dialog.close('ok');
+  fSshPassword.value = '';
   const v = makeView(viewMeta);
   v.started = true;         // createSession already ran; mount() must not start it again
+  if (res.ready) {
+    v.state = 'connected';
+    v.inputReady = true;
+  }
   mount(id);
 });
 
@@ -2074,9 +2265,11 @@ async function init(reset = false): Promise<void> {
     views.clear();
     activeId = null;
     for (const id of Object.keys(pendingData)) delete pendingData[id];
+    for (const id of Object.keys(pendingWindows)) delete pendingWindows[id];
     tabsEl.className = '';
     tabsEl.innerHTML = '';
     if (dialog.open) dialog.close();
+    if (mobileAuthDialog.open) mobileAuthDialog.close('cancel');
     sessionForm.reset();
     errorEl.textContent = '';
     setNative(true);
@@ -2085,6 +2278,18 @@ async function init(reset = false): Promise<void> {
     hideHostHistory();
     updateConsoleGate();
   }
+  try {
+    runtimeCapabilities = await api.getCapabilities();
+  } catch (_) {}
+  document.documentElement.dataset.platform = runtimeCapabilities.platform;
+  if (!document.documentElement.dataset.mobileView) document.documentElement.dataset.mobileView = 'sessions';
+  localKindOption.hidden = !runtimeCapabilities.localShell;
+  localKindOption.disabled = !runtimeCapabilities.localShell;
+  if (!runtimeCapabilities.localShell && fKind.value === 'local') fKind.value = 'remote';
+  nativeTabsRow.classList.toggle('mobile-unsupported', !runtimeCapabilities.nativeTabs);
+  mobileSshFields.hidden = runtimeCapabilities.platform !== 'mobile';
+  requiredElement<HTMLElement>('mobile-security').hidden = runtimeCapabilities.sshHostKeyVerification;
+  updateFields();
   // §18/§20: load config (loopback hosts + last-active project) before wiring.
   let lastActive: string | null = null;
   try {
@@ -2104,7 +2309,9 @@ async function init(reset = false): Promise<void> {
   renderSidebar();
   // §18: show persisted forwarded ports for every restored session up front (greyed until
   // re-opened), so the list survives an app restart without waiting for a connect.
-  for (const meta of persisted) if (!meta.archived) refreshTunnels(meta.id);
+  if (runtimeCapabilities.portForwarding) {
+    for (const meta of persisted) if (!meta.archived) refreshTunnels(meta.id);
+  }
   const activePersisted = persisted.filter((meta) => !meta.archived);
   const historyCount = persisted.length - activePersisted.length;
   setStatus(activePersisted.length
@@ -2113,7 +2320,7 @@ async function init(reset = false): Promise<void> {
   // §20: reopen the LAST-USED project (fall back to the first) so the app resumes where you left off.
   // The project restores its own last-active tab once its windows arrive (see onWindow).
   const autoOpen = activePersisted.filter((meta) => !meta.detached);
-  if (autoOpen.length) {
+  if (autoOpen.length && runtimeCapabilities.platform !== 'mobile') {
     const first = autoOpen[0];
     if (first) {
       const remembered = lastActive ? views.get(lastActive) : undefined;
@@ -2128,4 +2335,6 @@ void init();
 
 // §18: periodically re-probe the active session's tunnels so a stopped dev server goes grey (and
 // a restarted one goes active) without a manual refresh. Light: one call every 5s for the shown one.
-setInterval(() => { if (activeId != null && views.has(activeId)) refreshTunnels(activeId); }, 5000);
+setInterval(() => {
+  if (runtimeCapabilities.portForwarding && activeId != null && views.has(activeId)) refreshTunnels(activeId);
+}, 5000);

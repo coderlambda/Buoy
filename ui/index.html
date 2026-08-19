@@ -83,6 +83,7 @@
     .session.dead .controls { visibility:visible; }   /* keep retry visible even without hover */
     .session .act { flex:none; width:16px; text-align:center; font-size:11px;
       line-height:16px; color:var(--muted); cursor:pointer; }
+    .session .act.more { display:none; }
     .session .act.reconnect:hover { color:var(--accent); }
     /* A reconnect is in flight: dim the control and swallow clicks so a double-click can't stack
        two backend spawns (which would evict each other via tmux `new-session -D`). */
@@ -122,6 +123,7 @@
     #recover:hover { color:var(--accent); border-color:#45475a; }
     #recover:disabled { opacity:.45; cursor:default; }
     #main { flex:1; display:flex; flex-direction:column; min-width:0; min-height:0; overflow:hidden; }
+    #mobile-bar, #mobile-keys { display:none; }
     #tabs { display:none; gap:2px; padding:4px 6px 0; background:var(--panel); }
     #tabs.on { display:flex; }
     #tabs .tab { display:flex; align-items:center; gap:6px; padding:4px 10px; font-size:12px;
@@ -271,6 +273,47 @@
     .color-swatch.sel { border-color:var(--fg); }
     .color-swatch.none { background:var(--bg); color:var(--muted); font-size:13px; line-height:18px;
       border:1px solid #45475a; }
+    /* Mobile is a separate application package but shares the product renderer. Runtime
+       capabilities put these attributes on <html>; CSS owns layout while TypeScript owns
+       navigation state. */
+    html[data-platform="mobile"] #app { height:100dvh; }
+    html[data-platform="mobile"] #sidebar { width:100%; min-width:0; border-right:0;
+      padding-top:env(safe-area-inset-top); }
+    html[data-platform="mobile"][data-mobile-view="terminal"] #sidebar { display:none; }
+    html[data-platform="mobile"][data-mobile-view="sessions"] #main { display:none; }
+    html[data-platform="mobile"] #sidebar h1 { padding:14px 16px 8px; font-size:13px; }
+    html[data-platform="mobile"] #sessions { padding:0 8px; }
+    html[data-platform="mobile"] .session { min-height:54px; padding:10px 12px; border-radius:9px; }
+    html[data-platform="mobile"] .session .controls { visibility:visible; position:static;
+      transform:none; background:none; padding-left:8px; gap:10px; }
+    html[data-platform="mobile"] .session .act { width:28px; min-height:28px; line-height:28px;
+      font-size:16px; }
+    html[data-platform="mobile"] #new { min-height:44px; line-height:26px; margin-bottom:
+      calc(10px + env(safe-area-inset-bottom)); }
+    html[data-platform="mobile"] #mobile-bar { display:flex; align-items:center; gap:8px;
+      min-height:calc(44px + env(safe-area-inset-top)); padding:env(safe-area-inset-top) 10px 0;
+      background:var(--panel); border-bottom:1px solid #313244; flex:none; }
+    #mobile-back { min-height:36px; padding:6px 8px; color:var(--accent); background:transparent;
+      border:0; font:inherit; font-size:14px; }
+    #mobile-title { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+      text-align:center; font-weight:600; }
+    #mobile-security { color:#f9e2af; font-size:16px; width:32px; text-align:center; }
+    html[data-platform="mobile"] #tabs { overflow-x:auto; overflow-y:hidden; flex:none;
+      -webkit-overflow-scrolling:touch; }
+    html[data-platform="mobile"] #tabs .tab { min-height:40px; min-width:100px; }
+    html[data-platform="mobile"] #term { padding:2px; }
+    html[data-platform="mobile"] #status { height:24px; line-height:24px; }
+    html[data-platform="mobile"] #mobile-keys { display:flex; gap:4px; overflow-x:auto;
+      padding:5px 8px calc(5px + env(safe-area-inset-bottom)); background:var(--panel);
+      border-top:1px solid #313244; flex:none; }
+    html[data-platform="mobile"] #mobile-keys button { min-width:44px; min-height:36px;
+      padding:4px 9px; color:var(--fg); background:#252537; border:1px solid #45475a;
+      border-radius:7px; font:12px ui-monospace,SFMono-Regular,Menlo,monospace; }
+    html[data-platform="mobile"] dialog { width:calc(100vw - 24px); max-width:480px;
+      margin-top:max(12px, env(safe-area-inset-top)); }
+    html[data-platform="mobile"] dialog input,
+    html[data-platform="mobile"] dialog select { min-height:44px; font-size:16px; }
+    html[data-platform="mobile"] .toggle-row.mobile-unsupported { display:none; }
   </style>
 </head>
 <body>
@@ -286,9 +329,23 @@
       <div id="new">+ New session</div>
     </div>
     <div id="main">
+      <div id="mobile-bar">
+        <button id="mobile-back" type="button">‹ Sessions</button>
+        <span id="mobile-title">Terminal</span>
+        <span id="mobile-security" title="SSH host key verification is unavailable">⚠</span>
+      </div>
       <div id="tabs"></div>
       <div id="term"></div>
       <div id="status">ready</div>
+      <div id="mobile-keys" aria-label="Terminal keys">
+        <button type="button" data-input="\u001b">Esc</button>
+        <button type="button" data-input="\u0003">Ctrl-C</button>
+        <button type="button" data-input="\t">Tab</button>
+        <button type="button" data-input="\u001b[A">↑</button>
+        <button type="button" data-input="\u001b[B">↓</button>
+        <button type="button" data-input="\u001b[D">←</button>
+        <button type="button" data-input="\u001b[C">→</button>
+      </div>
     </div>
   </div>
 
@@ -298,7 +355,7 @@
         <div class="dialog-select">
           <select id="f-kind">
             <option value="remote" selected>Remote host (ssh + tmux)</option>
-            <option value="local">Local shell (tmux)</option>
+            <option id="f-kind-local" value="local">Local shell (tmux)</option>
           </select>
         </div>
       </div>
@@ -310,12 +367,17 @@
         </div>
         <div class="hint">Connects over ssh and keeps a persistent tmux session that
           reattaches automatically on reconnect.</div>
+        <div id="mobile-ssh-fields" hidden>
+          <label for="f-ssh-password">SSH password <span class="opt">(kept in memory only)</span></label>
+          <input id="f-ssh-password" type="password" autocomplete="current-password" />
+          <div class="hint">Leave empty only if the SSH server permits the “none” authentication method.</div>
+        </div>
       </div>
       <!-- Local sessions run a tmux on THIS machine, so they get native tabs and survive an app
            restart just like remote ones (§5.3b) — the toggle applies to both and stays visible. -->
       <div id="local-hint" class="hint">Runs a shell on this machine inside tmux, so the session
         survives quitting the app and reattaches when you reopen it.</div>
-      <div class="toggle-row">
+      <div id="native-tabs-row" class="toggle-row">
         <button type="button" id="f-control" class="toggle on" role="switch" aria-checked="true">
           <span class="knob"></span>
         </button>
@@ -326,6 +388,19 @@
       <div style="text-align:right">
         <button value="cancel">Cancel</button>
         <button value="ok" id="f-ok">Create</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="mobile-auth-dialog">
+    <form method="dialog" id="mobile-auth-form">
+      <label for="mobile-auth-password">SSH password</label>
+      <div id="mobile-auth-host" class="hint"></div>
+      <input id="mobile-auth-password" type="password" autocomplete="current-password" required />
+      <div class="hint">Used for this app process only; it is never written to disk.</div>
+      <div style="text-align:right">
+        <button value="cancel" formnovalidate>Cancel</button>
+        <button value="ok">Connect</button>
       </div>
     </form>
   </dialog>

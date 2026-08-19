@@ -1,0 +1,10 @@
+{
+  "name": "@buoy/desktop",
+  "version": "0.1.1",
+  "private": true,
+  "scripts": {
+    "dev": "cd ../.. && npm run tauri:dev",
+    "build": "cd ../.. && npm run tauri:build",
+    "test": "cd ../.. && npm run typecheck && npm test && npm run tauri:test"
+  }
+}

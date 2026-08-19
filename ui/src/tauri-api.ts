@@ -21,6 +21,7 @@ function on<T>(event: string, cb: (payload: T) => void): void {
 }
 
 export const terminalAPI: TerminalAPI = {
+  getCapabilities: () => invoke('get_runtime_capabilities'),
   // session CRUD — the Rust side owns all argv/validation.
   listSessions: () => invoke('list_sessions'),
   createSession: (meta) => invoke('create_session', { meta }),
@@ -35,7 +36,7 @@ export const terminalAPI: TerminalAPI = {
   close: (id, tabs) => invoke('session_close', { id, tabs }), // snapshot + end tmux + History
   resume: (id) => invoke('session_resume', { id }), // move from History before reattaching
   checkOpenSessions: () => invoke('check_open_sessions'),
-  kill: (id) => invoke('session_kill', { id }),     // terminate remote tmux session
+  kill: (id) => invoke('session_kill', { id }),     // terminate tmux session
   retry: (id) => invoke('session_retry', { id }),   // manual reconnect from a dead session
   forceReconnect: (id) => invoke('session_force_reconnect', { id }),   // reconnect now from any state
   rename: (id, title) => invoke('session_rename', { id, title }),

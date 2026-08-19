@@ -1,5 +1,6 @@
 node_modules/
 dist/
+dist-mobile/
 *.log
 .DS_Store
 ._*
@@ -12,5 +13,9 @@ certificate-base64.txt
 
 # Rust / Tauri build artifacts
 src-tauri/target/
+/target/
 src-tauri/gen/schemas/
+apps/mobile/src-tauri/gen/schemas/
+apps/mobile/src-tauri/gen/android/.gradle/
+apps/mobile/src-tauri/gen/android/local.properties
 src-tauri/src/ui_test_init.js

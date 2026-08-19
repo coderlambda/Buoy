@@ -17,6 +17,8 @@ interface CreateResult {
   mode?: string;
   tmuxPath?: string | null;
   tmuxVersion?: number[] | null;
+  sshPassword?: string;
+  ready?: boolean;
   [key: string]: unknown;
 }
 
@@ -26,6 +28,8 @@ interface TestBackend {
   tunnels?: Record<string, unknown[]>;
   hosts?: string[];
   echoInput?: boolean;
+  rejectCreateWithoutPassword?: boolean;
+  capabilities?: Record<string, unknown>;
 }
 
 interface TestFixture {
@@ -152,19 +156,37 @@ interface Window {
     const rejection = backend.reject?.[command];
     if (rejection) throw new Error(rejection);
     switch (command) {
+      case 'get_runtime_capabilities': return clone(backend.capabilities ?? {
+          platform: 'desktop', localShell: true, nativeTabs: true, portForwarding: true,
+          backgroundConnection: true, fileDownload: true, sshHostKeyVerification: true,
+        });
       case 'list_sessions': return clone(fixture.sessions);
       case 'get_config': return clone(fixture.config);
       case 'create_session': {
         const meta = args.meta ?? {};
+        if (backend.rejectCreateWithoutPassword && !meta.sshPassword) {
+          throw new Error('SSH authentication was rejected');
+        }
         const configured = clone(backend.createSessionResult ?? {});
         const id = configured.id ?? meta.id ?? `created-${++createdSessionSequence}`;
+        const session = configured.session ?? meta.session ?? `dt-${id}`;
+        const mode = configured.mode ?? meta.mode ?? 'control';
+        // Mirror the mobile runtime's ordering: initial control events can arrive before the
+        // create_session invoke resolves. This deliberately exercises the renderer's race buffer.
+        if (configured.ready && mode === 'control') {
+          emit('session:state', { id, state: 'connected' });
+          emit('session:window', { id, action: 'add', window: '@1', order: ['@1'] });
+          emit('session:window', { id, action: 'rename', window: '@1', name: 'shell' });
+          emit('session:window', { id, action: 'active', window: '@1', order: ['@1'] });
+          emit('session:ready', { id });
+        }
         const existing = fixture.sessions.find((session) => session.id === id);
-        const stored: TestSession = {
+        const stored = {
           id,
           host: String(meta.host ?? existing?.host ?? ''),
-          session: String(configured.session ?? meta.session ?? existing?.session ?? `dt-${id}`),
+          session,
           transport: (meta.transport ?? existing?.transport ?? 'ssh') as 'local' | 'ssh',
-          mode: (configured.mode ?? meta.mode ?? existing?.mode ?? 'control') as 'control' | 'plain' | 'local',
+          mode: mode as 'control' | 'plain' | 'local',
           title: String(meta.title ?? existing?.title ?? ''),
           archived: false,
           detached: false,
@@ -172,12 +194,13 @@ interface Window {
         if (existing) Object.assign(existing, stored); else fixture.sessions.push(stored);
         return {
           id,
-          session: stored.session,
-          mode: stored.mode,
+          session,
+          mode,
           tmuxPath: Object.prototype.hasOwnProperty.call(configured, 'tmuxPath')
             ? configured.tmuxPath : '/usr/bin/tmux',
           tmuxVersion: Object.prototype.hasOwnProperty.call(configured, 'tmuxVersion')
             ? configured.tmuxVersion : [3, 6],
+          ready: configured.ready,
         };
       }
       case 'session_input':

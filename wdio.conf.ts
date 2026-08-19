@@ -3,7 +3,6 @@ import * as path from 'node:path';
 
 const binary = path.resolve(
   __dirname,
-  'src-tauri',
   'target',
   'debug',
   process.platform === 'win32' ? 'buoy.exe' : 'buoy',
@@ -18,6 +17,7 @@ export const config: WebdriverIO.Config = {
     './test/gui-new-session.ts',
     './test/gui-terminal-repaint.ts',
     './test/gui-session-history.ts',
+    './test/gui-mobile-shell.ts',
   ],
   maxInstances: 1,
   capabilities: [{

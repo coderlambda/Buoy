@@ -16,6 +16,9 @@ jobs:
   rebuild:
     name: Build, verify, and replace macOS assets
     runs-on: macos-latest
+    env:
+      # Keep artifact discovery stable for both pre-workspace tags and the current root workspace.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       # Build the exact source referenced by the release rather than moving or rewriting
       # the published tag. The workflow itself is dispatched from main.
@@ -38,7 +41,7 @@ jobs:
       - name: Cache cargo
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: './src-tauri -> target'
+          workspaces: './src-tauri -> ../target'
           key: macos-universal-release
 
       - name: Import Apple Developer ID certificate
@@ -101,9 +104,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          app_path="$GITHUB_WORKSPACE/src-tauri/target/universal-apple-darwin/release/bundle/macos/Buoy.app"
+          app_path="$GITHUB_WORKSPACE/target/universal-apple-darwin/release/bundle/macos/Buoy.app"
           binary_path="$app_path/Contents/MacOS/buoy"
-          dmg_path="$(find "$GITHUB_WORKSPACE/src-tauri/target/universal-apple-darwin/release/bundle/dmg" -maxdepth 1 -name '*.dmg' -print -quit)"
+          dmg_path="$(find "$GITHUB_WORKSPACE/target/universal-apple-darwin/release/bundle/dmg" -maxdepth 1 -name '*.dmg' -print -quit)"
 
           test -d "$app_path"
           test -f "$binary_path"

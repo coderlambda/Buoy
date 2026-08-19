@@ -1,8 +1,12 @@
 {
-  "name": "buoy",
+  "name": "@buoy/workspace",
   "version": "0.1.1",
   "description": "Buoy — a durable remote terminal (ssh + tmux) whose sessions resurface after network drops",
   "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
     "dev": "vite",
     "build:frontend": "npm run typecheck:ui && vite build",
@@ -20,11 +24,18 @@
     "gui-new-session": "npm run test:ui:build && wdio run wdio.conf.ts --spec test/gui-new-session.ts",
     "gui-terminal-repaint": "npm run test:ui:build && wdio run wdio.conf.ts --spec test/gui-terminal-repaint.ts",
     "gui-session-history": "npm run test:ui:build && wdio run wdio.conf.ts --spec test/gui-session-history.ts",
+    "gui-mobile-shell": "npm run test:ui:build && wdio run wdio.conf.ts --spec test/gui-mobile-shell.ts",
     "measure:renderer": "npm run test:ui:build && cross-env BUOY_RENDERER_BENCHMARK_BACKEND=canvas wdio run wdio.conf.ts --spec test/gui-renderer-benchmark.ts && cross-env BUOY_RENDERER_BENCHMARK_BACKEND=dom wdio run wdio.conf.ts --spec test/gui-renderer-benchmark.ts",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "tauri:test": "cd src-tauri && PATH=\"$HOME/.cargo/bin:$PATH\" cargo test --lib"
+    "tauri:test": "cargo test -p buoy --lib",
+    "mobile:check": "npm run typecheck && npm run build:frontend -w @buoy/mobile && cargo check -p buoy-mobile",
+    "mobile:test": "cargo test -p buoy-mobile --lib",
+    "mobile:ios:init": "npm run ios:init -w @buoy/mobile",
+    "mobile:ios:dev": "npm run ios:dev -w @buoy/mobile",
+    "mobile:android:init": "npm run android:init -w @buoy/mobile",
+    "mobile:android:dev": "npm run android:dev -w @buoy/mobile"
   },
   "license": "MIT",
   "//devDependencies": "The GUI suites use WebdriverIO's embedded Tauri WebDriver to exercise the real platform webview; the ui-test Cargo feature is excluded from production builds.",

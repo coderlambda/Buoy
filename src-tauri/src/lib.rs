@@ -275,6 +275,11 @@ fn mark_attach_proven(app: &AppHandle, id: &str, once: &std::sync::atomic::Atomi
 // --- Tauri commands (the renderer's IPC surface; replaces preload.js) ----------------------
 
 #[tauri::command]
+fn get_runtime_capabilities() -> buoy_core::RuntimeCapabilities {
+    buoy_core::RuntimeCapabilities::desktop()
+}
+
+#[tauri::command]
 fn list_sessions(state: State<AppState>) -> Vec<SessionMeta> {
     state.store.load()
 }
@@ -1122,6 +1127,7 @@ pub fn run() {
                 .unwrap_or_else(|_| tauri::http::Response::new(Vec::new()))
         })
         .invoke_handler(tauri::generate_handler![
+            get_runtime_capabilities,
             list_sessions, create_session, session_input, session_resize,
             session_detach, session_close, session_resume, session_kill, session_rename,
             reorder_sessions, set_session_color, set_last_active, set_last_tab, set_tab_prefs,

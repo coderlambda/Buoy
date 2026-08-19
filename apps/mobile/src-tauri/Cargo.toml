@@ -1,0 +1,28 @@
+[package]
+name = "buoy-mobile"
+version = "0.1.0"
+description = "Buoy mobile SSH client"
+edition = "2024"
+rust-version = "1.85"
+
+[lib]
+name = "buoy_mobile_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+base64 = "0.22"
+buoy-core = { path = "../../../crates/buoy-core" }
+russh = { version = "0.62.5", default-features = false, features = ["ring", "rsa"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+url = "2"
+
+[dev-dependencies]
+rand = "0.10"
