@@ -1,0 +1,8 @@
+[workspace]
+members = [
+  "src-tauri",
+  "apps/mobile/src-tauri",
+  "crates/buoy-core",
+]
+default-members = ["src-tauri"]
+resolver = "2"

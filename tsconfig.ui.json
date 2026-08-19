@@ -7,5 +7,5 @@
     "noEmit": true,
     "types": []
   },
-  "include": ["ui/src/**/*.ts"]
+  "include": ["ui/src/**/*.ts", "apps/mobile/ui/src/**/*.ts"]
 }

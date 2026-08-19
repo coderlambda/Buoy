@@ -56,6 +56,8 @@ interface XtermTerminal {
 interface XtermTerminalOptions {
   fontFamily?: string;
   fontSize?: number;
+  lineHeight?: number;
+  rescaleOverlappingGlyphs?: boolean;
   theme?: { background?: string; foreground?: string };
   scrollback?: number;
   linkHandler?: unknown;

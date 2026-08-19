@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b0e14" />
+  <title>Buoy</title>
+  <link rel="stylesheet" href="/xterm.css" />
+  <link rel="stylesheet" href="/mobile.css" />
+</head>
+<body>
+  <div id="app">
+    <section id="sidebar" aria-label="Sessions">
+      <header class="session-header">
+        <div>
+          <div class="brand-row"><span class="brand-mark" aria-hidden="true"></span><span>BUOY</span></div>
+          <h1>Sessions</h1>
+          <p id="session-count">Your durable terminals</p>
+        </div>
+        <div class="session-actions">
+          <button id="recover" class="round-button subtle" type="button" aria-label="Check open sessions">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 8a7.5 7.5 0 1 0 .5 7"/><path d="M19 3v5h-5" /></svg>
+          </button>
+          <button id="new" class="round-button primary" type="button" aria-label="New session">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+          </button>
+        </div>
+      </header>
+
+      <div id="mobile-empty" class="empty-state">
+        <div class="empty-icon" aria-hidden="true">
+          <svg viewBox="0 0 48 48"><path d="M9 14.5A5.5 5.5 0 0 1 14.5 9h19A5.5 5.5 0 0 1 39 14.5v19a5.5 5.5 0 0 1-5.5 5.5h-19A5.5 5.5 0 0 1 9 33.5z"/><path d="m17 19 5 5-5 5M26 30h7" /></svg>
+        </div>
+        <h2>No sessions yet</h2>
+        <p>Connect to a host over your VPN. Buoy will return to the same tmux session when you reopen the app.</p>
+        <button id="mobile-empty-new" type="button">Connect a host</button>
+      </div>
+
+      <ul id="sessions" aria-live="polite"></ul>
+      <section id="history-panel" class="history-panel" hidden>
+        <div class="history-heading">History</div>
+        <ul id="history" aria-live="polite"></ul>
+      </section>
+      <footer class="session-footer">
+        <span class="secure-dot" aria-hidden="true"></span>
+        SSH stays inside your private network
+      </footer>
+    </section>
+
+    <main id="main">
+      <header id="mobile-bar">
+        <button id="mobile-back" class="round-button subtle" type="button" aria-label="Back to sessions">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14.5 6-6 6 6 6" /></svg>
+        </button>
+        <div class="terminal-heading">
+          <span id="mobile-title">Terminal</span>
+          <span id="status">Ready</span>
+        </div>
+        <span id="mobile-security" class="security-warning" title="SSH host key verification is unavailable" aria-label="SSH host key warning">!</span>
+        <span class="header-spacer" aria-hidden="true"></span>
+      </header>
+
+      <nav id="tabs" aria-label="Terminal windows"></nav>
+      <section id="term" aria-label="Terminal output"></section>
+
+      <div id="mobile-keys" aria-label="Terminal keys">
+        <button type="button" data-input="\u001b">Esc</button>
+        <button type="button" data-input="\u0003">Ctrl C</button>
+        <button type="button" data-input="\t">Tab</button>
+        <button class="key-icon" type="button" data-input="\u001b[D" aria-label="Left arrow">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m12.5 5-5 5 5 5" /></svg>
+        </button>
+        <button class="key-icon" type="button" data-input="\u001b[B" aria-label="Down arrow">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 7.5 5 5 5-5" /></svg>
+        </button>
+        <button class="key-icon" type="button" data-input="\u001b[A" aria-label="Up arrow">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 12.5 5-5 5 5" /></svg>
+        </button>
+        <button class="key-icon" type="button" data-input="\u001b[C" aria-label="Right arrow">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m7.5 5 5 5-5 5" /></svg>
+        </button>
+      </div>
+    </main>
+  </div>
+
+  <dialog id="dialog" class="sheet">
+    <form method="dialog" id="form">
+      <div class="sheet-handle" aria-hidden="true"></div>
+      <header class="sheet-header">
+        <div>
+          <span class="sheet-eyebrow">NEW CONNECTION</span>
+          <h2>Connect a host</h2>
+        </div>
+        <button value="cancel" class="sheet-close" type="submit" formnovalidate aria-label="Cancel">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 7 10 10M17 7 7 17" /></svg>
+        </button>
+      </header>
+
+      <div class="mobile-hidden-field">
+        <label for="f-kind">Type</label>
+        <select id="f-kind">
+          <option value="remote" selected>Remote host</option>
+          <option id="f-kind-local" value="local">Local shell</option>
+        </select>
+      </div>
+
+      <div id="remote-fields">
+        <label for="f-host">SSH address</label>
+        <div id="host-wrap">
+          <input id="f-host" placeholder="user@100.x.x.x" autocomplete="off" autocapitalize="none" spellcheck="false" />
+          <ul id="host-history"></ul>
+        </div>
+        <p class="hint">Use a Tailscale hostname or private VPN address. A custom port can follow the host.</p>
+
+        <div id="mobile-ssh-fields" hidden>
+          <label for="f-ssh-password">Password <span class="opt">Memory only</span></label>
+          <input id="f-ssh-password" type="password" autocomplete="current-password" placeholder="SSH password" />
+          <p class="hint">The password is used for this connection and is never stored.</p>
+        </div>
+      </div>
+
+      <div id="local-hint" class="hint">Runs a local tmux session.</div>
+
+      <label for="f-title">Display name <span class="opt">Optional</span></label>
+      <input id="f-title" placeholder="My Mac" autocomplete="off" />
+
+      <div id="native-tabs-row" class="setting-row">
+        <div>
+          <span class="setting-title">Native tabs</span>
+          <span class="setting-detail">Show tmux windows as tabs</span>
+        </div>
+        <button type="button" id="f-control" class="toggle on" role="switch" aria-checked="true">
+          <span class="knob"></span>
+        </button>
+      </div>
+
+      <div class="connection-note">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8.5 10V8a3.5 3.5 0 0 1 7 0v2M7 10h10v9H7z" /></svg>
+        The SSH connection can pause in the background. Your tmux session continues on the host and reconnects when Buoy opens again.
+      </div>
+
+      <div class="err" id="f-err"></div>
+      <button value="ok" id="f-ok" class="connect-button" type="submit">Connect</button>
+    </form>
+  </dialog>
+
+  <dialog id="mobile-auth-dialog" class="sheet auth-sheet">
+    <form method="dialog" id="mobile-auth-form">
+      <div class="sheet-handle" aria-hidden="true"></div>
+      <header class="sheet-header">
+        <div>
+          <span class="sheet-eyebrow">RECONNECT</span>
+          <h2>SSH password</h2>
+        </div>
+      </header>
+      <div id="mobile-auth-host" class="host-badge"></div>
+      <label for="mobile-auth-password">Password</label>
+      <input id="mobile-auth-password" type="password" autocomplete="current-password" required />
+      <p class="hint">Used once for this app process and never saved.</p>
+      <div class="sheet-actions">
+        <button value="cancel" class="secondary-button" formnovalidate>Cancel</button>
+        <button value="ok" class="connect-button">Connect</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/xterm.js"></script>
+  <script src="/addon-fit.js"></script>
+  <script src="/addon-canvas.js"></script>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

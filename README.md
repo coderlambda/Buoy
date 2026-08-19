@@ -5,8 +5,9 @@ persist server-side (tmux) and **resurface after network drops** — like a buoy
 by a wave, the connection always pops back up. ssh + tmux control mode for native tabs,
 clickable paths/URLs, and localhost port-forwarding.
 
-The app is **Tauri v2 + Rust** (`src-tauri/`) with a strict TypeScript frontend (`ui/src/`),
-bundled by Vite. See
+The app is a **Tauri v2 + Rust workspace** with a strict TypeScript frontend bundled by Vite.
+The shipping desktop runtime remains in `src-tauri/`; the mobile runtime is isolated in
+`apps/mobile/`, with shared contracts/core in `packages/` and `crates/`. See
 `DESIGN.md` for the full, adversarially-reviewed design,
 `OSC_NOTIFICATIONS_DESIGN.md` for terminal notification behavior, `TAURI_MIGRATION.md` for
 the history of the port from the original Electron MVP (deleted from this branch; it
@@ -38,9 +39,30 @@ survives in git history and on `main`), and `TEST_PLAN.md` for the test matrix.
 
 ```bash
 npm run tauri:dev      # develop (Vite hot reload + the Rust/Tauri backend)
-npm run tauri:build    # release bundle -> src-tauri/target/release/bundle/
+npm run tauri:build    # release bundle -> target/release/bundle/
                        #   macos/Buoy.app + dmg/Buoy_<version>_<arch>.dmg
 ```
+
+## Mobile
+
+Desktop and mobile are separate application packages in one repository, not forks. Both use the
+same terminal/session contract and renderer; each runtime advertises capabilities so
+platform-specific UI is rendered without scattered target checks.
+
+```bash
+npm run mobile:check       # shared types + mobile frontend + host Rust compile
+npm run mobile:ios:dev     # iOS simulator/device after Rust targets + signing are configured
+npm run mobile:android:init
+npm run mobile:android:dev # after Android SDK/NDK setup
+```
+
+Mobile is remote-only and foreground-oriented. It opens SSH in-process (no local `ssh` binary),
+requires remote `tmux`, and implements the Desktop remote feature set: durable reconnect, native
+tmux tabs with plain fallback, notifications, sticky port forwarding, remote file preview/download,
+session preferences, and persisted host-key TOFU. There is no Buoy account, relay, or service
+authentication. VPN provides reachability; an optional SSH password stays in process memory only.
+Local shells, background socket guarantees, SSH key/agent integration, and credential persistence
+remain platform/product boundaries. See `MOBILE.md` for details.
 
 Create a **Local shell** session to try it immediately — it runs your shell inside a local
 `tmux`, so it gets native tabs and survives quitting the app (without `tmux` installed it

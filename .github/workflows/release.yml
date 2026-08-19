@@ -63,7 +63,7 @@ jobs:
       - name: Cache cargo
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: './src-tauri -> target'
+          workspaces: '. -> target'
           key: ${{ matrix.platform }}
 
       # GitHub runners cannot access the certificate installed in the developer's local

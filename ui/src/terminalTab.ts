@@ -11,6 +11,8 @@
 export interface TerminalTabSpec {
   linkHandler?: unknown;
   linkProvider?: XtermLinkProvider;
+  /** Reconcile iOS dictation's evolving full-sentence insertText snapshots. */
+  mobileTextInput?: boolean;
 }
 
 export interface TerminalTabContext {
@@ -18,6 +20,7 @@ export interface TerminalTabContext {
   ack?(bytes: number): void;
   copyText?(text: string): void;
   setStatus?(message: string): void;
+  log?(message: string): void;
   onBell?(): void;
   onInteract?(): void;
 }
@@ -25,6 +28,44 @@ export interface TerminalTabContext {
 let repaintCount = 0;
 let inputLatencyStarted: number | null = null;
 let inputLatencyResult: number | null = null;
+
+function codePoints(value: string): string[] { return Array.from(value); }
+
+function commonPrefixLength(left: string[], right: string[]): number {
+  const end = Math.min(left.length, right.length);
+  let index = 0;
+  while (index < end && left[index] === right[index]) index += 1;
+  return index;
+}
+
+export interface MobileDomEdit {
+  output: string;
+  deleteCount: number;
+  insertCount: number;
+  prefixLength: number;
+}
+
+/**
+ * Turn the actual edit WebKit made to xterm's helper textarea into terminal bytes. iOS dictation
+ * does not expose a composition lifecycle, but it does keep replacing its previous hypothesis in
+ * the textarea. Keeping that text storage and applying its replacement is the strategy used by
+ * native iOS terminals such as SwiftTerm; relying on InputEvent.data loses the replacement range.
+ */
+export class MobileDomInputReconciler {
+  reconcile(before: string, after: string): MobileDomEdit {
+    const oldPoints = codePoints(before);
+    const newPoints = codePoints(after);
+    const prefixLength = commonPrefixLength(oldPoints, newPoints);
+    const deleteCount = oldPoints.length - prefixLength;
+    const inserted = newPoints.slice(prefixLength);
+    return {
+      output: '\x7f'.repeat(deleteCount) + inserted.join(''),
+      deleteCount,
+      insertCount: inserted.length,
+      prefixLength,
+    };
+  }
+}
 
 // Diagnostic used by the native webview suite. Incrementing only after refresh succeeds makes the
 // counter detect both a missed call site and a renderer whose refresh primitive stopped working.
@@ -37,8 +78,18 @@ export function getTerminalInputLatency(): number | null { return inputLatencyRe
 
 export function createTerminalTab(spec: TerminalTabSpec, ctx: TerminalTabContext) {
   const options: XtermTerminalOptions = {
-    fontFamily: 'Menlo, Consolas, monospace', fontSize: 13,
-    theme: { background: '#1e1e2e', foreground: '#cdd6f4' }, scrollback: 5000,
+    // SF Mono covers terminal box drawing on iOS; the later fallbacks cover CJK, symbols and emoji.
+    // xterm still owns wcwidth/cell placement, while Canvas can select a fallback glyph per cell.
+    fontFamily: spec.mobileTextInput
+      ? '"SFMono-Regular", "SF Mono", Menlo, Monaco, "PingFang SC", "Apple Symbols", "Apple Color Emoji", monospace'
+      : 'Menlo, Consolas, monospace',
+    fontSize: spec.mobileTextInput ? 12 : 13,
+    lineHeight: spec.mobileTextInput ? 1.08 : 1,
+    rescaleOverlappingGlyphs: true,
+    theme: spec.mobileTextInput
+      ? { background: '#090c12', foreground: '#eef3fa' }
+      : { background: '#1e1e2e', foreground: '#cdd6f4' },
+    scrollback: 5000,
     // §21: handle OSC 8 hyperlinks (embedded-URI links). Without this xterm renders them
     // underlined but the click is a no-op in the Tauri webview.
   };
@@ -78,9 +129,24 @@ export function createTerminalTab(spec: TerminalTabSpec, ctx: TerminalTabContext
   let el: HTMLDivElement | null = null;
   let rendererKind: 'dom' | 'canvas' = 'dom';
   const preOpen: string[] = [];   // bytes buffered until the xterm is opened
+  const mobileDomInput = new MobileDomInputReconciler();
+  let mobileBeforeInput: {
+    target: HTMLTextAreaElement;
+    value: string;
+    selectionStart: number | null;
+    selectionEnd: number | null;
+    inputType: string;
+  } | null = null;
+  let mobileTrackedValue = '';
+  let mobileComposing = false;
+  let keyboardDispatch = false;
+  let lastKeyboardData: { data: string; at: number } | null = null;
 
   // input up (gating is applied by the caller via ctx.input, which may buffer)
-  term.onData((data) => ctx.input(data));
+  term.onData((data) => {
+    if (keyboardDispatch) lastKeyboardData = { data, at: performance.now() };
+    ctx.input(data);
+  });
   // xterm consumes a standalone BEL byte and surfaces it through onBell instead of leaving it in
   // the rendered data stream. Codex's default notification method falls back to BEL for terminals
   // it does not recognize, so forward that standard attention signal to the project/tab layer.
@@ -122,6 +188,78 @@ export function createTerminalTab(spec: TerminalTabSpec, ctx: TerminalTabContext
       // Observe real DOM gestures instead of term.onData: xterm uses onData for both user input and
       // automatic terminal protocol replies, and a reply must not acknowledge unread work.
       const acknowledge = () => { if (ctx.onInteract) ctx.onInteract(); };
+      if (spec.mobileTextInput) {
+        // WebKit has an open bug where iOS dictation emits no composition events. Capture the real
+        // before/after edit on xterm's textarea and stop the target event before xterm forwards
+        // InputEvent.data as an append. This preserves WebKit's replacement semantics instead.
+        el.addEventListener('beforeinput', (event) => {
+          const input = event as InputEvent;
+          if (mobileComposing || input.inputType === 'insertFromPaste') return;
+          if (!(event.target instanceof HTMLTextAreaElement)) return;
+          mobileBeforeInput = {
+            target: event.target,
+            value: event.target.value,
+            selectionStart: event.target.selectionStart,
+            selectionEnd: event.target.selectionEnd,
+            inputType: input.inputType,
+          };
+          mobileTrackedValue = event.target.value;
+        }, true);
+        el.addEventListener('input', (event) => {
+          const input = event as InputEvent;
+          if (!(event.target instanceof HTMLTextAreaElement)) return;
+          const textarea = event.target;
+          const beforeState = mobileBeforeInput?.target === textarea ? mobileBeforeInput : null;
+          const before = beforeState
+            ? beforeState.value
+            : mobileTrackedValue;
+          const after = textarea.value;
+          mobileTrackedValue = after;
+          mobileBeforeInput = null;
+
+          if (mobileComposing || input.inputType === 'insertFromPaste') return;
+          const keyboardData = lastKeyboardData;
+          const keyboardAlreadySent = keyboardData != null
+            && performance.now() - keyboardData.at < 250
+            && (keyboardData.data === input.data
+              || (input.inputType.startsWith('delete') && keyboardData.data === '\x7f'));
+          if (keyboardAlreadySent) return;
+
+          // This input had no keyboard/keypress delivery (the signature of iOS dictation and some
+          // soft keyboards). Prevent xterm's target listener from appending InputEvent.data.
+          event.stopPropagation();
+          const edit = mobileDomInput.reconcile(before, after);
+          if (ctx.log) {
+            ctx.log(`mobile input edit ${JSON.stringify({
+              inputType: input.inputType,
+              dataLength: codePoints(input.data ?? '').length,
+              beforeLength: codePoints(before).length,
+              afterLength: codePoints(after).length,
+              selectionStart: beforeState?.selectionStart ?? null,
+              selectionEnd: beforeState?.selectionEnd ?? null,
+              prefixLength: edit.prefixLength,
+              deleteCount: edit.deleteCount,
+              insertCount: edit.insertCount,
+            })}`);
+          }
+          if (edit.output) ctx.input(edit.output);
+        }, true);
+        el.addEventListener('keydown', () => {
+          keyboardDispatch = true;
+          setTimeout(() => { keyboardDispatch = false; }, 0);
+        }, true);
+        el.addEventListener('keyup', () => { keyboardDispatch = false; }, true);
+        el.addEventListener('compositionstart', () => { mobileComposing = true; }, true);
+        el.addEventListener('compositionend', (event) => {
+          mobileComposing = false;
+          if (event.target instanceof HTMLTextAreaElement) mobileTrackedValue = event.target.value;
+        }, true);
+        el.addEventListener('paste', () => { mobileBeforeInput = null; }, true);
+        el.addEventListener('blur', (event) => {
+          mobileBeforeInput = null;
+          mobileTrackedValue = event.target instanceof HTMLTextAreaElement ? event.target.value : '';
+        }, true);
+      }
       el.addEventListener('pointerdown', acknowledge, true);
       el.addEventListener('keydown', acknowledge, true);
       el.addEventListener('paste', acknowledge, true);
