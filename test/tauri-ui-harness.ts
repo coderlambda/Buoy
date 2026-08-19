@@ -44,7 +44,7 @@ export async function loadFixture(
   ), { timeout: 10000, timeoutMsg: 'Tauri UI fixture was not installed' });
   await browser.waitUntil(async () => browser.execute(
     (count) => document.querySelectorAll('#sessions .session').length === count,
-    sessions.length,
+    sessions.filter((item) => !item.archived).length,
   ), { timeout: 10000, timeoutMsg: 'renderer did not mount the expected fake sessions' });
   await browser.pause(100);
 }

@@ -19,6 +19,7 @@
     "gui-notifications": "npm run test:ui:build && wdio run wdio.conf.ts --spec test/gui-notifications.ts",
     "gui-new-session": "npm run test:ui:build && wdio run wdio.conf.ts --spec test/gui-new-session.ts",
     "gui-terminal-repaint": "npm run test:ui:build && wdio run wdio.conf.ts --spec test/gui-terminal-repaint.ts",
+    "gui-session-history": "npm run test:ui:build && wdio run wdio.conf.ts --spec test/gui-session-history.ts",
     "measure:renderer": "npm run test:ui:build && cross-env BUOY_RENDERER_BENCHMARK_BACKEND=canvas wdio run wdio.conf.ts --spec test/gui-renderer-benchmark.ts && cross-env BUOY_RENDERER_BENCHMARK_BACKEND=dom wdio run wdio.conf.ts --spec test/gui-renderer-benchmark.ts",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",

@@ -17,6 +17,7 @@ export const config: WebdriverIO.Config = {
     './test/gui-notifications.ts',
     './test/gui-new-session.ts',
     './test/gui-terminal-repaint.ts',
+    './test/gui-session-history.ts',
   ],
   maxInstances: 1,
   capabilities: [{

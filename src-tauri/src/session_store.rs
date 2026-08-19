@@ -6,6 +6,19 @@ use std::path::PathBuf;
 
 use crate::validation::{parse_host, validate_session};
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryTab {
+    pub window: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub cwd: String,
+    #[serde(default)]
+    pub shell: String,
+    #[serde(default)]
+    pub last_command: String,
+}
 // Serialized to/from the renderer AND disk in camelCase, so the JS side reads meta.tmuxPath /
 // meta.tmuxVersion directly (a snake/camel mismatch here silently dropped the persisted tmux
 // path -> re-probe on every reconnect -> wrong socket -> couldn't reattach existing sessions).
@@ -44,6 +57,18 @@ pub struct SessionMeta {
     pub tab_order: Vec<String>,                   // custom tab order (window ids); missing -> tmux order
     #[serde(default)]
     pub tab_colors: std::collections::BTreeMap<String, String>,   // window id -> accent color
+    // Explicit Close snapshots and ends tmux, then archives the row for reconstruction. Legacy rows
+    // default to active so upgrades do not unexpectedly hide existing sessions.
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub archived_at: Option<u64>,
+    #[serde(default)]
+    pub detached: bool,
+    #[serde(default)]
+    pub recovery_tabs: Vec<RecoveryTab>,
+    #[serde(default)]
+    pub restore_pending: bool,
 }
 
 fn default_transport() -> String { "ssh".into() }
@@ -112,6 +137,23 @@ impl SessionStore {
         if hit { self.save(&list); }
     }
 
+    pub fn update_session(&self, id: &str, update: impl FnOnce(&mut SessionMeta)) -> bool {
+        let mut list = self.load();
+        let Some(session) = list.iter_mut().find(|session| session.id == id) else { return false };
+        update(session);
+        self.save(&list);
+        true
+    }
+
+    /// Move one persisted session into or out of History without changing its tmux identity,
+    /// cached attach metadata, tab preferences, or ordering. Returns false for an unknown id.
+    pub fn set_archived(&self, id: &str, archived: bool, archived_at: Option<u64>) -> bool {
+        self.update_session(id, |session| {
+            session.archived = archived;
+            session.archived_at = if archived { archived_at } else { None };
+        })
+    }
+
     pub fn save(&self, sessions: &[SessionMeta]) {
         if let Some(dir) = self.path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -149,6 +191,7 @@ mod tests {
         ).unwrap();
         assert_eq!(camel.tmux_path.as_deref(), Some("/home/u/.local/bin/tmux"));
         assert_eq!(camel.tmux_version, Some((3, 7)));
+        assert!(!camel.archived, "legacy rows remain in the active list");
 
         let legacy: SessionMeta = serde_json::from_str(
             r#"{"id":"1","host":"me@h","session":"dt-1","mode":"control",
@@ -167,6 +210,8 @@ mod tests {
             tmux_path: Some("/t".into()), tmux_version: Some((3, 7)),
             title: Some("x".into()), order: 0, attach_ok: false,
             color: None, last_tab: None, tab_order: vec![], tab_colors: Default::default(),
+            archived: false, archived_at: None,
+            detached: false, recovery_tabs: vec![], restore_pending: false,
         };
         let json = serde_json::to_string(&m).unwrap();
         assert!(json.contains("\"tmuxPath\""), "must serialize camelCase tmuxPath");
@@ -191,6 +236,8 @@ mod tests {
             tmux_path: Some("/opt/homebrew/bin/tmux".into()), tmux_version: Some((3, 6)),
             title: Some("local".into()), order: 0, attach_ok: false,
             color: None, last_tab: None, tab_order: vec![], tab_colors: Default::default(),
+            archived: false, archived_at: None,
+            detached: false, recovery_tabs: vec![], restore_pending: false,
         };
         store.save(&[mk("l1", "control"), mk("l2", "plain"), mk("l3", "local")]);
         let loaded = store.load();
@@ -239,6 +286,8 @@ mod tests {
             tmux_path: Some("/usr/bin/tmux".into()), tmux_version: Some((3, 7)),
             title: Some(id.into()), order, attach_ok: false,
             color: None, last_tab: None, tab_order: vec![], tab_colors: Default::default(),
+            archived: false, archived_at: None,
+            detached: false, recovery_tabs: vec![], restore_pending: false,
         };
         store.save(&[mk("a", 0), mk("b", 1)]);
         assert!(store.load().iter().all(|s| !s.attach_ok), "fresh rows start unproven");
@@ -257,6 +306,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn archive_round_trip_preserves_tmux_and_tab_state() {
+        let dir = std::env::temp_dir().join(format!("dt-store-history-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let store = SessionStore::new(dir.join("sessions.json"));
+        let original = SessionMeta {
+            id: "resume-me".into(), host: "me@h".into(), session: "dt-resume".into(),
+            transport: "ssh".into(), mode: "control".into(),
+            tmux_path: Some("/usr/bin/tmux".into()), tmux_version: Some((3, 7)),
+            title: Some("work".into()), order: 0, attach_ok: true,
+            color: None, last_tab: Some("@2".into()), tab_order: vec!["@1".into(), "@2".into()],
+            tab_colors: Default::default(), archived: false, archived_at: None,
+            detached: false, recovery_tabs: vec![], restore_pending: false,
+        };
+        store.save(&[original]);
+        assert!(store.set_archived("resume-me", true, Some(1234)));
+        let archived = store.load().remove(0);
+        assert!(archived.archived);
+        assert_eq!(archived.archived_at, Some(1234));
+        assert_eq!(archived.tmux_path.as_deref(), Some("/usr/bin/tmux"));
+        assert_eq!(archived.last_tab.as_deref(), Some("@2"));
+        assert_eq!(archived.tab_order, vec!["@1".to_string(), "@2".to_string()]);
+
+        assert!(store.set_archived("resume-me", false, None));
+        let resumed = store.load().remove(0);
+        assert!(!resumed.archived);
+        assert_eq!(resumed.archived_at, None);
+        assert!(resumed.attach_ok, "resume must keep the proven tmux socket metadata");
+        assert!(!store.set_archived("missing", true, Some(1)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // §20: order + customization survive a save/load round-trip, and load is order-sorted.
     #[test]
     fn persists_order_and_customization() {
@@ -271,6 +352,8 @@ mod tests {
             attach_ok: false, color: color.map(String::from), last_tab: Some("@2".into()),
             tab_order: vec!["@2".into(), "@0".into()],
             tab_colors: [("@0".to_string(), "#89b4fa".to_string())].into_iter().collect(),
+            archived: false, archived_at: None,
+            detached: false, recovery_tabs: vec![], restore_pending: false,
         };
         // save() assigns order by array position; load() returns in that order.
         store.save(&[mk("a", 0, None), mk("b", 1, Some("#a6e3a1"))]);
