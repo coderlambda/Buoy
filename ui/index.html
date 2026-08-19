@@ -18,6 +18,11 @@
     #sidebar h1 { font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted);
       padding:12px 14px 6px; margin:0; }
     #sessions { list-style:none; margin:0; padding:0 6px; overflow-y:auto; flex:1; }
+    #history-panel { display:flex; flex:none; max-height:42%; min-height:0; flex-direction:column;
+      border-top:1px solid #313244; }
+    #history-panel[hidden] { display:none; }
+    #sessions[hidden] + #history-panel { max-height:none; flex:1; border-top:0; }
+    #history { list-style:none; margin:0; padding:0 6px 6px; overflow-y:auto; min-height:0; }
     .session { position:relative; display:flex; align-items:flex-start; gap:8px; padding:8px 10px;
       border-radius:6px; cursor:pointer; }
     .session:hover { background:#252537; }
@@ -84,6 +89,13 @@
     .session .act.reconnect.busy, .session .retry.busy { opacity:.4; pointer-events:none; }
     .session .act.detach:hover { color:var(--fg); }
     .session .act.kill:hover { color:#f38ba8; }
+    .history-session { opacity:.82; }
+    .history-session:hover { opacity:1; }
+    .history-session .history-actions { display:flex; align-items:center; gap:5px; margin-left:6px; }
+    .history-session .history-actions button { margin:0; padding:3px 7px; color:var(--muted);
+      background:#252537; border:1px solid #45475a; border-radius:5px; font:inherit; cursor:pointer; }
+    .history-session .history-actions .resume { color:var(--accent); }
+    .history-session .history-actions .delete:hover { color:#f38ba8; }
     /* §18: forwarded-port list under the project name */
     .session .tunnels { display:flex; flex-direction:column; gap:2px; margin-top:3px; }
     .session .tunnel { display:flex; align-items:center; gap:4px; font-size:10px; color:var(--muted);
@@ -105,6 +117,10 @@
     #new { margin:10px; padding:8px; border:1px dashed #45475a; border-radius:6px; text-align:center;
       color:var(--muted); cursor:pointer; }
     #new:hover { color:var(--fg); border-color:var(--accent); }
+    #recover { margin:8px 10px 0; padding:6px 8px; color:var(--muted); background:transparent;
+      border:1px solid #313244; border-radius:6px; font:inherit; cursor:pointer; }
+    #recover:hover { color:var(--accent); border-color:#45475a; }
+    #recover:disabled { opacity:.45; cursor:default; }
     #main { flex:1; display:flex; flex-direction:column; min-width:0; min-height:0; overflow:hidden; }
     #tabs { display:none; gap:2px; padding:4px 6px 0; background:var(--panel); }
     #tabs.on { display:flex; }
@@ -262,6 +278,11 @@
     <div id="sidebar">
       <h1>Sessions</h1>
       <ul id="sessions"></ul>
+      <section id="history-panel" hidden>
+        <h1>History</h1>
+        <ul id="history"></ul>
+      </section>
+      <button id="recover" type="button">↻ Check open sessions</button>
       <div id="new">+ New session</div>
     </div>
     <div id="main">

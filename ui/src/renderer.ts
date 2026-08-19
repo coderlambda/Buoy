@@ -17,6 +17,7 @@ import type { FileViewerTabContext, FileViewerTabSpec } from './fileViewerTab.js
 import type {
   CreateSessionMeta,
   OscNotificationParser,
+  RecoveryTabSnapshot,
   SessionMeta,
   SessionState,
   TabContent,
@@ -59,6 +60,8 @@ interface AppTab {
   renameDraft?: string | null;
   renameSel?: RenameSelection | null;
   renameFocus?: boolean;
+  commandDraft?: string;
+  lastCommand?: string;
 }
 
 interface View {
@@ -83,6 +86,7 @@ interface View {
   renameDraft?: string | null;
   renameSel?: RenameSelection | null;
   renameFocus?: boolean;
+  remoteOpen?: boolean | null;
 }
 
 type DragAxis = 'x' | 'y';
@@ -111,8 +115,36 @@ function errorMessage(error: unknown): string {
 
 const api = window.terminalAPI;
 const sessionsEl = requiredElement<HTMLElement>('sessions');
+const historyEl = requiredElement<HTMLElement>('history');
+const historyPanel = requiredElement<HTMLElement>('history-panel');
 const statusEl = requiredElement<HTMLElement>('status');
 const termHost = requiredElement<HTMLElement>('term');
+const recoverButton = requiredElement<HTMLButtonElement>('recover');
+
+function trackCommandInput(tab: AppTab | null, data: string): void {
+  if (!tab || !data) return;
+  // Remove terminal protocol and arrow-key escape sequences. Human text and paste content remain;
+  // xterm device replies must never become a recoverable shell command.
+  const text = data
+    .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '');
+  let draft = tab.commandDraft || '';
+  for (const character of Array.from(text)) {
+    if (character === '\r' || character === '\n') {
+      const command = draft.trim();
+      if (command) tab.lastCommand = command.slice(0, 4096);
+      draft = '';
+    } else if (character === '\x7f' || character === '\b') {
+      draft = Array.from(draft).slice(0, -1).join('');
+    } else if (character === '\x15' || character === '\x03') {
+      draft = '';
+    } else if (character >= ' ' && character !== '\x7f') {
+      draft += character;
+      if (draft.length > 4096) draft = draft.slice(-4096);
+    }
+  }
+  tab.commandDraft = draft;
+}
 
 // §22: console gate overlay — a blurred, non-interactive scrim shown while the active session is
 // connecting or its link is broken, so the user can't type into a session that can't receive it.
@@ -283,7 +315,11 @@ function ensureTab(v: View, winId: string): AppTab {
     // onData carries protocol replies (OSC colour queries, device attributes, focus events). A
     // tab switch updates the UI before tmux's echoed active-window event arrives, so relying on
     // the session-wide active window can deliver those replies to the neighbouring tab.
-    input: (data: string) => { if (!shouldDropInput(v)) void api.input(v.meta.id, data, winId); },
+    input: (data: string) => {
+      if (shouldDropInput(v)) return;
+      trackCommandInput(tab, data);
+      void api.input(v.meta.id, data, winId);
+    },
     ack: (bytes: number) => api.ack(v.meta.id, bytes),
     // Clipboard: xterm ignores OSC 52 by default and there's no built-in Cmd+C, so the terminal
     // tab wires both through here. copyText -> system clipboard; setStatus -> status line feedback.
@@ -299,6 +335,7 @@ function ensureTab(v: View, winId: string): AppTab {
   tab = {
     winId, title: winId, content, mounted: false,
     unreadNotification: false,
+    lastCommand: v.meta.recoveryTabs?.find((saved) => saved.window === winId)?.lastCommand || '',
     // Notification OSCs can span PTY chunks, so each terminal/window owns a streaming parser.
     // Keeping it on the tab also prevents an unfinished OSC in one tmux window from consuming
     // bytes from another window.
@@ -570,6 +607,8 @@ function makeLinkProvider(
 async function mount(id: string, userInitiated = false): Promise<void> {
   const v = views.get(id);
   if (!v) return;
+  if (v.meta.archived) { await resumeSession(id); return; }
+  v.meta.detached = false;
 
   // Ensure the project has a container in #term (one per project; tabs live inside it).
   if (!v.el) {
@@ -716,9 +755,43 @@ setInterval(() => {
   lastWakeTick = now;
 }, WAKE_POLL_MS);
 
+function renderHistorySession(id: string, v: View): void {
+  const li = document.createElement('li');
+  li.className = 'session history-session';
+  li.dataset.id = id;
+  const closed = v.meta.archivedAt && Number.isFinite(v.meta.archivedAt)
+    ? `Closed ${new Date(v.meta.archivedAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}`
+    : 'Closed';
+  const location = v.meta.host || 'local shell';
+  li.innerHTML = `<span class="status-dots"><span class="dot closed"></span></span>
+    <span class="body">
+      <span class="name-row"><span class="name">${escapeHtml(v.meta.title || v.meta.session)}</span></span>
+      <span class="sub">${escapeHtml(closed)} · ${escapeHtml(location)}</span>
+    </span>
+    <span class="history-actions">
+      <button class="resume" type="button">Resume</button>
+      <button class="delete" type="button" title="Delete this saved history entry">Delete</button>
+    </span>`;
+  requiredDescendant<HTMLElement>(li, '.resume').onclick = (event) => {
+    event.stopPropagation();
+    void resumeSession(id);
+  };
+  requiredDescendant<HTMLElement>(li, '.delete').onclick = (event) => {
+    event.stopPropagation();
+    void killSession(id);
+  };
+  li.onclick = () => { void resumeSession(id); };
+  historyEl.appendChild(li);
+}
+
 function renderSidebar() {
   sessionsEl.innerHTML = '';
-  for (const [id, v] of views) {
+  historyEl.innerHTML = '';
+  const activeViews = [...views].filter(([, view]) => !view.meta.archived);
+  const archivedViews = [...views]
+    .filter(([, view]) => !!view.meta.archived)
+    .sort(([, a], [, b]) => (b.meta.archivedAt || 0) - (a.meta.archivedAt || 0));
+  for (const [id, v] of activeViews) {
     const li = document.createElement('li');
     li.className = 'session' + (id === activeId ? ' active' : '') + (v.state === 'dead' ? ' dead' : '');
     // NB: deliberately NOT `draggable = true` — reordering is pointer-driven (§24). Setting it would
@@ -730,7 +803,10 @@ function renderSidebar() {
     // version when known — a local session runs a real tmux too (§5.3b), so it earns the same badge;
     // its absence is the visible signal that this machine has no tmux and the session isn't durable.
     const ver = v.tmuxVersion ? ` · tmux ${v.tmuxVersion.join('.')}` : '';
-    const sub = v.meta.host ? escapeHtml(v.meta.host) + ver : 'local shell' + ver;
+    const detachedState = v.meta.detached
+      ? ` · detached${v.remoteOpen === true ? ' · open' : v.remoteOpen === false ? ' · not found' : ''}`
+      : '';
+    const sub = (v.meta.host ? escapeHtml(v.meta.host) : 'local shell') + ver + detachedState;
     // §18: forwarded ports under the project name. Active rows show the local port and open on
     // click; inactive (grey) rows are persisted-but-not-serving — click re-opens the tunnel.
     // String is short: ":<remote> → :<local>" (local shows "—" when not currently mapped).
@@ -763,8 +839,8 @@ function renderSidebar() {
           <span class="controls">
             <span class="retry${reconnectBusy(id) ? ' busy' : ''}">retry</span>
             <span class="act reconnect${reconnectBusy(id) ? ' busy' : ''}" title="${reconnectBusy(id) ? 'Reconnecting…' : 'Force reconnect now'}">⟳</span>
-            <span class="act detach" title="Detach (keeps running on the remote)">⤫</span>
-            <span class="act kill" title="Kill (ends the remote session)">⏻</span>
+            <span class="act detach" title="Detach (keeps tmux running)">⤫</span>
+            <span class="act kill" title="Close (ends tmux and saves recovery state)">⏻</span>
           </span>
         </span>
         <span class="sub">${sub}</span>
@@ -777,8 +853,8 @@ function renderSidebar() {
     // Double-click the name to rename (display title only; tmux session name unchanged).
     nameEl.ondblclick = (e) => { e.stopPropagation(); startRename(id); };
     requiredDescendant<HTMLElement>(li, '.reconnect').onclick = (e) => { e.stopPropagation(); forceReconnect(id); };
-    requiredDescendant<HTMLElement>(li, '.detach').onclick = (e) => { e.stopPropagation(); detachSession(id); };
-    requiredDescendant<HTMLElement>(li, '.kill').onclick = (e) => { e.stopPropagation(); void killSession(id); };
+    requiredDescendant<HTMLElement>(li, '.detach').onclick = (e) => { e.stopPropagation(); void detachSession(id); };
+    requiredDescendant<HTMLElement>(li, '.kill').onclick = (e) => { e.stopPropagation(); void closeSession(id); };
     // tunnel rows: active -> open the local URL; inactive -> re-open; ⇄ force same-port; × close.
     li.querySelectorAll<HTMLElement>('.tunnel').forEach((el) => {
       const remote = Number(el.getAttribute('data-remote'));
@@ -824,6 +900,9 @@ function renderSidebar() {
     wireSidebarDnD(li, id);
     sessionsEl.appendChild(li);
   }
+  for (const [id, view] of archivedViews) renderHistorySession(id, view);
+  historyPanel.toggleAttribute('hidden', archivedViews.length === 0);
+  sessionsEl.toggleAttribute('hidden', activeViews.length === 0);
 }
 
 // --- §20/§24: drag-to-reorder, on POINTER events (not HTML5 drag-and-drop) --------------------
@@ -1035,13 +1114,14 @@ function wireSidebarDnD(li: HTMLElement, _id: string): void {
 // Index-based (not "before/after target id") because that's what the pointer drag knows: the
 // landing slot, which may be one past the last row — an id-relative form can't name that position.
 function reorderProjectByIndex(from: number, to: number): void {
-  const ids = [...views.keys()];
+  const ids = [...views].filter(([, view]) => !view.meta.archived).map(([id]) => id);
   if (from < 0 || from >= ids.length || to < 0 || to >= ids.length) return;   // list changed mid-drag
   const [moved] = ids.splice(from, 1);
   if (!moved) return;
   ids.splice(to, 0, moved);
   const reordered = new Map<string, View>();
   for (const id of ids) { const v = views.get(id); if (v) reordered.set(id, v); }
+  for (const [id, view] of views) if (view.meta.archived) reordered.set(id, view);
   views.clear();
   for (const [id, v] of reordered) views.set(id, v);
   renderSidebar();
@@ -1114,6 +1194,13 @@ function teardownViewUi(v: View): void {
   v.pending = null;
 }
 
+function firstActiveViewId(excluding?: string): string | null {
+  for (const [id, view] of views) {
+    if (id !== excluding && !view.meta.archived) return id;
+  }
+  return null;
+}
+
 // Remove a project view from the UI (dispose all its tabs). Does NOT touch the remote.
 function removeView(id: string): void {
   const v = views.get(id);
@@ -1126,24 +1213,32 @@ function removeView(id: string): void {
   if (activeId === id) {
     activeId = null;
     tabsEl.className = ''; tabsEl.innerHTML = '';
-    const next = views.keys().next();
-    if (!next.done) mount(next.value); else { termHost.innerHTML = ''; setStatus('no sessions — create one'); }
+    const next = firstActiveViewId(id);
+    if (next) void mount(next); else { termHost.innerHTML = ''; setStatus('no active sessions'); }
   }
   renderSidebar();
 }
 
-// Detach: stop the local client; the remote tmux session keeps running (reattach later).
-// The view STAYS in the sidebar (and its row stays in the store) reset to the unconnected state, so
-// clicking it reattaches via mount(). Removing it here would strand a live remote tmux session with
-// no way back to it — there is no remote-session discovery.
-function detachSession(id: string): void {
+// Explicit Detach: stop only Buoy's client. The tmux server and all of its processes stay alive.
+// The persisted row remains in Sessions and is marked detached until the next mount.
+async function detachSession(id: string): Promise<void> {
   const v = views.get(id);
   if (!v) return;
-  api.close(id);
+  try {
+    await api.detach(id);
+  } catch (error) {
+    setStatus(`detach failed: ${errorMessage(error)}`);
+    return;
+  }
+  // Keep locally observed per-tab commands across the detach/reattach UI teardown. The tmux
+  // window ids remain stable, so ensureTab can put them back on reconstructed AppTab objects.
+  v.meta.recoveryTabs = recoveryHints(v);
   teardownViewUi(v);
   delete pendingData[id];          // late output for the connection we just dropped
   v.started = false;               // mount() will reattach on the next click
   v.state = 'idle';
+  v.meta.detached = true;
+  v.remoteOpen = null;
   v.inputReady = v.meta.mode !== 'control';
   v.tunnels = [];
   v.restoreTab = v.lastTab || null;   // reveal the same tab again on reattach
@@ -1151,15 +1246,136 @@ function detachSession(id: string): void {
   if (activeId === id) {
     activeId = null;
     tabsEl.className = ''; tabsEl.innerHTML = '';
-    termHost.innerHTML = '';
-    const next = views.keys().next();
-    if (!next.done) mount(next.value); else setStatus('detached — click a session to reattach');
+    const next = firstActiveViewId(id);
+    if (next) void mount(next); else { termHost.innerHTML = ''; setStatus('detached — click the session to reattach'); }
   } else {
     setStatus('detached (still running on the remote)');
   }
   renderSidebar();
   updateConsoleGate();
 }
+
+function recoveryHints(v: View): RecoveryTabSnapshot[] {
+  return tabDisplayOrder(v).flatMap((window) => {
+    const tab = v.tabs.get(window);
+    if (!tab || tab.viewer) return [];
+    return [{ window, title: tab.title, lastCommand: tab.lastCommand || '' }];
+  });
+}
+
+// Close snapshots each tmux window, ends the tmux session, and moves the durable metadata to
+// History. Resume later reconstructs windows/cwds and seeds bash/zsh history with lastCommand.
+async function closeSession(id: string): Promise<void> {
+  const v = views.get(id);
+  if (!v) return;
+  if (v.meta.mode === 'local') {
+    if (!confirm('Close this local shell?\n\nIt is not backed by tmux and cannot be resumed.')) return;
+    try { await api.kill(id); } catch (_) {}
+    removeView(id);
+    return;
+  }
+  const label = v.meta.title || v.meta.session;
+  const location = v.meta.transport === 'local' ? 'local' : 'remote';
+  if (!confirm(`Close "${label}"?\n\nThis ends the ${location} tmux session. Buoy will save each tab's working directory and last command so it can be reconstructed from History.`)) return;
+
+  if (!v.started) {
+    await mount(id);
+    if (!v.started || v.state === 'dead') {
+      setStatus('connect the session before closing it');
+      return;
+    }
+  }
+  const hints = recoveryHints(v);
+  setStatus(`saving and closing ${label}…`);
+  try {
+    await api.close(id, hints);
+  } catch (error) {
+    // The backend detaches first to prevent the reconnect supervisor from recreating tmux.
+    teardownViewUi(v);
+    v.started = false;
+    v.state = 'idle';
+    v.meta.detached = true;
+    setStatus(`close failed; session detached instead: ${errorMessage(error)}`);
+    renderSidebar();
+    return;
+  }
+  teardownViewUi(v);
+  delete pendingData[id];
+  v.started = false;
+  v.state = 'idle';
+  v.inputReady = false;
+  v.meta.archived = true;
+  v.meta.archivedAt = Date.now();
+  v.meta.detached = false;
+  v.meta.recoveryTabs = hints;
+  v.meta.restorePending = true;
+  if (activeId === id) {
+    activeId = null;
+    tabsEl.className = ''; tabsEl.innerHTML = '';
+    const next = firstActiveViewId(id);
+    if (next) void mount(next); else termHost.innerHTML = '';
+  }
+  setStatus(`${label} closed and moved to History`);
+  renderSidebar();
+  updateConsoleGate();
+}
+
+async function resumeSession(id: string): Promise<void> {
+  const v = views.get(id);
+  if (!v || !v.meta.archived) return;
+  const label = v.meta.title || v.meta.session;
+  setStatus(`restoring ${label}…`);
+  try {
+    await api.resume(id);
+  } catch (error) {
+    setStatus(`could not resume ${label}: ${errorMessage(error)}`);
+    return;
+  }
+  v.meta.archived = false;
+  v.meta.archivedAt = null;
+  v.meta.detached = false;
+  v.started = false;
+  v.state = 'idle';
+  v.restoreTab = v.lastTab || null;
+  renderSidebar();
+  await mount(id, true);
+}
+
+async function checkOpenSessions(): Promise<void> {
+  recoverButton.disabled = true;
+  setStatus('checking tmux sessions…');
+  try {
+    const results = await api.checkOpenSessions();
+    const recoverable: Array<[string, View]> = [];
+    let errors = 0;
+    for (const result of results) {
+      const view = views.get(result.id);
+      if (!view) continue;
+      view.remoteOpen = result.error ? null : result.open;
+      if (result.error) errors++;
+      if (result.open && view.meta.detached) recoverable.push([result.id, view]);
+    }
+    renderSidebar();
+    if (recoverable.length) {
+      showChooser('Open detached sessions', recoverable.map(([sessionId, view]) => [
+        `Reattach ${view.meta.title || view.meta.host || view.meta.session}`,
+        () => void mount(sessionId, true),
+      ] as const));
+      setStatus(`${recoverable.length} detached session${recoverable.length === 1 ? '' : 's'} found`);
+    } else if (errors) {
+      setStatus(`check finished with ${errors} host error${errors === 1 ? '' : 's'}`);
+    } else {
+      const open = results.filter((result) => result.open).length;
+      setStatus(`${open} tmux session${open === 1 ? '' : 's'} open; none need recovery`);
+    }
+  } catch (error) {
+    setStatus(`could not check sessions: ${errorMessage(error)}`);
+  } finally {
+    recoverButton.disabled = false;
+  }
+}
+
+recoverButton.onclick = () => { void checkOpenSessions(); };
 
 // Force reconnect: tear down and reattach the SAME session now, even if it currently looks
 // connected (e.g. a wedged/half-open link after a network change). The backend resets its retry
@@ -1177,12 +1393,16 @@ function forceReconnect(id: string): void {
   renderSidebar();
 }
 
-// Kill: terminate the remote tmux session (ends its processes). Irreversible → confirm.
+// Permanent delete: active sessions lose tmux and metadata; archived sessions lose the snapshot.
 async function killSession(id: string): Promise<void> {
   const v = views.get(id);
   const label = (v && (v.meta.title || v.meta.session)) || 'this session';
-  if (!confirm(`Kill "${label}"?\n\nThis ENDS the remote tmux session and everything running in it. This cannot be undone.`)) return;
-  setStatus(`killing ${label}…`);
+  const archived = !!v?.meta.archived;
+  const message = archived
+    ? `Delete "${label}" from History?\n\nThe tmux session was already closed. This removes Buoy's recovery snapshot and cannot be undone.`
+    : `Delete "${label}" permanently?\n\nThis ends the tmux session and everything running in it, then removes its saved entry. This cannot be undone.`;
+  if (!confirm(message)) return;
+  setStatus(archived ? `deleting ${label} from History…` : `deleting ${label}…`);
   try {
     const res = await api.kill(id);
     setStatus(res && res.killedRemote ? `killed ${label}` : `removed ${label}`);
@@ -1371,6 +1591,7 @@ window.__testType = (s: string) => {
   if (activeId == null) return;
   const v = views.get(activeId);
   acknowledgeTerminalInteraction(v, v && activeTab(v));
+  trackCommandInput(v ? activeTab(v) : null, s);
   api.input(activeId, s, v && v.activeWindow);
 };
 window.__testInputReady = () => { const v = activeId ? views.get(activeId) : undefined; return !!(v && v.inputReady); };
@@ -1883,14 +2104,20 @@ async function init(reset = false): Promise<void> {
   renderSidebar();
   // §18: show persisted forwarded ports for every restored session up front (greyed until
   // re-opened), so the list survives an app restart without waiting for a connect.
-  for (const meta of persisted) refreshTunnels(meta.id);
-  setStatus(persisted.length ? `${persisted.length} session(s) restored — click to reconnect` : 'no sessions — create one');
+  for (const meta of persisted) if (!meta.archived) refreshTunnels(meta.id);
+  const activePersisted = persisted.filter((meta) => !meta.archived);
+  const historyCount = persisted.length - activePersisted.length;
+  setStatus(activePersisted.length
+    ? `${activePersisted.length} session(s) restored${historyCount ? ` · ${historyCount} in History` : ''}`
+    : historyCount ? `${historyCount} closed session(s) in History` : 'no sessions — create one');
   // §20: reopen the LAST-USED project (fall back to the first) so the app resumes where you left off.
   // The project restores its own last-active tab once its windows arrive (see onWindow).
-  if (persisted.length) {
-    const first = persisted[0];
+  const autoOpen = activePersisted.filter((meta) => !meta.detached);
+  if (autoOpen.length) {
+    const first = autoOpen[0];
     if (first) {
-      const target = (lastActive && views.has(lastActive)) ? lastActive : first.id;
+      const remembered = lastActive ? views.get(lastActive) : undefined;
+      const target = remembered && !remembered.meta.archived && !remembered.meta.detached ? lastActive! : first.id;
       void mount(target);
     }
   }

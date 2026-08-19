@@ -22,6 +22,7 @@ pub mod supervisor;
 pub mod tunnel;
 pub mod host_history;
 pub mod claude_integration;
+pub mod session_recovery;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -33,7 +34,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use control_backend::{BackendConfig, BackendEvent};
 use plain_backend::{PlainBackend, PlainConfig, PlainEvent};
 use local_backend::{LocalBackend, LocalConfig, LocalEvent};
-use session_store::{SessionMeta, SessionStore};
+use session_store::{RecoveryTab, SessionMeta, SessionStore};
 
 /// Augment PATH like env.js (also used by backends/probe).
 pub fn augmented_path() -> String {
@@ -398,6 +399,8 @@ fn create_session(app: AppHandle, state: State<AppState>, meta: CreateArgs) -> R
         order: 0,
         attach_ok: false,
         color: None, last_tab: None, tab_order: vec![], tab_colors: Default::default(),
+        archived: false, archived_at: None,
+        detached: false, recovery_tabs: vec![], restore_pending: false,
     };
 
     // Persist (dedupe by id). Reconnecting an EXISTING session must NOT move it — preserve its
@@ -408,6 +411,7 @@ fn create_session(app: AppHandle, state: State<AppState>, meta: CreateArgs) -> R
     // is the only way back to it after a restart — exactly as for a remote session. The one exception
     // is the no-tmux fallback, whose shell dies with the app, so a stored row would resurrect nothing.
     let persist = !no_local_tmux;
+    let mut persisted_meta = session_meta.clone();
     if persist {
         let mut list = state.store.load();
         let mut m = session_meta.clone();
@@ -417,6 +421,8 @@ fn create_session(app: AppHandle, state: State<AppState>, meta: CreateArgs) -> R
             m.last_tab = existing.last_tab.clone();
             m.tab_order = existing.tab_order.clone();
             m.tab_colors = existing.tab_colors.clone();
+            m.recovery_tabs = existing.recovery_tabs.clone();
+            m.restore_pending = existing.restore_pending;
             if m.title.is_none() { m.title = existing.title.clone(); }
         } else {
             m.order = list.iter().map(|s| s.order).max().map_or(0, |mx| mx + 1);
@@ -425,6 +431,19 @@ fn create_session(app: AppHandle, state: State<AppState>, meta: CreateArgs) -> R
         list.push(m);
         list.sort_by_key(|s| s.order);
         state.store.save(&list);
+        if let Some(saved) = list.iter().find(|saved| saved.id == id) {
+            persisted_meta = saved.clone();
+        }
+    }
+
+    // A closed session no longer exists remotely. Reconstruct its windows before the normal
+    // control client attaches, then clear the one-shot flag so network reconnects never repeat it.
+    if persisted_meta.restore_pending {
+        session_recovery::restore(&persisted_meta)?;
+        state.store.update_session(&id, |saved| {
+            saved.restore_pending = false;
+            saved.detached = false;
+        });
     }
 
     // The store row was just written with attachOk=false (see SessionMeta::attach_ok). The first
@@ -572,17 +591,83 @@ fn session_resize(state: State<AppState>, id: String, cols: u16, rows: u16) {
     if let Some(s) = state.sessions.lock().unwrap().get(&id) { s.backend.resize(cols, rows); }
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryTabHint {
+    window: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    last_command: String,
+}
+
 #[tauri::command]
-fn session_close(state: State<AppState>, id: String) {
-    // Detach: stop the local client, leave the remote tmux running. Its port-forward tunnels die
-    // with the client (§18).
-    //
-    // The persisted store row is deliberately KEPT — that is the whole difference between detach and
-    // kill. The row holds the host, tmux session name, path and title, which is the only way back to
-    // the still-running remote session: there is no remote-session discovery, so deleting it here
-    // (as this used to) stranded a live tmux session with no way to reattach from the UI.
-    if let Some(s) = state.sessions.lock().unwrap().remove(&id) { s.backend.kill(); }
+fn session_detach(state: State<AppState>, id: String) -> Result<(), String> {
+    if !state.store.update_session(&id, |saved| saved.detached = true) {
+        return Err("unknown session".into());
+    }
+    if let Some(session) = state.sessions.lock().unwrap().remove(&id) { session.backend.kill(); }
     state.tunnels.close_session(&id);
+    Ok(())
+}
+
+#[tauri::command]
+fn session_close(state: State<AppState>, id: String, tabs: Vec<RecoveryTabHint>) -> Result<(), String> {
+    // Close is intentionally destructive to the remote tmux server. Snapshot first; unlike Detach,
+    // only a successfully captured and killed session is moved to History.
+    let meta = state.store.load().into_iter().find(|saved| saved.id == id)
+        .ok_or_else(|| "unknown session".to_string())?;
+    let hints: Vec<_> = tabs.into_iter().map(|tab| session_recovery::CommandHint {
+        window: tab.window,
+        title: tab.title,
+        last_command: tab.last_command,
+    }).collect();
+    // Stop the reconnect supervisor before killing tmux. Otherwise the remote kill can make the
+    // supervisor immediately run `new-session -A` and recreate a blank session behind Close.
+    if let Some(session) = state.sessions.lock().unwrap().remove(&id) { session.backend.kill(); }
+    state.tunnels.close_session(&id);
+    let recovery_tabs: Vec<RecoveryTab> = match session_recovery::snapshot_and_kill(&meta, &hints) {
+        Ok(tabs) => tabs,
+        Err(error) => {
+            state.store.update_session(&id, |saved| saved.detached = true);
+            return Err(error);
+        }
+    };
+    let archived_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    state.store.update_session(&id, |saved| {
+        saved.archived = true;
+        saved.archived_at = Some(archived_at);
+        saved.detached = false;
+        saved.recovery_tabs = recovery_tabs;
+        saved.restore_pending = true;
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn session_resume(state: State<AppState>, id: String) -> Result<(), String> {
+    if state.store.update_session(&id, |saved| {
+        saved.archived = false;
+        saved.archived_at = None;
+        saved.detached = false;
+    }) { Ok(()) }
+    else { Err("unknown session".into()) }
+}
+
+#[derive(Serialize)]
+struct SessionCheckResult { id: String, open: bool, error: Option<String> }
+
+#[tauri::command]
+fn check_open_sessions(state: State<AppState>) -> Vec<SessionCheckResult> {
+    state.store.load().into_iter().filter(|session| !session.archived).map(|session| {
+        match session_recovery::is_open(&session) {
+            Ok(open) => SessionCheckResult { id: session.id, open, error: None },
+            Err(error) => SessionCheckResult { id: session.id, open: false, error: Some(error) },
+        }
+    }).collect()
 }
 
 #[tauri::command]
@@ -1038,12 +1123,12 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_sessions, create_session, session_input, session_resize,
-            session_close, session_kill, session_rename,
+            session_detach, session_close, session_resume, session_kill, session_rename,
             reorder_sessions, set_session_color, set_last_active, set_last_tab, set_tab_prefs,
             tab_new, tab_select, tab_close, tab_capture, tab_rename, open_external, ui_log,
             read_remote_file, save_file, enable_html_scripts, session_retry, session_force_reconnect,
             open_forwarded_url, get_config, list_tunnels, close_tunnel, force_forward,
-            list_hosts, remember_host
+            list_hosts, remember_host, check_open_sessions
         ])
         // Tunnels are deliberately NOT killed on exit — they keep forwarding, and the next launch
         // ADOPTS the still-alive ones (reuse across restarts). Dead orphans are cleared on load;

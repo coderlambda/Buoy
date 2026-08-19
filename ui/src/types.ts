@@ -18,6 +18,29 @@ export interface SessionMeta {
   lastTab?: string | null;
   tabOrder?: string[];
   tabColors?: Record<string, string>;
+  /** Explicitly closed by the user after the tmux session was snapshotted and ended. */
+  archived?: boolean;
+  /** Epoch milliseconds used to order the History list, when known. */
+  archivedAt?: number | null;
+  /** Explicit client detach; the tmux server is still alive. */
+  detached?: boolean;
+  /** Snapshot used to reconstruct a closed tmux session. */
+  recoveryTabs?: RecoveryTabSnapshot[];
+  restorePending?: boolean;
+}
+
+export interface RecoveryTabSnapshot {
+  window: string;
+  title?: string;
+  cwd?: string;
+  shell?: string;
+  lastCommand?: string;
+}
+
+export interface SessionCheckResult {
+  id: string;
+  open: boolean;
+  error?: string;
 }
 
 export interface CreateSessionMeta {
@@ -82,7 +105,10 @@ export interface TerminalAPI {
   input(id: string, data: string, win?: string | null): Promise<unknown> | void;
   resize(id: string, cols: number, rows: number): Promise<unknown> | void;
   ack(id: string, bytes: number): void;
-  close(id: string): Promise<unknown> | void;
+  detach(id: string): Promise<unknown> | void;
+  close(id: string, tabs: RecoveryTabSnapshot[]): Promise<unknown> | void;
+  resume(id: string): Promise<unknown> | void;
+  checkOpenSessions(): Promise<SessionCheckResult[]>;
   kill(id: string): Promise<{ killedRemote?: boolean }> | void;
   retry(id: string): Promise<unknown> | void;
   forceReconnect(id: string): Promise<unknown> | void;

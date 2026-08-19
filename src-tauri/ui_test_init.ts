@@ -17,6 +17,7 @@ interface CreateResult {
   mode?: string;
   tmuxPath?: string | null;
   tmuxVersion?: number[] | null;
+  [key: string]: unknown;
 }
 
 interface TestBackend {
@@ -45,6 +46,7 @@ interface CommandArgs {
   ids?: string[];
   tabOrder?: string[] | null;
   tabColor?: unknown;
+  tabs?: unknown[];
 }
 
 interface TestCalls {
@@ -156,10 +158,22 @@ interface Window {
         const meta = args.meta ?? {};
         const configured = clone(backend.createSessionResult ?? {});
         const id = configured.id ?? meta.id ?? `created-${++createdSessionSequence}`;
+        const existing = fixture.sessions.find((session) => session.id === id);
+        const stored: TestSession = {
+          id,
+          host: String(meta.host ?? existing?.host ?? ''),
+          session: String(configured.session ?? meta.session ?? existing?.session ?? `dt-${id}`),
+          transport: (meta.transport ?? existing?.transport ?? 'ssh') as 'local' | 'ssh',
+          mode: (configured.mode ?? meta.mode ?? existing?.mode ?? 'control') as 'control' | 'plain' | 'local',
+          title: String(meta.title ?? existing?.title ?? ''),
+          archived: false,
+          detached: false,
+        };
+        if (existing) Object.assign(existing, stored); else fixture.sessions.push(stored);
         return {
           id,
-          session: configured.session ?? meta.session ?? `dt-${id}`,
-          mode: configured.mode ?? meta.mode ?? 'control',
+          session: stored.session,
+          mode: stored.mode,
           tmuxPath: Object.prototype.hasOwnProperty.call(configured, 'tmuxPath')
             ? configured.tmuxPath : '/usr/bin/tmux',
           tmuxVersion: Object.prototype.hasOwnProperty.call(configured, 'tmuxVersion')
@@ -173,6 +187,29 @@ interface Window {
         }
         return null;
       case 'session_resize': calls.terminal.push(['resize', args.id, args.cols, args.rows]); return null;
+      case 'session_detach': {
+        const stored = fixture.sessions.find((session) => session.id === args.id);
+        if (stored) stored.detached = true;
+        return null;
+      }
+      case 'session_close': {
+        const stored = fixture.sessions.find((session) => session.id === args.id);
+        if (stored) { stored.archived = true; stored.detached = false; }
+        return null;
+      }
+      case 'session_resume': {
+        const stored = fixture.sessions.find((session) => session.id === args.id);
+        if (stored) { stored.archived = false; stored.detached = false; }
+        return null;
+      }
+      case 'check_open_sessions': return fixture.sessions
+        .filter((session) => !session.archived)
+        .map((session) => ({ id: session.id, open: true }));
+      case 'session_kill': {
+        fixture.sessions = fixture.sessions.filter((session) => session.id !== args.id);
+        window.__BUOY_UI_TEST__.fixture = fixture;
+        return { killedRemote: true };
+      }
       case 'tab_capture': calls.terminal.push(['capture', args.id, args.win]); return null;
       case 'session_rename': calls.renames.push([args.id, args.title]); return { ok: true, title: args.title };
       case 'tab_rename': calls.tabRenames.push([args.id, args.win, args.title]); return null;
