@@ -9,7 +9,7 @@ laptop sleep—Buoy reconnects to the same session and brings the workspace back
 Buoy is intentionally not a general-purpose terminal toolbox. It is built around one job: making
 tmux sessions easy to find, operate, and trust through unreliable connections.
 
-[Download the latest release](https://github.com/coderlambda/Buoy/releases/latest)
+[Download the latest release](https://github.com/coderlambda/buoy-tmux/releases/latest)
 
 ## Why Buoy
 
@@ -134,7 +134,7 @@ sidebar.
 ### Install
 
 Download the package for your platform from
-[GitHub Releases](https://github.com/coderlambda/Buoy/releases/latest):
+[GitHub Releases](https://github.com/coderlambda/buoy-tmux/releases/latest):
 
 - **macOS:** universal DMG or app archive for Apple Silicon and Intel. The app is Developer ID
   signed, notarized by Apple, and stapled.
