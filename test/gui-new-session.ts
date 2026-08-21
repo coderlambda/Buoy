@@ -43,9 +43,25 @@ describe('Tauri UI: new session dialog', () => {
         inputHeight: input.getBoundingClientRect().height,
         backgroundMatches: selectStyle.backgroundColor === inputStyle.backgroundColor,
         borderMatches: selectStyle.borderColor === inputStyle.borderColor,
+        selectFocused: select.matches(':focus'),
+        focusBorderMatches: selectStyle.borderColor === arrowStyle.borderRightColor,
         radiusMatches: selectStyle.borderRadius === inputStyle.borderRadius,
         fontMatches: selectStyle.fontFamily === inputStyle.fontFamily
           && selectStyle.fontSize === inputStyle.fontSize,
+        selectSurface: {
+          background: selectStyle.backgroundColor,
+          border: selectStyle.borderColor,
+          radius: selectStyle.borderRadius,
+          fontFamily: selectStyle.fontFamily,
+          fontSize: selectStyle.fontSize,
+        },
+        inputSurface: {
+          background: inputStyle.backgroundColor,
+          border: inputStyle.borderColor,
+          radius: inputStyle.borderRadius,
+          fontFamily: inputStyle.fontFamily,
+          fontSize: inputStyle.fontSize,
+        },
         arrow: arrowStyle.content !== 'none' && arrowStyle.pointerEvents === 'none',
       };
     })()`);
@@ -55,8 +71,9 @@ describe('Tauri UI: new session dialog', () => {
       `TC-NS1 Type field removes native select chrome (got ${state.appearance})`);
     check(Math.abs(state.selectHeight - state.inputHeight) < 0.5,
       `TC-NS1 Type and Host fields have the same height (${state.selectHeight}px / ${state.inputHeight}px)`);
-    check(state.backgroundMatches && state.borderMatches && state.radiusMatches && state.fontMatches,
-      'TC-NS1 Type field uses the same surface, border, radius, and typography as text inputs');
+    check(state.backgroundMatches && state.radiusMatches && state.fontMatches
+      && (state.borderMatches || (state.selectFocused && state.focusBorderMatches)),
+    `TC-NS1 Type field matches text inputs and keeps its focused accent border (${JSON.stringify({ select: state.selectSurface, input: state.inputSurface, selectFocused: state.selectFocused })})`);
     check(state.arrow, 'TC-NS1 Type field shows a non-interactive theme chevron');
 
     if (process.env.BUOY_GUI_SCREENSHOT) {
