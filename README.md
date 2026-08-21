@@ -27,6 +27,40 @@ Buoy treats the **tmux session as the durable workspace** and the SSH connection
 The name comes from that behavior: a connection can be pushed under by a wave, but the session
 resurfaces.
 
+## Product tour
+
+### Keep every tmux workspace in sight
+
+[![Buoy showing remote and local tmux workspaces, native tabs, an unread Codex notification, and a forwarded port](docs/screenshots/workspace-overview.png)](docs/screenshots/workspace-overview.png)
+
+Each sidebar entry is a durable tmux workspace, not a disposable terminal connection. Remote and
+local projects live together, while their colored status dots show whether they are connected or
+reconnecting. Select a project and its tmux windows become native tabs with independent terminal
+buffers and scrollback.
+
+The same view keeps background work visible without becoming noisy: the blue dot under the
+connection status rolls up unread activity from the `codex` tab, and the `:3000 → :3000` row shows
+an active SSH tunnel for a remote loopback service.
+
+### Import tmux sessions that are already running
+
+[![Buoy discovering existing tmux sessions on a remote host and preparing to import one](docs/screenshots/import-existing-sessions.png)](docs/screenshots/import-existing-sessions.png)
+
+Buoy can inspect the default tmux server on a local or remote host, show each session's window and
+attachment counts, and import the one you choose. Sessions already open in Buoy are left out of the
+list, and importing does not detach their existing tmux clients. This makes Buoy useful with the
+workspaces you already have—there is no migration step or shell setup to maintain.
+
+### Detach safely, or resume deliberately closed work
+
+[![Buoy showing active workspaces and closed projects that can be resumed from History](docs/screenshots/session-history.png)](docs/screenshots/session-history.png)
+
+**Detach** closes only Buoy's client and leaves tmux running. **Close** deliberately ends the tmux
+session after saving a recovery snapshot in History. Choosing **Resume** rebuilds its tabs as
+shells in their last known working directories and labels them with the last foreground commands,
+so the context of the workspace is still recognizable after a host restart or intentional close.
+It does not pretend to restore process memory or unsaved application state.
+
 ## Features
 
 ### Durable local and remote workspaces
@@ -179,6 +213,7 @@ npm run tauri:dev
 
 Create production bundles with `npm run tauri:build`. Contributors can run the complete validation
 suite with `npm run typecheck`, `npm test`, `npm run tauri:test`, and `npm run test:ui`.
+Regenerate the privacy-safe product screenshots with `npm run screenshots:readme`.
 
 Implementation details and contributor references live in [DESIGN.md](DESIGN.md),
 [TEST_PLAN.md](TEST_PLAN.md), [OSC_NOTIFICATIONS_DESIGN.md](OSC_NOTIFICATIONS_DESIGN.md), and
