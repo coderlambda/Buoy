@@ -17,6 +17,7 @@ interface CreateResult {
   mode?: string;
   tmuxPath?: string | null;
   tmuxVersion?: number[] | null;
+  socketName?: string | null;
   [key: string]: unknown;
 }
 
@@ -25,6 +26,11 @@ interface TestBackend {
   createSessionResult?: CreateResult;
   tunnels?: Record<string, unknown[]>;
   hosts?: string[];
+  discovery?: {
+    tmuxPath: string;
+    tmuxVersion?: number[];
+    sessions: Array<{ name: string; windows: number; attached: number; created: number }>;
+  };
   echoInput?: boolean;
 }
 
@@ -153,6 +159,9 @@ interface Window {
     if (rejection) throw new Error(rejection);
     switch (command) {
       case 'list_sessions': return clone(fixture.sessions);
+      case 'discover_tmux_sessions': return clone(backend.discovery ?? {
+        tmuxPath: '/usr/bin/tmux', tmuxVersion: [3, 6], sessions: [],
+      });
       case 'get_config': return clone(fixture.config);
       case 'create_session': {
         const meta = args.meta ?? {};
@@ -178,6 +187,8 @@ interface Window {
             ? configured.tmuxPath : '/usr/bin/tmux',
           tmuxVersion: Object.prototype.hasOwnProperty.call(configured, 'tmuxVersion')
             ? configured.tmuxVersion : [3, 6],
+          socketName: Object.prototype.hasOwnProperty.call(configured, 'socketName')
+            ? configured.socketName : meta.socketName,
         };
       }
       case 'session_input':

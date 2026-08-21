@@ -23,6 +23,7 @@ pub mod tunnel;
 pub mod host_history;
 pub mod claude_integration;
 pub mod session_recovery;
+pub mod tmux_discovery;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -212,9 +213,19 @@ fn emit_backend_event(app: &AppHandle, id: &str, ev: BackendEvent) {
             let _ = app.emit("session:window", WindowPayload {
                 id: id.into(), action: "active".into(), window, name: None, order: Some(order) });
         }
+        BackendEvent::RecoverySnapshot { windows } => {
+            if let Some(state) = app.try_state::<AppState>() {
+                state.store.set_recovery_windows(id, &windows);
+            }
+        }
         BackendEvent::Ready => { let _ = app.emit("session:ready", json!({ "id": id })); }
         BackendEvent::Exit => { let _ = app.emit("session:exit", json!({ "id": id })); }
     }
+}
+
+fn session_socket(meta: &SessionMeta) -> String {
+    meta.socket_name.clone()
+        .unwrap_or_else(|| tmux_socket::socket_name(&meta.mode, meta.tmux_version, &meta.session))
 }
 
 /// Record that this session's cached tmuxPath/tmuxVersion demonstrably attached, so the next
@@ -279,6 +290,20 @@ fn list_sessions(state: State<AppState>) -> Vec<SessionMeta> {
     state.store.load()
 }
 
+#[tauri::command]
+async fn discover_tmux_sessions(kind: String, host: String)
+    -> Result<tmux_discovery::DiscoveryResult, String>
+{
+    tauri::async_runtime::spawn_blocking(move || {
+        let transport = if kind == "local" {
+            transport::Transport::Local
+        } else {
+            transport::Transport::Ssh
+        };
+        tmux_discovery::discover(transport, &host)
+    }).await.map_err(|e| format!("tmux discovery task failed: {e}"))?
+}
+
 #[derive(serde::Deserialize)]
 struct CreateArgs {
     id: Option<String>,
@@ -291,18 +316,21 @@ struct CreateArgs {
     tmux_path: Option<String>,
     #[serde(default, rename = "tmuxVersion")]
     tmux_version: Option<(u32, u32)>,
+    #[serde(default, rename = "socketName")]
+    socket_name: Option<String>,
     transport: Option<String>,
 }
 
 #[tauri::command]
 fn create_session(app: AppHandle, state: State<AppState>, meta: CreateArgs) -> Result<serde_json::Value, String> {
-    dlog!("create_session: host={:?} session={:?} mode={:?} tmuxPath={:?} tmuxVersion={:?}",
-        meta.host, meta.session, meta.mode, meta.tmux_path, meta.tmux_version);
+    dlog!("create_session: host={:?} session={:?} mode={:?} tmuxPath={:?} tmuxVersion={:?} socketName={:?}",
+        meta.host, meta.session, meta.mode, meta.tmux_path, meta.tmux_version, meta.socket_name);
     let id = meta.id.clone().unwrap_or_else(|| {
         // millis-since-epoch id
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis().to_string()).unwrap_or_else(|_| "session".into())
     });
+    let previous_meta = state.store.load().into_iter().find(|s| s.id == id);
     // A webview reload (notably Tauri dev's frontend hot reload) calls create_session again while
     // the Rust process and its AppState remain alive. Replacing the HashMap entry without closing
     // its backend leaves the old Supervisor running on its worker Arcs; old and new `-D` tmux
@@ -348,7 +376,7 @@ fn create_session(app: AppHandle, state: State<AppState>, meta: CreateArgs) -> R
     }
     let mut local_tmux: Option<(String, Option<(u32, u32)>)> = None;
     let cache_proven = meta.tmux_path.is_some()
-        && state.store.load().iter().any(|s| s.id == id && s.attach_ok);
+        && previous_meta.as_ref().is_some_and(|s| s.attach_ok);
     if is_local {
         // Always re-probe locally: it costs one exec of `tmux -V` (no network, no 8s timeout), and
         // unlike the ssh path there is no risk of stranding a server we can't reach afterwards — a
@@ -384,6 +412,12 @@ fn create_session(app: AppHandle, state: State<AppState>, meta: CreateArgs) -> R
     let no_local_tmux = is_local && local_tmux.is_none();
     let mode = choose_mode(is_local, local_tmux.is_some(), want_control, tmux_version);
     let session_transport = if is_local { transport::Transport::Local } else { transport::Transport::Ssh };
+    let socket_name = meta.socket_name.clone()
+        .or_else(|| previous_meta.as_ref().and_then(|s| s.socket_name.clone()));
+    let effective_socket = socket_name.clone()
+        .unwrap_or_else(|| tmux_socket::socket_name(mode, tmux_version, &session));
+    let recovery_windows = previous_meta.as_ref()
+        .map(|s| s.recovery_windows.clone()).unwrap_or_default();
 
     let session_meta = SessionMeta {
         id: id.clone(),
@@ -395,12 +429,14 @@ fn create_session(app: AppHandle, state: State<AppState>, meta: CreateArgs) -> R
         mode: mode.into(),
         tmux_path: Some(tmux_path.clone()),
         tmux_version,
+        socket_name: socket_name.clone(),
         title: meta.title.clone().or_else(|| Some(meta.host.clone())),
         order: 0,
         attach_ok: false,
         color: None, last_tab: None, tab_order: vec![], tab_colors: Default::default(),
         archived: false, archived_at: None,
         detached: false, recovery_tabs: vec![], restore_pending: false,
+        recovery_windows: recovery_windows.clone(),
     };
 
     // Persist (dedupe by id). Reconnecting an EXISTING session must NOT move it — preserve its
@@ -423,6 +459,8 @@ fn create_session(app: AppHandle, state: State<AppState>, meta: CreateArgs) -> R
             m.tab_colors = existing.tab_colors.clone();
             m.recovery_tabs = existing.recovery_tabs.clone();
             m.restore_pending = existing.restore_pending;
+            m.socket_name = existing.socket_name.clone().or(m.socket_name);
+            m.recovery_windows = existing.recovery_windows.clone();
             if m.title.is_none() { m.title = existing.title.clone(); }
         } else {
             m.order = list.iter().map(|s| s.order).max().map_or(0, |mx| mx + 1);
@@ -452,6 +490,22 @@ fn create_session(app: AppHandle, state: State<AppState>, meta: CreateArgs) -> R
     // Once per Session object: the flag only needs setting on the first success, and the store
     // write must not run per data event.
     let proven = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // A live tmux server always wins and is left byte-for-byte alone. Only when the named session
+    // vanished (typically a host reboot) does the saved recipe recreate shells/tabs before attach.
+    if session_transport == transport::Transport::Local && !recovery_windows.is_empty() {
+        match tmux_discovery::restore_if_missing(
+            session_transport, &meta.host, &tmux_path, &effective_socket, &session,
+            &recovery_windows,
+        ) {
+            Ok(true) => dlog!("create_session: rebuilt {} window(s) for missing session {}",
+                recovery_windows.len(), session),
+            Ok(false) => {}
+            Err(error) => return Err(format!(
+                "could not verify or rebuild the saved tmux workspace: {error}"
+            )),
+        }
+    }
 
     // Spawn the backend.
     let backend = if no_local_tmux {
@@ -520,6 +574,8 @@ fn create_session(app: AppHandle, state: State<AppState>, meta: CreateArgs) -> R
             BackendConfig {
                 host: meta.host.clone(), session: session.clone(),
                 tmux_path: tmux_path.clone(), tmux_version, base_args: vec![],
+                socket: effective_socket.clone(),
+                recovery_windows: recovery_windows.clone(),
                 transport: session_transport,
             },
             supervisor::SupervisorOpts::default(),
@@ -556,6 +612,8 @@ fn create_session(app: AppHandle, state: State<AppState>, meta: CreateArgs) -> R
             PlainConfig {
                 host: meta.host.clone(), session: session.clone(),
                 tmux_path: tmux_path.clone(), tmux_version, base_args: vec![],
+                socket: effective_socket.clone(),
+                recovery_windows: recovery_windows.clone(),
                 transport: session_transport,
             }, sink, 90, 30,
         ).map_err(|e| e.to_string())?;
@@ -570,7 +628,7 @@ fn create_session(app: AppHandle, state: State<AppState>, meta: CreateArgs) -> R
     // renderer's cached copy has to follow or its next createSession would re-send the stale pair.
     Ok(json!({
         "id": id, "session": session, "mode": mode,
-        "tmuxPath": tmux_path, "tmuxVersion": tmux_version,
+        "tmuxPath": tmux_path, "tmuxVersion": tmux_version, "socketName": socket_name,
     }))
 }
 
@@ -681,7 +739,7 @@ fn session_kill(state: State<AppState>, id: String) -> serde_json::Value {
 
     let mut killed_remote = false;
     if let Some(m) = meta {
-        let socket = tmux_socket::socket_name(&m.mode, m.tmux_version, &m.session);
+        let socket = session_socket(&m);
         let tmux_path = m.tmux_path.clone().unwrap_or_else(|| "tmux".into());
         if m.transport == "local" {
             // Local tmux server: kill it directly. Without this a "Kill" on a local session would
@@ -858,7 +916,7 @@ async fn read_remote_file(app: AppHandle, id: String, path: String) -> Result<Fi
             } else {
                 remote_file::TmuxCtx {
                     tmux_path: meta.tmux_path.clone().unwrap_or_default(),
-                    socket: tmux_socket::socket_name(&meta.mode, meta.tmux_version, &meta.session),
+                    socket: session_socket(&meta),
                     session: meta.session.clone(),
                 }
             };
@@ -869,7 +927,7 @@ async fn read_remote_file(app: AppHandle, id: String, path: String) -> Result<Fi
             // tmux socket/session so the remote script can query #{pane_current_path}.
             let ctx = remote_file::TmuxCtx {
                 tmux_path: meta.tmux_path.clone().unwrap_or_default(),
-                socket: tmux_socket::socket_name(&meta.mode, meta.tmux_version, &meta.session),
+                socket: session_socket(&meta),
                 session: meta.session.clone(),
             };
             remote_file::read_remote_file(&meta.host, &path_for_task, DOWNLOAD_CAP, &ctx, &[])
@@ -1124,6 +1182,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_sessions, create_session, session_input, session_resize,
             session_detach, session_close, session_resume, session_kill, session_rename,
+            discover_tmux_sessions,
             reorder_sessions, set_session_color, set_last_active, set_last_tab, set_tab_prefs,
             tab_new, tab_select, tab_close, tab_capture, tab_rename, open_external, ui_log,
             read_remote_file, save_file, enable_html_scripts, session_retry, session_force_reconnect,

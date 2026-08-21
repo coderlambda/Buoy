@@ -241,6 +241,98 @@ describe('Tauri UI: new session dialog', () => {
     finish();
   });
 
+  it('discovers and imports a session from the default tmux server', async () => {
+    const { check, finish } = createChecks();
+    const alreadyOpen = {
+      ...session(3, 'existing shell'),
+      host: 'dev@example.test',
+      session: 'existing',
+      socketName: 'default',
+    };
+    await loadFixture([...baseSessions(), alreadyOpen], {}, {
+      discovery: {
+        tmuxPath: '/home/dev/.local/bin/tmux', tmuxVersion: [3, 7],
+        sessions: [
+          { name: 'existing', windows: 2, attached: 1, created: 30 },
+          { name: 'work', windows: 3, attached: 1, created: 20 },
+          { name: 'notes', windows: 1, attached: 0, created: 10 },
+        ],
+      },
+      createSessionResult: { id: 'imported-work', session: 'work', mode: 'control',
+        tmuxPath: '/home/dev/.local/bin/tmux', tmuxVersion: [3, 7], socketName: 'default' },
+    });
+    await openDialog();
+    await js(`document.getElementById('f-host').value = 'dev@example.test'`);
+    await js(`document.getElementById('f-discover').click()`);
+    await browser.waitUntil(async () => js(
+      `document.querySelectorAll('#tmux-discovery .discovered-session').length === 2`));
+
+    const discovered = await js(`Array.from(document.querySelectorAll(
+      '#tmux-discovery .discovered-session')).map((node) => node.textContent)`);
+    check(discovered.length === 2 && !discovered.some((text: string) => text.includes('existing'))
+      && discovered[0].includes('work') && discovered[0].includes('3 windows')
+      && discovered[0].includes('1 attached'),
+    `TC-NS7 discovery skips already-open sessions and shows the remaining topology (got ${JSON.stringify(discovered)})`);
+
+    await js(`document.querySelector('#tmux-discovery .discovered-session').click()`);
+    check(await js(`document.getElementById('f-ok').textContent`) === 'Import',
+      'TC-NS7 selecting an existing session changes the primary action to Import');
+    await submitCreate();
+    await browser.waitUntil(async () => js(
+      `!!document.querySelector('#sessions .session[data-id="imported-work"]')`));
+
+    const discovers = await commandCalls('discover_tmux_sessions');
+    const creates = await newSessionCalls();
+    const sent = creates[0]?.[1]?.meta;
+    check(discovers.length === 1 && discovers[0]?.[1]?.kind === 'remote'
+      && discovers[0]?.[1]?.host === 'dev@example.test',
+    `TC-NS7 discovery targets the selected SSH host (got ${JSON.stringify(discovers)})`);
+    check(sent?.session === 'work' && sent?.socketName === 'default'
+      && sent?.tmuxPath === '/home/dev/.local/bin/tmux'
+      && JSON.stringify(sent?.tmuxVersion) === JSON.stringify([3, 7]),
+    `TC-NS7 import preserves the existing name/default socket and probed tmux (got ${JSON.stringify(sent)})`);
+    finish();
+  });
+
+  it('shows an empty import state when every discovered session is already open', async () => {
+    const { check, finish } = createChecks();
+    const openSession = (n: number, name: string) => ({
+      ...session(n, name),
+      host: 'dev@example.test',
+      session: name,
+      socketName: 'default',
+    });
+    await loadFixture([
+      ...baseSessions(),
+      openSession(3, 'work'),
+      openSession(4, 'notes'),
+    ], {}, {
+      discovery: {
+        tmuxPath: '/usr/bin/tmux', tmuxVersion: [3, 6],
+        sessions: [
+          { name: 'work', windows: 3, attached: 1, created: 20 },
+          { name: 'notes', windows: 1, attached: 0, created: 10 },
+        ],
+      },
+    });
+    await openDialog();
+    await js(`document.getElementById('f-host').value = 'dev@example.test'`);
+    await js(`document.getElementById('f-discover').click()`);
+    await browser.waitUntil(async () => js(
+      `document.getElementById('tmux-discovery').textContent.includes('already open')`));
+
+    const state = await js(`({
+      options: document.querySelectorAll('#tmux-discovery .discovered-session').length,
+      message: document.getElementById('tmux-discovery').textContent,
+      action: document.getElementById('f-ok').textContent,
+    })`);
+    check(state.options === 0
+      && state.message === 'No new sessions to import. All discovered sessions are already open.'
+      && state.action === 'Create',
+    `TC-NS8 all-open discovery has no import choices (got ${JSON.stringify(state)})`);
+    finish();
+  });
+
   it('keeps a backend creation failure visible and allows retry', async () => {
     const { check, finish } = createChecks();
     await loadFixture(baseSessions(), {}, { reject: { create_session: 'ssh spawn denied' } });
@@ -257,11 +349,11 @@ describe('Tauri UI: new session dialog', () => {
       rendererErrors: window.__errs.slice(),
     })`);
     check(state.open && state.rows === 2,
-      `TC-NS7 failed creation stays open and adds no row (got ${JSON.stringify(state)})`);
+      `TC-NS9 failed creation stays open and adds no row (got ${JSON.stringify(state)})`);
     check(state.message === 'Could not create session: ssh spawn denied',
-      `TC-NS7 failed creation shows the backend reason (got ${JSON.stringify(state.message)})`);
+      `TC-NS9 failed creation shows the backend reason (got ${JSON.stringify(state.message)})`);
     check(state.rendererErrors.length === 0,
-      `TC-NS7 the handled rejection produces no uncaught renderer error (got ${JSON.stringify(state.rendererErrors)})`);
+      `TC-NS9 the handled rejection produces no uncaught renderer error (got ${JSON.stringify(state.rendererErrors)})`);
 
     await js(`delete window.__BUOY_UI_TEST__.fixture.backend.reject.create_session`);
     await submitCreate();
@@ -273,9 +365,9 @@ describe('Tauri UI: new session dialog', () => {
       active: document.querySelector('#sessions .session.active').dataset.id,
     })`);
     check(!state.open && state.rows === 3 && state.active === 'created-1',
-      `TC-NS7 retry succeeds without reopening the dialog (got ${JSON.stringify(state)})`);
+      `TC-NS9 retry succeeds without reopening the dialog (got ${JSON.stringify(state)})`);
     check((await newSessionCalls()).length === 2,
-      'TC-NS7 one failed attempt plus one retry produced exactly two backend calls');
+      'TC-NS9 one failed attempt plus one retry produced exactly two backend calls');
     finish();
   });
 });

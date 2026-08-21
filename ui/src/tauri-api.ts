@@ -23,6 +23,7 @@ function on<T>(event: string, cb: (payload: T) => void): void {
 export const terminalAPI: TerminalAPI = {
   // session CRUD — the Rust side owns all argv/validation.
   listSessions: () => invoke('list_sessions'),
+  discoverTmuxSessions: (kind, host) => invoke('discover_tmux_sessions', { kind, host }),
   createSession: (meta) => invoke('create_session', { meta }),
   // `win` identifies the xterm instance that produced the bytes. This matters for terminal
   // replies (for example OSC 10/11 colour-query responses): during a tab switch tmux's active

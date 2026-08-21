@@ -71,7 +71,8 @@ fn force_reconnect_does_not_loop() {
 
     let sup = Supervisor::new(
         BackendConfig { host: "localhost".into(), session: session.into(),
-            tmux_path: tmux.clone(), tmux_version: Some((3, 6)), base_args: vec![],
+            tmux_path: tmux.clone(), tmux_version: Some((3, 6)), socket: String::new(),
+            recovery_windows: vec![], base_args: vec![],
             transport: Transport::Ssh },
         SupervisorOpts::default(),
         real_backend_factory(),

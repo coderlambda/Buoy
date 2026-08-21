@@ -10,8 +10,8 @@
 //! Local:  `tmux -L sock new-session -A -s name`, with the environment set on the child directly.
 
 use crate::validation::{
-    self, build_control_mode_ssh_args, build_local_control_mode_args, build_local_tmux_args,
-    build_ssh_args, local_tmux_lc_all,
+    self, build_control_mode_ssh_args_with_recovery, build_local_control_mode_args,
+    build_local_tmux_args, build_ssh_args_with_recovery, local_tmux_lc_all,
 };
 
 /// Which machine a session's tmux server lives on.
@@ -60,13 +60,34 @@ pub fn spawn_spec(
     lc_all: Option<&str>,
     lang: Option<&str>,
 ) -> Result<SpawnSpec, validation::ValidationError> {
+    spawn_spec_with_recovery(
+        transport, control, host, session, tmux_path, socket, base_args, lc_all, lang, &[],
+    )
+}
+
+pub fn spawn_spec_with_recovery(
+    transport: Transport,
+    control: bool,
+    host: &str,
+    session: &str,
+    tmux_path: &str,
+    socket: &str,
+    base_args: &[String],
+    lc_all: Option<&str>,
+    lang: Option<&str>,
+    recovery_windows: &[crate::session_store::RecoveryWindow],
+) -> Result<SpawnSpec, validation::ValidationError> {
     match transport {
         Transport::Ssh => {
             let opts = ssh_opts(base_args);
             let args = if control {
-                build_control_mode_ssh_args(host, session, &opts, tmux_path, socket)?
+                build_control_mode_ssh_args_with_recovery(
+                    host, session, &opts, tmux_path, socket, recovery_windows,
+                )?
             } else {
-                build_ssh_args(host, session, &opts, tmux_path, socket)?
+                build_ssh_args_with_recovery(
+                    host, session, &opts, tmux_path, socket, recovery_windows,
+                )?
             };
             // Overridable so a test can inject a fake transport that execs a LOCAL tmux (no
             // network/sshd) and exercise the real backend + supervisor end to end.
@@ -84,6 +105,19 @@ pub fn spawn_spec(
             } else {
                 build_local_tmux_args(session, tmux_path, socket)?
             };
+            // An imported default-server session belongs to the user. Attach without changing its
+            // global shell, PATH, or default-command; those settings affect every other session on
+            // that server. Child-only locale/TERM are still safe and needed by the tmux client.
+            if socket == "default" {
+                let mut env = vec![
+                    ("PATH".into(), crate::augmented_path()),
+                    ("TERM".into(), "xterm-256color".into()),
+                ];
+                if let Some(v) = local_tmux_lc_all(lc_all, lang) {
+                    env.push(("LC_ALL".into(), v.into()));
+                }
+                return Ok(SpawnSpec { program: tmux_path.to_string(), args, env });
+            }
             let path = crate::claude_integration::path_with_local_shim(&crate::augmented_path());
             let shell_launcher = crate::claude_integration::local_shell_launcher()
                 .unwrap_or_else(|_| std::path::PathBuf::from("/bin/sh"));
@@ -172,6 +206,24 @@ mod tests {
         // the app's locale must NOT leak into the remote child's env (the remote gets its LC_ALL via
         // the argv prefix instead)
         assert!(!s.env.iter().any(|(k, _)| k == "LC_ALL"), "no LC_ALL in ssh child env: {:?}", s.env);
+    }
+
+    #[test]
+    fn remote_recovery_runs_inside_the_actual_interactive_ssh_bootstrap() {
+        let windows = vec![crate::session_store::RecoveryWindow {
+            name: "work".into(), cwd: "/tmp/project".into(),
+            command: "codex".into(), active: true,
+        }];
+        let s = spawn_spec_with_recovery(
+            Transport::Ssh, true, "me@h", "dt-x", "/t", "dtcc3-7-dt-x", &[],
+            None, None, &windows,
+        ).unwrap();
+        let script = remote_script(&s.args);
+        let check = script.find("if ! /t -L dtcc3-7-dt-x has-session -t dt-x").unwrap();
+        let attach = script.find("exec /t -CC -L dtcc3-7-dt-x new-session").unwrap();
+        assert!(check < attach, "rebuild decision happens after the one SSH login and before attach");
+        assert!(!script.contains("/tmp/project"), "cwd remains base64 data in the remote shell");
+        assert!(script.contains("BUOY_RESTORED"));
     }
 
     // TC-T2 local mode: the program IS tmux, there is no ssh and no host anywhere in the argv.

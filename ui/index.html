@@ -203,6 +203,21 @@
     #host-history li { padding:6px 8px; border-radius:4px; cursor:pointer; font-size:12px;
       overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     #host-history li:hover, #host-history li.sel { background:#313244; color:var(--fg); }
+    .discover-row { display:flex; align-items:center; gap:8px; margin:0 0 10px; }
+    dialog button.discover-button { margin:0; flex:none; background:var(--bg); color:var(--fg);
+      border:1px solid #45475a; border-radius:5px; cursor:pointer; }
+    dialog button.discover-button:hover { border-color:var(--accent); }
+    dialog button.discover-button:disabled { opacity:.55; cursor:default; }
+    #tmux-discovery { display:none; margin:-2px 0 10px; padding:5px; border:1px solid #45475a;
+      border-radius:6px; background:var(--bg); max-height:150px; overflow-y:auto; }
+    #tmux-discovery.on { display:block; }
+    dialog .discovered-session { width:100%; margin:0; padding:7px 8px; display:flex;
+      align-items:center; gap:8px; border:0; border-radius:4px; background:transparent; color:var(--fg);
+      text-align:left; cursor:pointer; }
+    dialog .discovered-session:hover { background:#313244; }
+    dialog .discovered-session.selected { background:rgba(137,180,250,.15); outline:1px solid var(--accent); }
+    .discovered-session .session-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .discovered-session .session-meta { color:var(--muted); font-size:11px; white-space:nowrap; }
     /* native-mode toggle button */
     .toggle-row { display:flex; align-items:center; gap:8px; margin:2px 0 10px; }
     .toggle { position:relative; width:38px; height:22px; padding:0; margin:0; border-radius:11px;
@@ -315,6 +330,11 @@
            restart just like remote ones (§5.3b) — the toggle applies to both and stays visible. -->
       <div id="local-hint" class="hint">Runs a shell on this machine inside tmux, so the session
         survives quitting the app and reattaches when you reopen it.</div>
+      <div class="discover-row">
+        <button type="button" id="f-discover" class="discover-button">Find existing tmux sessions</button>
+        <span class="hint" style="margin:0">Uses the host's default tmux server.</span>
+      </div>
+      <div id="tmux-discovery" role="listbox" aria-label="Existing tmux sessions"></div>
       <div class="toggle-row">
         <button type="button" id="f-control" class="toggle on" role="switch" aria-checked="true">
           <span class="knob"></span>

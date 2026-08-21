@@ -108,10 +108,25 @@ export function stripOsc8Sequences(data: string): string {
 // preserve every other SGR parameter, including ordinary underline styles and color attributes.
 const SGR_RE = /\x1b\[([0-9:;]*)m/g;
 
+// A capture-pane payload replaces the visible screen, but xterm otherwise parses it as a
+// continuation of the previous byte stream. That is unsafe after reconnect/tab recovery: the old
+// stream can end inside an OSC 8 link, with dotted SGR active, or with terminal geometry modes that
+// change where CUP and autowrap land. Establish the ordinary full-screen baseline before painting
+// without using RIS/DECSTR (those broader resets would also disturb application input modes such as
+// bracketed paste and mouse reporting). The suffix prevents a final captured cell attribute from
+// leaking into the next live chunk; neither wrapper moves the cursor.
+const RECONNECT_SNAPSHOT_PREFIX = '\x1b]8;;\x1b\\\x1b[0m'
+  + '\x1b[?6l'    // DECOM: cursor positions are viewport-relative, not scroll-region-relative
+  + '\x1b[?69l'   // DECLRMM: disable stale left/right margins that cause mid-screen wrapping
+  + '\x1b[r'      // DECSTBM: restore the full-height scrolling region
+  + '\x1b[?7h'    // DECAWM: ordinary right-edge autowrap
+  + '\x1b[?45l'   // reverse-wraparound off
+  + '\x1b[4l';    // IRM: replace characters instead of inserting them
+const RECONNECT_SNAPSHOT_SUFFIX = '\x1b]8;;\x1b\\\x1b[0m';
+
 export function sanitizeReconnectSnapshot(data: string): string {
   const withoutLinks = stripOsc8Sequences(data);
-  if (withoutLinks.indexOf('4:4') === -1) return withoutLinks;
-  return withoutLinks.replace(SGR_RE, (sequence, params: string) => {
+  const withoutDottedUnderline = withoutLinks.replace(SGR_RE, (sequence, params: string) => {
     const parts = params.split(';');
     let changed = false;
     for (let i = 0; i < parts.length; i++) {
@@ -122,6 +137,7 @@ export function sanitizeReconnectSnapshot(data: string): string {
     }
     return changed ? `\x1b[${parts.join(';')}m` : sequence;
   });
+  return RECONNECT_SNAPSHOT_PREFIX + withoutDottedUnderline + RECONNECT_SNAPSHOT_SUFFIX;
 }
 
 // Notification OSCs are a STREAM protocol: the ESC introducer, payload, and terminator can arrive

@@ -16,13 +16,16 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system, MasterPty};
 
 use crate::control_parser::{ControlEvent, ControlModeParser};
 use crate::reply_channel::{ReplyChannel, ReplyKind};
+use crate::session_store::RecoveryWindow;
 use crate::tmux_keys::encode_send_keys;
 use crate::tmux_socket::socket_name;
 use crate::transport::{self, Transport};
 use crate::validation;
 use crate::window_registry::{PaneRow, WindowRegistry};
 
-const LIST_FMT: &str = "#{window_id} #{pane_id} #{pane_active} #{window_active} #{window_name}";
+// Tabs keep names/paths with spaces intact. Newlines and tabs in persisted values are stripped by
+// SessionStore before they can become part of a recovery recipe.
+const LIST_FMT: &str = "#{window_id}\t#{pane_id}\t#{pane_active}\t#{window_active}\t#{window_name}\t#{pane_current_path}\t#{pane_current_command}";
 const MAX_HISTORY: u32 = 2000;
 const MAX_BUFFER: usize = 4096;
 
@@ -37,6 +40,9 @@ pub enum BackendEvent {
     WindowClose { window: String, order: Vec<String> },
     WindowRename { window: String, name: String },
     WindowActive { window: String, order: Vec<String> },
+    /// Latest active-pane cwd/command per window. The session layer persists this without exposing
+    /// it as a renderer event; it is used only if the tmux server later disappears.
+    RecoverySnapshot { windows: Vec<RecoveryWindow> },
     Ready,
     Exit,
 }
@@ -49,6 +55,10 @@ pub struct BackendConfig {
     pub session: String,
     pub tmux_path: String,
     pub tmux_version: Option<(u32, u32)>,
+    /// Resolved socket name. Imported sessions use `default`; Buoy-owned sessions use a private,
+    /// versioned socket computed by the session layer.
+    pub socket: String,
+    pub recovery_windows: Vec<RecoveryWindow>,
     pub base_args: Vec<String>,
     /// ssh to `host`, or a tmux on THIS machine (kind:'local'). Everything downstream — parser,
     /// registry, supervisor, reattach — is identical either way; see transport.rs.
@@ -59,7 +69,8 @@ impl Default for BackendConfig {
     fn default() -> Self {
         BackendConfig {
             host: String::new(), session: String::new(), tmux_path: "tmux".into(),
-            tmux_version: None, base_args: vec![], transport: Transport::Ssh,
+            tmux_version: None, socket: String::new(), recovery_windows: vec![],
+            base_args: vec![], transport: Transport::Ssh,
         }
     }
 }
@@ -71,6 +82,7 @@ struct Inner {
     writer: Box<dyn Write + Send>,
     sink: BackendSink,
     session: String,
+    managed: bool,
     ready: bool,
     attached: bool,
     // Input can arrive before the control client is ready. Preserve its originating window while
@@ -111,11 +123,15 @@ impl ControlBackend {
     pub fn spawn(cfg: BackendConfig, sink: BackendSink, cols: u16, rows: u16)
         -> Result<Self, validation::ValidationError>
     {
-        let socket = socket_name("control", cfg.tmux_version, &cfg.session);
+        let socket = if cfg.socket.is_empty() {
+            socket_name("control", cfg.tmux_version, &cfg.session)
+        } else {
+            cfg.socket.clone()
+        };
         let (lc_all, lang) = transport::current_locale();
-        let spec = transport::spawn_spec(
+        let spec = transport::spawn_spec_with_recovery(
             cfg.transport, true, &cfg.host, &cfg.session, &cfg.tmux_path, &socket,
-            &cfg.base_args, lc_all.as_deref(), lang.as_deref(),
+            &cfg.base_args, lc_all.as_deref(), lang.as_deref(), &cfg.recovery_windows,
         )?;
         crate::dlog!("ControlBackend.spawn: socket={} {} {}", socket, spec.program, spec.args.join(" "));
 
@@ -149,6 +165,7 @@ impl ControlBackend {
             writer,
             sink: sink.clone(),
             session: cfg.session.clone(),
+            managed: socket != "default",
             ready: false,
             attached: false,
             pending_input: Vec::new(),
@@ -216,6 +233,19 @@ impl ControlBackend {
                     if g.stopped { break; }
                     g.flush_output();
                 }
+            });
+        }
+
+        // `cd` does not necessarily trigger a tmux topology event. Poll at a deliberately low
+        // cadence so a host-restart recipe eventually captures the current directory without
+        // coupling discovery to terminal output volume (a busy TUI can emit hundreds/sec).
+        {
+            let inner = inner.clone();
+            thread::spawn(move || loop {
+                thread::sleep(Duration::from_secs(15));
+                let mut g = inner.lock().unwrap();
+                if g.stopped { break; }
+                g.refresh_now();
             });
         }
 
@@ -456,6 +486,10 @@ impl Inner {
 
         // Emit any buffered output first so window add/active can't be reordered ahead of it.
         g.flush_output();
+        let recovery = recovery_snapshot(&rows, &order, g.reg.active_window.as_deref());
+        if !recovery.is_empty() {
+            g.emit(BackendEvent::RecoverySnapshot { windows: recovery });
+        }
         for win in &diff.added {
             // A newly-added window already has a name in tmux (auto-derived or a manual rename that
             // persisted server-side). `added` alone carries only the id, so emit its name too —
@@ -550,12 +584,14 @@ impl Inner {
             // untitled shell shows "zsh" rather than the hostname. This drives %window-renamed,
             // which the renderer already maps to the tab label. A manual rename turns automatic-
             // rename off for that window (tmux does this itself when you set-option the name).
-            g.send("set-option -g automatic-rename on".into(), ReplyKind::Ignore);
-            g.send(
-                "set-option -g automatic-rename-format \
-                 '#{?#{==:#{pane_title},#{host}},#{pane_current_command},#{pane_title}}'".into(),
-                ReplyKind::Ignore,
-            );
+            if g.managed {
+                g.send("set-option -g automatic-rename on".into(), ReplyKind::Ignore);
+                g.send(
+                    "set-option -g automatic-rename-format \
+                     '#{?#{==:#{pane_title},#{host}},#{pane_current_command},#{pane_title}}'".into(),
+                    ReplyKind::Ignore,
+                );
+            }
             g.refresh_now();
         }
         // fast-path ready shortly after attach (topology reply has landed)
@@ -728,14 +764,16 @@ fn capture_repaint(body: &[String], cursor_x: usize, cursor_y: usize) -> String 
     )
 }
 
-// "@win %pane paneActive winActive name"
+// "@win<TAB>%pane<TAB>paneActive<TAB>winActive<TAB>name<TAB>cwd<TAB>command"
 fn parse_list_row(line: &str) -> Option<PaneRow> {
-    let mut parts = line.splitn(5, ' ');
+    let mut parts = line.splitn(7, '\t');
     let win = parts.next()?;
     let pane = parts.next()?;
     let pane_active = parts.next()?;
     let win_active = parts.next()?;
     let name = parts.next().unwrap_or("");
+    let cwd = parts.next().unwrap_or("");
+    let command = parts.next().unwrap_or("");
     if !win.starts_with('@') || !pane.starts_with('%') { return None; }
     if pane_active != "0" && pane_active != "1" { return None; }
     if win_active != "0" && win_active != "1" { return None; }
@@ -745,7 +783,22 @@ fn parse_list_row(line: &str) -> Option<PaneRow> {
         pane_active: pane_active == "1",
         win_active: win_active == "1",
         name: name.to_string(),
+        cwd: cwd.to_string(),
+        command: command.to_string(),
     })
+}
+
+fn recovery_snapshot(rows: &[PaneRow], order: &[String], active: Option<&str>) -> Vec<RecoveryWindow> {
+    order.iter().filter_map(|window| {
+        let row = rows.iter().find(|row| &row.win == window && row.pane_active)
+            .or_else(|| rows.iter().find(|row| &row.win == window))?;
+        Some(RecoveryWindow {
+            name: latin1_to_utf8(&row.name),
+            cwd: latin1_to_utf8(&row.cwd),
+            command: latin1_to_utf8(&row.command),
+            active: active == Some(window.as_str()),
+        })
+    }).collect()
 }
 
 fn is_win_id(s: &str) -> bool {
@@ -855,6 +908,7 @@ mod tests {
             writer: Box::new(CaptureWriter(sent.clone())),
             sink,
             session: "s".into(),
+            managed: true,
             ready: false,
             attached: false,
             pending_input: Vec::new(),
@@ -897,7 +951,7 @@ mod tests {
         assert_eq!(inner.lock().unwrap().pending_input.len(), 1, "input buffered");
 
         // Topology reply lands -> active window becomes @0 -> buffered input flushes as send-keys.
-        Inner::apply_topology(&inner, vec!["@0 %0 1 1 zsh".to_string()]);
+        Inner::apply_topology(&inner, vec!["@0\t%0\t1\t1\tzsh\t/tmp\tzsh".to_string()]);
         assert_eq!(inner.lock().unwrap().reg.active_window.as_deref(), Some("@0"));
         assert!(sent_str(&sent).contains("send-keys"), "pending input flushed after topology");
         assert!(inner.lock().unwrap().pending_input.is_empty(), "pending_input drained");
@@ -907,7 +961,7 @@ mod tests {
     #[test]
     fn tc_cb_topology_before_ready_drains_input_on_ready() {
         let (inner, sent) = test_inner();
-        Inner::apply_topology(&inner, vec!["@0 %0 1 1 zsh".to_string()]);
+        Inner::apply_topology(&inner, vec!["@0\t%0\t1\t1\tzsh\t/tmp\tzsh".to_string()]);
         // Not ready yet: input buffers even though we know the window.
         inner.lock().unwrap().write_input("ls\n", None);
         assert!(!sent_str(&sent).contains("send-keys"), "not sent before ready");
@@ -924,8 +978,8 @@ mod tests {
     fn tc_cb_explicit_input_target_wins_over_active_window() {
         let (inner, sent) = test_inner();
         Inner::apply_topology(&inner, vec![
-            "@0 %0 1 1 codex".to_string(),
-            "@1 %1 1 0 codex".to_string(),
+            "@0\t%0\t1\t1\tcodex\t/tmp/a\tcodex".to_string(),
+            "@1\t%1\t1\t0\tcodex\t/tmp/b\tcodex".to_string(),
         ]);
         Inner::mark_ready(&inner);
         assert_eq!(inner.lock().unwrap().reg.active_window.as_deref(), Some("@0"));
@@ -1039,7 +1093,7 @@ mod tests {
     fn tc_cb_input_waits_for_capture_repaint() {
         let (inner, sent) = test_inner();
         assert_eq!(inner.lock().unwrap().reply.take(), Some(ReplyKind::Ignore));
-        Inner::apply_topology(&inner, vec!["@0 %0 1 1 zsh".into()]);
+        Inner::apply_topology(&inner, vec!["@0\t%0\t1\t1\tzsh\t/tmp\tzsh".into()]);
         Inner::mark_ready(&inner);
         sent.lock().unwrap().clear();
 
@@ -1060,17 +1114,35 @@ mod tests {
 
     #[test]
     fn parse_list_row_ok() {
-        let r = parse_list_row("@1 %9 1 1 zsh").unwrap();
+        let r = parse_list_row("@1\t%9\t1\t1\tzsh\t/tmp/a b\tcodex").unwrap();
         assert_eq!(r.win, "@1");
         assert_eq!(r.pane, "%9");
         assert!(r.pane_active && r.win_active);
         assert_eq!(r.name, "zsh");
+        assert_eq!(r.cwd, "/tmp/a b");
+        assert_eq!(r.command, "codex");
     }
 
     #[test]
     fn parse_list_row_rejects_capture_text() {
         assert!(parse_list_row("$ ls -la").is_none());
         assert!(parse_list_row("total 40").is_none());
+    }
+
+    #[test]
+    fn recovery_snapshot_uses_each_windows_active_pane() {
+        let rows = vec![
+            parse_list_row("@0\t%0\t0\t1\twork\t/tmp/wrong\ttail").unwrap(),
+            parse_list_row("@0\t%1\t1\t1\twork\t/tmp/right\tcodex").unwrap(),
+            parse_list_row("@1\t%2\t1\t0\tlogs\t/var/log\tzsh").unwrap(),
+        ];
+        let snapshot = recovery_snapshot(&rows, &["@0".into(), "@1".into()], Some("@0"));
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0].cwd, "/tmp/right");
+        assert_eq!(snapshot[0].command, "codex");
+        assert!(snapshot[0].active);
+        assert_eq!(snapshot[1].cwd, "/var/log");
+        assert!(!snapshot[1].active);
     }
 
     #[test]
@@ -1177,7 +1249,7 @@ mod tests {
     #[test]
     fn tc_cb_mapped_pane_output_requests_no_refresh() {
         let (inner, sent) = test_inner();
-        Inner::apply_topology(&inner, vec!["@0 %0 1 1 zsh".to_string()]);
+        Inner::apply_topology(&inner, vec!["@0\t%0\t1\t1\tzsh\t/tmp\tzsh".to_string()]);
         sent.lock().unwrap().clear();
 
         let needs = inner.lock().unwrap().route_output("%0".into(), "hello".into());

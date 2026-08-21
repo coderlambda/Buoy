@@ -595,6 +595,40 @@ fn make_executable(_path: &Path) -> io::Result<()> {
 /// this function is called. The outer ssh command base64-wraps the complete script and passes the
 /// decoded bytes as `/bin/sh -c`'s argument, so tmux inherits ssh's pty stdin rather than a pipe.
 pub fn remote_tmux_script(tmux_path: &str, socket: &str, session: &str, control: bool) -> String {
+    remote_tmux_script_inner(tmux_path, socket, session, control, "")
+}
+
+pub fn remote_tmux_script_with_recovery(
+    tmux_path: &str,
+    socket: &str,
+    session: &str,
+    control: bool,
+    windows: &[crate::session_store::RecoveryWindow],
+) -> Result<String, String> {
+    let recovery = if windows.is_empty() {
+        String::new()
+    } else {
+        crate::tmux_discovery::recovery_shell_block(tmux_path, socket, session, windows)?
+    };
+    Ok(remote_tmux_script_inner(tmux_path, socket, session, control, &recovery))
+}
+
+fn remote_tmux_script_inner(
+    tmux_path: &str,
+    socket: &str,
+    session: &str,
+    control: bool,
+    recovery: &str,
+) -> String {
+    // Importing a user's existing default-server session must be observational: do not install a
+    // shell wrapper, replace tmux's global default-command, or use `-D` (which would evict their
+    // other clients). The control client can coexist with ordinary attached clients.
+    if socket == "default" {
+        let cc = if control { " -CC" } else { "" };
+        return format!(
+            "LC_ALL=C.UTF-8\nexport LC_ALL\n{recovery}exec {tmux_path}{cc} -L default attach-session -t {session} \\; set-option -g focus-events on"
+        );
+    }
     let wrapper_b64 = crate::validation::base64_encode(CLAUDE_WRAPPER.as_bytes());
     let manifest_b64 = crate::validation::base64_encode(CLAUDE_PLUGIN_MANIFEST.as_bytes());
     let hooks_b64 = crate::validation::base64_encode(CLAUDE_PLUGIN_HOOKS.as_bytes());
@@ -673,6 +707,7 @@ fi
 export BUOY_TERMINAL BUOY_SESSION_ID BUOY_SHELL_LAUNCHER BUOY_REAL_SHELL BUOY_TMUX_BIN SHELL
 LC_ALL=C.UTF-8
 export LC_ALL
+{recovery}
 exec {tmux_path}{cc} -L {socket} new-session{detach} -A -s {session} \; set-option -g focus-events on \; set-environment -g PATH "$PATH" \; set-environment -g BUOY_TERMINAL 1 \; set-environment -g BUOY_SESSION_ID "$BUOY_SESSION_ID" \; set-environment -g BUOY_SHELL_LAUNCHER "$BUOY_SHELL_LAUNCHER" \; set-environment -g BUOY_REAL_SHELL "$BUOY_REAL_SHELL" \; set-environment -g BUOY_TMUX_BIN "$BUOY_TMUX_BIN" \; set-environment -g SHELL "$BUOY_REAL_SHELL" \; set-option -g default-shell "$BUOY_REAL_SHELL" \; set-option -g default-command 'if [ -x "$BUOY_SHELL_LAUNCHER" ]; then exec "$BUOY_SHELL_LAUNCHER"; else exec "$BUOY_REAL_SHELL" -l; fi'"#
     )
 }
@@ -976,6 +1011,16 @@ mod tests {
         assert!(script.contains("set-environment -g BUOY_TMUX_BIN \"$BUOY_TMUX_BIN\""));
         assert!(script.contains("set-option -g default-shell \"$BUOY_REAL_SHELL\""));
         assert!(script.contains("set-option -g default-command 'if [ -x \"$BUOY_SHELL_LAUNCHER\" ]"));
+    }
+
+    #[test]
+    fn imported_default_server_is_not_reconfigured_or_detached() {
+        let script = remote_tmux_script("/usr/bin/tmux", "default", "work", true);
+        assert!(script.contains("-CC -L default attach-session -t work"));
+        assert!(!script.contains("new-session"));
+        assert!(!script.contains(" -D"));
+        assert!(!script.contains("default-command"));
+        assert!(!script.contains("buoy_install"));
     }
 
     /// Run the production SSH command shape through a real pty. A string-only assertion cannot

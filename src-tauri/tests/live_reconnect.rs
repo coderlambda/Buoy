@@ -49,7 +49,8 @@ fn live_reconnects_after_ssh_killed() {
 
     let sup = Supervisor::new(
         BackendConfig { host: host.clone(), session: session.into(),
-            tmux_path: tmux.clone(), tmux_version: Some((3, 7)), base_args: vec![],
+            tmux_path: tmux.clone(), tmux_version: Some((3, 7)), socket: String::new(),
+            recovery_windows: vec![], base_args: vec![],
             transport: Transport::Ssh },
         SupervisorOpts::default(),
         real_backend_factory(),

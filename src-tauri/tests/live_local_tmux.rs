@@ -53,6 +53,7 @@ fn sink(rec: Arc<Mutex<Rec>>) -> buoy_lib::control_backend::BackendSink {
             BackendEvent::WindowClose { order, .. } => { r.windows = order; }
             BackendEvent::WindowActive { order, .. } => { r.windows = order; }
             BackendEvent::WindowRename { .. } => {}
+            BackendEvent::RecoverySnapshot { .. } => {}
             BackendEvent::Ready => { r.ready = true; }
             BackendEvent::Exit => { r.exits += 1; }
         }
@@ -76,7 +77,8 @@ fn tc_lt1_local_control_mode_attaches_and_runs() {
         BackendConfig {
             host: String::new(),               // a local session has NO host
             session: session.into(),
-            tmux_path: tmux.clone(), tmux_version: ver, base_args: vec![],
+            tmux_path: tmux.clone(), tmux_version: ver, socket: String::new(),
+            recovery_windows: vec![], base_args: vec![],
             transport: Transport::Local,
         },
         sink(rec.clone()), 90, 30,
@@ -113,7 +115,8 @@ fn tc_lt2_local_session_survives_client_death() {
 
     let cfg = || BackendConfig {
         host: String::new(), session: session.into(),
-        tmux_path: tmux.clone(), tmux_version: ver, base_args: vec![],
+        tmux_path: tmux.clone(), tmux_version: ver, socket: String::new(),
+        recovery_windows: vec![], base_args: vec![],
         transport: Transport::Local,
     };
 
@@ -166,7 +169,8 @@ fn tc_lt3_local_session_reports_connected_state() {
     let sup = Supervisor::new(
         BackendConfig {
             host: String::new(), session: session.into(),
-            tmux_path: tmux.clone(), tmux_version: ver, base_args: vec![],
+            tmux_path: tmux.clone(), tmux_version: ver, socket: String::new(),
+            recovery_windows: vec![], base_args: vec![],
             transport: Transport::Local,
         },
         SupervisorOpts::default(),
@@ -207,7 +211,8 @@ fn tc_lt4_local_plain_mode_runs_under_tmux() {
     let b = PlainBackend::spawn(
         PlainConfig {
             host: String::new(), session: session.into(),
-            tmux_path: tmux.clone(), tmux_version: ver, base_args: vec![],
+            tmux_path: tmux.clone(), tmux_version: ver, socket: String::new(),
+            recovery_windows: vec![], base_args: vec![],
             transport: Transport::Local,
         }, psink, 80, 24,
     ).expect("local plain backend spawns");
@@ -245,7 +250,8 @@ fn tc_lt5_local_tmux_keeps_unicode_window_names() {
     let backend = ControlBackend::spawn(
         BackendConfig {
             host: String::new(), session: session.into(),
-            tmux_path: tmux.clone(), tmux_version: ver, base_args: vec![],
+            tmux_path: tmux.clone(), tmux_version: ver, socket: String::new(),
+            recovery_windows: vec![], base_args: vec![],
             transport: Transport::Local,
         },
         sink(rec.clone()), 90, 30,
@@ -282,7 +288,8 @@ fn tc_lt6_capture_restores_real_cursor_position() {
     let backend = ControlBackend::spawn(
         BackendConfig {
             host: String::new(), session: session.into(),
-            tmux_path: tmux.clone(), tmux_version: ver, base_args: vec![],
+            tmux_path: tmux.clone(), tmux_version: ver, socket: String::new(),
+            recovery_windows: vec![], base_args: vec![],
             transport: Transport::Local,
         },
         sink(rec.clone()), 90, 30,

@@ -197,7 +197,18 @@ pub fn build_ssh_args(
     tmux_path: &str,
     socket: &str,
 ) -> Result<Vec<String>> {
-    build_tmux_ssh_args(raw_host, raw_session, base_args, tmux_path, socket, false)
+    build_tmux_ssh_args(raw_host, raw_session, base_args, tmux_path, socket, false, &[])
+}
+
+pub fn build_ssh_args_with_recovery(
+    raw_host: &str,
+    raw_session: &str,
+    base_args: &[String],
+    tmux_path: &str,
+    socket: &str,
+    windows: &[crate::session_store::RecoveryWindow],
+) -> Result<Vec<String>> {
+    build_tmux_ssh_args(raw_host, raw_session, base_args, tmux_path, socket, false, windows)
 }
 
 fn build_tmux_ssh_args(
@@ -207,6 +218,7 @@ fn build_tmux_ssh_args(
     tmux_path: &str,
     socket: &str,
     control: bool,
+    windows: &[crate::session_store::RecoveryWindow],
 ) -> Result<Vec<String>> {
     let session = validate_session(raw_session)?;
     let parts = parse_host(raw_host)?;
@@ -225,7 +237,9 @@ fn build_tmux_ssh_args(
     args.extend(base_args.iter().cloned());
     args.push("--".into());
     args.push(host_token(&parts));
-    let script = crate::claude_integration::remote_tmux_script(tmux_path, socket, &session, control);
+    let script = crate::claude_integration::remote_tmux_script_with_recovery(
+        tmux_path, socket, &session, control, windows,
+    ).map_err(|e| ValidationError::new("recovery", &e))?;
     // Decode the bootstrap into `sh -c`'s argv, not its stdin. The remote login shell still owns
     // the pty allocated by `ssh -tt`, so the decoded script—and its final `exec tmux -CC`—inherits
     // that original tty fd. Piping the script into `/bin/sh` made tmux inherit the decoder pipe and
@@ -253,12 +267,17 @@ pub fn build_local_tmux_args(raw_session: &str, tmux_path: &str, socket: &str) -
     if !matches_socket(socket) {
         return Err(ValidationError::new("socket", "invalid socket name"));
     }
-    Ok(vec![
-        "-L".into(), socket.to_string(),
-        "new-session".into(), "-A".into(), "-s".into(), session,
-        // No shell is involved locally, so tmux receives its command separator directly.
-        ";".into(), "set-option".into(), "-g".into(), "focus-events".into(), "on".into(),
-    ])
+    let mut args = vec!["-L".into(), socket.to_string()];
+    if socket == "default" {
+        // Import means attach, never silently create. If a reboot removed this session, the
+        // recovery preflight recreates its saved windows first; a failed preflight stays visible.
+        args.extend(["attach-session".into(), "-t".into(), session]);
+    } else {
+        args.extend(["new-session".into(), "-A".into(), "-s".into(), session]);
+    }
+    // No shell is involved locally, so tmux receives its command separator directly.
+    args.extend([";".into(), "set-option".into(), "-g".into(), "focus-events".into(), "on".into()]);
+    Ok(args)
 }
 
 /// Local control-mode (-CC) argv: same shape as build_local_tmux_args with -CC before -L and -D on
@@ -266,8 +285,10 @@ pub fn build_local_tmux_args(raw_session: &str, tmux_path: &str, socket: &str) -
 pub fn build_local_control_mode_args(raw_session: &str, tmux_path: &str, socket: &str) -> Result<Vec<String>> {
     let mut args = build_local_tmux_args(raw_session, tmux_path, socket)?;
     args.insert(0, "-CC".into());
-    if let Some(ns) = args.iter().position(|a| a == "new-session") {
-        args.insert(ns + 1, "-D".into());
+    if socket != "default" {
+        if let Some(ns) = args.iter().position(|a| a == "new-session") {
+            args.insert(ns + 1, "-D".into());
+        }
     }
     Ok(args)
 }
@@ -314,7 +335,18 @@ pub fn build_control_mode_ssh_args(
     tmux_path: &str,
     socket: &str,
 ) -> Result<Vec<String>> {
-    build_tmux_ssh_args(raw_host, raw_session, base_args, tmux_path, socket, true)
+    build_tmux_ssh_args(raw_host, raw_session, base_args, tmux_path, socket, true, &[])
+}
+
+pub fn build_control_mode_ssh_args_with_recovery(
+    raw_host: &str,
+    raw_session: &str,
+    base_args: &[String],
+    tmux_path: &str,
+    socket: &str,
+    windows: &[crate::session_store::RecoveryWindow],
+) -> Result<Vec<String>> {
+    build_tmux_ssh_args(raw_host, raw_session, base_args, tmux_path, socket, true, windows)
 }
 
 /// Build ssh argv to KILL a remote tmux session (mirrors buildKillArgs): base64-wrapped so the
@@ -497,6 +529,17 @@ mod tests {
             "-CC", "-L", "dtcc3-6-dt-x", "new-session", "-D", "-A", "-s", "dt-x", ";",
             "set-option", "-g", "focus-events", "on",
         ]);
+    }
+
+    #[test]
+    fn tc_v_imported_default_session_attaches_without_detaching_or_creating() {
+        let a = build_local_control_mode_args("work", "tmux", "default").unwrap();
+        assert_eq!(a, [
+            "-CC", "-L", "default", "attach-session", "-t", "work", ";",
+            "set-option", "-g", "focus-events", "on",
+        ]);
+        assert!(!a.iter().any(|arg| arg == "-D" || arg == "new-session"),
+            "import neither evicts other clients nor invents a missing session: {a:?}");
     }
 
     // TC-V-L3 local kill needs no shell wrapper (contrast build_kill_args, which base64-wraps for a

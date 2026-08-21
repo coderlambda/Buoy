@@ -212,22 +212,31 @@ test('TC-PL4g2 stripOsc8Sequences removes hyperlink wrappers only', () => {
 // normalization clears that one style without flattening the rest of the captured formatting.
 test('TC-PL4g3 sanitizeReconnectSnapshot clears only dotted underline', () => {
   const E = '\x1b';
+  const prefix = E + ']8;;' + E + '\\' + E + '[0m' + E + '[?6l' + E + '[?69l'
+    + E + '[r' + E + '[?7h' + E + '[?45l' + E + '[4l';
+  const suffix = E + ']8;;' + E + '\\' + E + '[0m';
+  const body = (data: string): string => {
+    const normalized = sanitizeReconnectSnapshot(data);
+    assert.ok(normalized.startsWith(prefix), 'snapshot starts from deterministic terminal state');
+    assert.ok(normalized.endsWith(suffix), 'snapshot cannot leak text attributes into live output');
+    return normalized.slice(prefix.length, -suffix.length);
+  };
   assert.equal(
-    sanitizeReconnectSnapshot(E + '[4:4mdotted' + E + '[0m'),
+    body(E + '[4:4mdotted' + E + '[0m'),
     E + '[24mdotted' + E + '[0m',
   );
   assert.equal(
-    sanitizeReconnectSnapshot(E + '[2;4:4;38:2::10:20:30mstyled' + E + '[0m'),
+    body(E + '[2;4:4;38:2::10:20:30mstyled' + E + '[0m'),
     E + '[2;24;38:2::10:20:30mstyled' + E + '[0m',
     'combined dim and RGB color attributes survive',
   );
   assert.equal(
-    sanitizeReconnectSnapshot(E + '[4mplain underline' + E + '[24m ' + E + '[4:3mwavy' + E + '[0m'),
+    body(E + '[4mplain underline' + E + '[24m ' + E + '[4:3mwavy' + E + '[0m'),
     E + '[4mplain underline' + E + '[24m ' + E + '[4:3mwavy' + E + '[0m',
     'non-dotted underline variants survive',
   );
   const link = E + ']8;;file:///tmp/a.txt' + E + '\\a.txt' + E + ']8;;' + E + '\\';
-  assert.equal(sanitizeReconnectSnapshot(link), 'a.txt', 'OSC 8 snapshot wrappers are still removed');
+  assert.equal(body(link), 'a.txt', 'OSC 8 snapshot wrappers are still removed');
 });
 
 // TC-PL4h notification OSC detection covers the protocols advertised by modern agent terminals.

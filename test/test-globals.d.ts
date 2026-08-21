@@ -28,6 +28,18 @@ interface Window {
   __testReset(): Promise<void>;
   __testRepaintCount(): number;
   __testRendererKind(): string | null;
+  __testFindText(text: string): {
+    x: number;
+    y: number;
+    isWrapped: boolean;
+    underlined: boolean;
+  } | null;
+  __testTabTerminalSizes(): Array<{
+    winId: string;
+    cols: number;
+    rows: number;
+    active: boolean;
+  }>;
   __testBenchmarkWrite(lines: number): Promise<RendererWriteBenchmark>;
   __testBenchmarkFrames(frames: number): Promise<RendererFrameBenchmark>;
   __testArmInputLatency(): void;
