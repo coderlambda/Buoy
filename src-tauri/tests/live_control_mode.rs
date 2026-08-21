@@ -39,6 +39,7 @@ fn sink(rec: Arc<Mutex<Recorder>>) -> buoy_lib::control_backend::BackendSink {
             BackendEvent::WindowClose { order, .. } => { r.windows = order; }
             BackendEvent::WindowActive { window, order } => { r.active = Some(window); r.windows = order; }
             BackendEvent::WindowRename { .. } => {}
+            BackendEvent::RecoverySnapshot { .. } => {}
             BackendEvent::Ready => { r.ready = true; }
             BackendEvent::Exit => {}
         }
@@ -65,7 +66,8 @@ fn live_tab_isolation_and_revisit() {
     let backend = ControlBackend::spawn(
         BackendConfig {
             host: host.clone(), session: session.into(),
-            tmux_path: tmux.clone(), tmux_version: Some((3, 7)), base_args: vec![],
+            tmux_path: tmux.clone(), tmux_version: Some((3, 7)), socket: String::new(),
+            recovery_windows: vec![], base_args: vec![],
             transport: Transport::Ssh,
         },
         sink(rec.clone()), 90, 30,
@@ -144,7 +146,8 @@ fn live_reattach_existing_session() {
 
     let cfg = || BackendConfig {
         host: host.clone(), session: session.into(),
-        tmux_path: tmux.clone(), tmux_version: Some((3, 7)), base_args: vec![],
+        tmux_path: tmux.clone(), tmux_version: Some((3, 7)), socket: String::new(),
+        recovery_windows: vec![], base_args: vec![],
         transport: Transport::Ssh,
     };
 
@@ -195,7 +198,8 @@ fn live_multibyte_utf8_not_corrupted() {
     let rec = Arc::new(Mutex::new(Recorder::default()));
     let backend = ControlBackend::spawn(
         BackendConfig { host: host.clone(), session: session.into(),
-            tmux_path: tmux.clone(), tmux_version: Some((3, 7)), base_args: vec![],
+            tmux_path: tmux.clone(), tmux_version: Some((3, 7)), socket: String::new(),
+            recovery_windows: vec![], base_args: vec![],
             transport: Transport::Ssh },
         sink(rec.clone()), 200, 50,
     ).expect("spawn");
@@ -256,7 +260,8 @@ fn live_sustained_output_survives() {
 
     let backend = ControlBackend::spawn(
         BackendConfig { host: host.clone(), session: session.into(),
-            tmux_path: tmux.clone(), tmux_version: Some((3, 7)), base_args: vec![],
+            tmux_path: tmux.clone(), tmux_version: Some((3, 7)), socket: String::new(),
+            recovery_windows: vec![], base_args: vec![],
             transport: Transport::Ssh },
         sink, 200, 50,
     ).expect("spawn");
@@ -315,7 +320,8 @@ fn live_resize_reaches_tmux() {
     let rec = Arc::new(Mutex::new(Recorder::default()));
     let backend = ControlBackend::spawn(
         BackendConfig { host: host.clone(), session: session.into(),
-            tmux_path: tmux.clone(), tmux_version: Some((3, 7)), base_args: vec![],
+            tmux_path: tmux.clone(), tmux_version: Some((3, 7)), socket: String::new(),
+            recovery_windows: vec![], base_args: vec![],
             transport: Transport::Ssh },
         sink(rec.clone()), 80, 24,
     ).expect("spawn");

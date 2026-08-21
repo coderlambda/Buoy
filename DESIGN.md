@@ -321,7 +321,15 @@ supervisor:
   the pty stdout stream (et's own "Could not reach…" diagnostic is written there,
   intermixed with terminal output; verified).
 
-### 5.2 Restore on app reopen (restores *connections*, not *state*)
+### 5.2 Restore on app reopen and conservative host-restart recovery
+
+> Current implementation note: control mode periodically persists each window's active-pane cwd,
+> foreground command, name, and active state. Before reattaching, Buoy checks the named tmux
+> session out of band. If the server/session vanished, it recreates one shell per saved window at
+> the saved cwd and uses the prior foreground command as the display name. It never reruns arbitrary
+> commands and cannot restore process memory or unsaved application state. The older investigation
+> below explains why terminal-stream inference was rejected; the Tauri backend now has the required
+> out-of-band command path.
 
 - Persist `[{ id, host, session, title, order, lastActive }]` to disk at
   `app.getPath('userData')`. **Treat this file as untrusted input on load** — re-validate
@@ -408,8 +416,9 @@ supervisor:
 - **Scrollback expectation:** reattach redraws only the *current screen*; historical
   scrollback lives in tmux copy-mode (reachable via tmux keys), **not** replayed into
   xterm.js. Set a generous tmux `history-limit`; do not promise scrollback restore.
-- App-owned state we *do* restore: tab order, focus, titles. Per-session working dir /
-  running program is owned by tmux, not us.
+- App-owned state we restore: tab order, focus, titles, and a conservative per-window cwd/foreground
+  command recipe. While tmux is alive it remains authoritative; the recipe is used only when the
+  session is missing.
 
 ### 5.3 Sidebar
 

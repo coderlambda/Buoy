@@ -386,7 +386,8 @@ mod tests {
 
     fn cfg() -> BackendConfig {
         BackendConfig { host: "h".into(), session: "s".into(), tmux_path: "t".into(),
-            tmux_version: Some((3, 7)), base_args: vec![], transport: Transport::Ssh }
+            tmux_version: Some((3, 7)), socket: "default".into(), recovery_windows: vec![],
+            base_args: vec![], transport: Transport::Ssh }
     }
 
     // Immediate sleep so backoff doesn't slow tests (policy, not timing, is under test).

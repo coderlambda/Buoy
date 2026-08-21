@@ -13,6 +13,7 @@ export interface SessionMeta {
   title?: string;
   tmuxPath?: string;
   tmuxVersion?: number[];
+  socketName?: string;
   order?: number;
   color?: string | null;
   lastTab?: string | null;
@@ -53,6 +54,7 @@ export interface CreateSessionMeta {
   title: string;
   tmuxPath?: string;
   tmuxVersion?: number[];
+  socketName?: string;
 }
 
 export interface CreateSessionResult {
@@ -61,6 +63,20 @@ export interface CreateSessionResult {
   mode?: SessionMode;
   tmuxPath?: string;
   tmuxVersion?: number[];
+  socketName?: string;
+}
+
+export interface DiscoveredTmuxSession {
+  name: string;
+  windows: number;
+  attached: number;
+  created: number;
+}
+
+export interface TmuxDiscoveryResult {
+  tmuxPath: string;
+  tmuxVersion?: number[];
+  sessions: DiscoveredTmuxSession[];
 }
 
 export interface TunnelInfo {
@@ -101,6 +117,7 @@ export interface WindowEvent {
 
 export interface TerminalAPI {
   listSessions(): Promise<SessionMeta[]>;
+  discoverTmuxSessions(kind: SessionKind, host: string): Promise<TmuxDiscoveryResult>;
   createSession(meta: CreateSessionMeta): Promise<CreateSessionResult>;
   input(id: string, data: string, win?: string | null): Promise<unknown> | void;
   resize(id: string, cols: number, rows: number): Promise<unknown> | void;

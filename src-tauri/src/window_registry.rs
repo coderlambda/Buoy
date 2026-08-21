@@ -12,6 +12,8 @@ pub struct PaneRow {
     pub pane_active: bool,
     pub win_active: bool,
     pub name: String,
+    pub cwd: String,
+    pub command: String,
 }
 
 #[derive(Debug, Clone)]
@@ -162,7 +164,7 @@ mod tests {
     fn row(win: &str, pane: &str, pane_active: bool, win_active: bool, name: &str) -> PaneRow {
         PaneRow {
             win: win.into(), pane: pane.into(),
-            pane_active, win_active, name: name.into(),
+            pane_active, win_active, name: name.into(), cwd: "/tmp".into(), command: "zsh".into(),
         }
     }
 

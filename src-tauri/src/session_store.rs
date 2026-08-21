@@ -19,6 +19,23 @@ pub struct RecoveryTab {
     #[serde(default)]
     pub last_command: String,
 }
+
+/// A reconstructible description of one tmux window. This is deliberately not a process
+/// checkpoint: recovery creates a shell in `cwd` and labels it with the last foreground command,
+/// but never re-executes an arbitrary command after a host restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryWindow {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub cwd: String,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub active: bool,
+}
+
 // Serialized to/from the renderer AND disk in camelCase, so the JS side reads meta.tmuxPath /
 // meta.tmuxVersion directly (a snake/camel mismatch here silently dropped the persisted tmux
 // path -> re-probe on every reconnect -> wrong socket -> couldn't reattach existing sessions).
@@ -37,6 +54,10 @@ pub struct SessionMeta {
     pub tmux_path: Option<String>,
     #[serde(default, alias = "tmux_version")]
     pub tmux_version: Option<(u32, u32)>,
+    /// None means a Buoy-owned versioned socket. Imported sessions use `default`, the user's
+    /// ordinary tmux server, so Buoy and existing terminal clients see the same session.
+    #[serde(default, alias = "socket_name")]
+    pub socket_name: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
@@ -69,6 +90,10 @@ pub struct SessionMeta {
     pub recovery_tabs: Vec<RecoveryTab>,
     #[serde(default)]
     pub restore_pending: bool,
+    /// Continuously observed active-pane state used only when a host reboot removes a live tmux
+    /// server. This complements `recovery_tabs`, which belongs to explicit Close/History.
+    #[serde(default)]
+    pub recovery_windows: Vec<RecoveryWindow>,
 }
 
 fn default_transport() -> String { "ssh".into() }
@@ -81,6 +106,40 @@ fn safe_tmux_path(p: &Option<String>) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn safe_socket_name(p: &Option<String>) -> Option<String> {
+    match p {
+        Some(s) if !s.is_empty() && s.len() <= 128
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-')) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+fn clean_text(s: &str, limit: usize) -> String {
+    s.chars().filter(|c| !c.is_control()).take(limit).collect::<String>().trim().to_string()
+}
+
+fn clean_recovery_windows(windows: &[RecoveryWindow]) -> Vec<RecoveryWindow> {
+    let mut out = Vec::new();
+    let mut active_seen = false;
+    for window in windows.iter().take(64) {
+        // pane_current_path is absolute. Refusing other values both rejects corrupt state and keeps
+        // the later tmux `-c` argument constrained even though sessions.json is untrusted input.
+        if window.cwd.len() > 4096 || window.cwd.chars().any(|c| c.is_control()) { continue; }
+        let cwd = window.cwd.clone();
+        if !cwd.starts_with('/') { continue; }
+        let active = window.active && !active_seen;
+        active_seen |= active;
+        out.push(RecoveryWindow {
+            name: clean_text(&window.name, 100),
+            cwd,
+            command: clean_text(&window.command, 100),
+            active,
+        });
+    }
+    if !out.is_empty() && !active_seen { out[0].active = true; }
+    out
 }
 
 pub struct SessionStore {
@@ -117,6 +176,8 @@ impl SessionStore {
             }
             if !["control", "plain", "local"].contains(&e.mode.as_str()) { e.mode = "plain".into(); }
             e.tmux_path = safe_tmux_path(&e.tmux_path);
+            e.socket_name = safe_socket_name(&e.socket_name);
+            e.recovery_windows = clean_recovery_windows(&e.recovery_windows);
             if e.title.is_none() { e.title = Some(e.session.clone()); }
             out.push(e);
         }
@@ -154,6 +215,22 @@ impl SessionStore {
         })
     }
 
+    /// Persist only meaningful topology changes; the backend polls periodically to catch `cd`, so
+    /// writing an identical JSON file every time would cause needless disk churn.
+    pub fn set_recovery_windows(&self, id: &str, windows: &[RecoveryWindow]) {
+        let clean = clean_recovery_windows(windows);
+        if clean.is_empty() { return; }
+        let mut list = self.load();
+        let mut hit = false;
+        for e in list.iter_mut() {
+            if e.id == id && e.recovery_windows != clean {
+                e.recovery_windows = clean.clone();
+                hit = true;
+            }
+        }
+        if hit { self.save(&list); }
+    }
+
     pub fn save(&self, sessions: &[SessionMeta]) {
         if let Some(dir) = self.path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -163,6 +240,8 @@ impl SessionStore {
             if !["ssh", "mosh", "et", "local"].contains(&c.transport.as_str()) { c.transport = "ssh".into(); }
             if !["control", "plain", "local"].contains(&c.mode.as_str()) { c.mode = "plain".into(); }
             c.tmux_path = safe_tmux_path(&c.tmux_path);
+            c.socket_name = safe_socket_name(&c.socket_name);
+            c.recovery_windows = clean_recovery_windows(&c.recovery_windows);
             if c.title.is_none() { c.title = Some(c.session.clone()); }
             c.order = i as i64;
             c
@@ -208,10 +287,12 @@ mod tests {
             id: "1".into(), host: "me@h".into(), session: "dt-1".into(),
             transport: "ssh".into(), mode: "control".into(),
             tmux_path: Some("/t".into()), tmux_version: Some((3, 7)),
+            socket_name: None,
             title: Some("x".into()), order: 0, attach_ok: false,
             color: None, last_tab: None, tab_order: vec![], tab_colors: Default::default(),
             archived: false, archived_at: None,
             detached: false, recovery_tabs: vec![], restore_pending: false,
+            recovery_windows: vec![],
         };
         let json = serde_json::to_string(&m).unwrap();
         assert!(json.contains("\"tmuxPath\""), "must serialize camelCase tmuxPath");
@@ -234,10 +315,12 @@ mod tests {
             id: id.into(), host: String::new(), session: format!("dt-{id}"),
             transport: "local".into(), mode: mode.into(),
             tmux_path: Some("/opt/homebrew/bin/tmux".into()), tmux_version: Some((3, 6)),
+            socket_name: None,
             title: Some("local".into()), order: 0, attach_ok: false,
             color: None, last_tab: None, tab_order: vec![], tab_colors: Default::default(),
             archived: false, archived_at: None,
             detached: false, recovery_tabs: vec![], restore_pending: false,
+            recovery_windows: vec![],
         };
         store.save(&[mk("l1", "control"), mk("l2", "plain"), mk("l3", "local")]);
         let loaded = store.load();
@@ -284,10 +367,12 @@ mod tests {
             id: id.into(), host: "me@h".into(), session: format!("dt-{id}"),
             transport: "ssh".into(), mode: "control".into(),
             tmux_path: Some("/usr/bin/tmux".into()), tmux_version: Some((3, 7)),
+            socket_name: None,
             title: Some(id.into()), order, attach_ok: false,
             color: None, last_tab: None, tab_order: vec![], tab_colors: Default::default(),
             archived: false, archived_at: None,
             detached: false, recovery_tabs: vec![], restore_pending: false,
+            recovery_windows: vec![],
         };
         store.save(&[mk("a", 0), mk("b", 1)]);
         assert!(store.load().iter().all(|s| !s.attach_ok), "fresh rows start unproven");
@@ -319,6 +404,7 @@ mod tests {
             color: None, last_tab: Some("@2".into()), tab_order: vec!["@1".into(), "@2".into()],
             tab_colors: Default::default(), archived: false, archived_at: None,
             detached: false, recovery_tabs: vec![], restore_pending: false,
+            socket_name: None, recovery_windows: vec![],
         };
         store.save(&[original]);
         assert!(store.set_archived("resume-me", true, Some(1234)));
@@ -349,11 +435,13 @@ mod tests {
             id: id.into(), host: "me@h".into(), session: format!("dt-{id}"),
             transport: "ssh".into(), mode: "control".into(),
             tmux_path: None, tmux_version: None, title: Some(id.into()), order,
+            socket_name: None,
             attach_ok: false, color: color.map(String::from), last_tab: Some("@2".into()),
             tab_order: vec!["@2".into(), "@0".into()],
             tab_colors: [("@0".to_string(), "#89b4fa".to_string())].into_iter().collect(),
             archived: false, archived_at: None,
             detached: false, recovery_tabs: vec![], restore_pending: false,
+            recovery_windows: vec![],
         };
         // save() assigns order by array position; load() returns in that order.
         store.save(&[mk("a", 0, None), mk("b", 1, Some("#a6e3a1"))]);
@@ -364,6 +452,41 @@ mod tests {
         assert_eq!(b.last_tab.as_deref(), Some("@2"));
         assert_eq!(b.tab_order, vec!["@2".to_string(), "@0".to_string()]);
         assert_eq!(b.tab_colors.get("@0").map(String::as_str), Some("#89b4fa"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn imported_socket_and_recovery_recipe_are_validated_and_persisted() {
+        let dir = std::env::temp_dir().join(format!("buoy-store-recovery-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("sessions.json");
+        std::fs::write(&path, r#"[{
+          "id":"imported","host":"me@host","session":"work","transport":"ssh",
+          "mode":"control","socketName":"default",
+          "recoveryWindows":[
+            {"name":"agent\n","cwd":"/tmp/project","command":"codex\t","active":true},
+            {"name":"logs","cwd":"/var/log","command":"zsh","active":true},
+            {"name":"bad","cwd":"relative/path","command":"sh","active":false}
+          ]
+        }]"#).unwrap();
+        let store = SessionStore::new(path);
+        let loaded = store.load();
+        assert_eq!(loaded.len(), 1);
+        let session = &loaded[0];
+        assert_eq!(session.socket_name.as_deref(), Some("default"));
+        assert_eq!(session.recovery_windows.len(), 2, "relative cwd is discarded");
+        assert_eq!(session.recovery_windows[0].name, "agent");
+        assert_eq!(session.recovery_windows[0].command, "codex");
+        assert!(session.recovery_windows[0].active);
+        assert!(!session.recovery_windows[1].active, "only one active window survives");
+
+        store.set_recovery_windows("imported", &[
+            RecoveryWindow { name: "next".into(), cwd: "/opt/work".into(),
+                command: "claude".into(), active: true },
+        ]);
+        let reloaded = store.load();
+        assert_eq!(reloaded[0].recovery_windows[0].cwd, "/opt/work");
+        assert_eq!(reloaded[0].recovery_windows[0].command, "claude");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -108,6 +108,37 @@ describe('Tauri UI: terminal reconnect repaint', () => {
     })`);
     check(restoredStyle.buffer.includes('RESTORED_TEXT') && restoredStyle.underlined === false,
       `TC-CR5 reconnect history removes tmux SGR 4:4 dots (got ${JSON.stringify(restoredStyle)})`);
+
+    // A reconnect capture is a new terminal-state baseline, not merely more output. A TUI may
+    // leave dotted SGR, origin mode, horizontal margins, or autowrap state active immediately
+    // before the capture. If the snapshot inherits those modes, text starts at the old margin,
+    // wraps in the middle of the viewport, and the final tmux cursor is offset.
+    const isolatedText = 'SNAPSHOT_STATE_ISOLATED';
+    await fire('data', {
+      id: 's1', window: '@0',
+      data: E + '[4:4m' + E + '[5;12r' + E + '[?69h' + E + '[5;20s' + E + '[?6h',
+    });
+    await fire('data', {
+      id: 's1', window: '@0', repaint: true,
+      data: E + '[H' + E + '[2J' + isolatedText + E + '[2;3H',
+    });
+    await browser.pause(100);
+    const isolated = await js(`({
+      text: window.__testFindText('${isolatedText}'),
+      cursor: window.__testTerminalState(),
+    })`);
+    check(isolated.text?.x === 0 && isolated.text?.y === 0 && isolated.text?.isWrapped === false,
+      `TC-CR6 snapshot ignores stale margins and does not wrap early (got ${JSON.stringify(isolated)})`);
+    check(isolated.text?.underlined === false,
+      `TC-CR6 snapshot ignores inherited dotted SGR (got ${JSON.stringify(isolated)})`);
+    check(isolated.cursor?.cursorX === 2 && isolated.cursor?.cursorY === 1,
+      `TC-CR6 snapshot cursor addressing ignores stale origin/margins (got ${JSON.stringify(isolated)})`);
+    // Keep the current test binary usable even when the regression is deliberately run against an
+    // unfixed build: failures are aggregated by createChecks(), so later cases still execute.
+    await fire('data', {
+      id: 's1', window: '@0',
+      data: E + '[0m' + E + '[?6l' + E + '[?69l' + E + '[r' + E + '[?7h' + E + '[?45l' + E + '[4l',
+    });
     finish();
   });
 
@@ -138,6 +169,35 @@ describe('Tauri UI: terminal reconnect repaint', () => {
       `TC-P2 reveal kept identical layout dimensions (got ${JSON.stringify({ beforeReveal, afterReveal })})`);
     check(afterReveal.count === beforeReveal.count + 1,
       `TC-P2 same-size reveal forced exactly one full repaint (got ${beforeReveal.count} -> ${afterReveal.count})`);
+
+    // tmux applies a client resize to every window, and control mode continues delivering output
+    // for hidden windows. Their xterm grids therefore must be resized with the visible one before
+    // background output arrives; otherwise the same bytes wrap at two different columns.
+    await browser.setWindowSize(880, 700);
+    await browser.pause(250);
+    const resizedTabs = await js('window.__testTabTerminalSizes()');
+    const activeSize = resizedTabs.find((size: { active: boolean }) => size.active);
+    check(resizedTabs.length >= 2 && resizedTabs.every((size: { cols: number; rows: number }) =>
+      size.cols === activeSize?.cols && size.rows === activeSize?.rows),
+    `TC-CR7 hidden terminal grids follow the tmux client size (got ${JSON.stringify(resizedTabs)})`);
+    await browser.setWindowSize(1000, 700);
+    await browser.pause(250);
+
+    // Two authoritative active-window events can arrive in one browser turn during restore. The
+    // reveal work queued for the first one must be discarded after that tab becomes hidden; fitting
+    // a display:none xterm can otherwise send its default 80x24 grid back to tmux.
+    const beforeRapidSwitch = await js('window.__terminalCalls.length');
+    await js(`(() => {
+      window.__fire('window', { id: 's1', action: 'add', window: '@3', order: ['@0', '@1', '@3'] });
+      window.__fire('window', { id: 's1', action: 'active', window: '@3', order: ['@0', '@1', '@3'] });
+      window.__fire('window', { id: 's1', action: 'active', window: '@0', order: ['@0', '@1', '@3'] });
+    })()`);
+    await browser.pause(100);
+    const rapidSwitchResizes = await js(
+      `window.__terminalCalls.slice(${beforeRapidSwitch}).filter((call) => call[0] === 'resize')`,
+    );
+    check(rapidSwitchResizes.length === 1,
+      `TC-CR8 stale hidden-tab reveal cannot resize tmux (got ${JSON.stringify(rapidSwitchResizes)})`);
 
     // Run both recovery events synchronously inside the page so WebDriver focus bookkeeping cannot
     // add noise. Two live tabs exist, so +1 per event also proves hidden panes were not swept.

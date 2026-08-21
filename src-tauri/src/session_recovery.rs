@@ -18,7 +18,9 @@ pub struct CommandHint {
 }
 
 fn socket(meta: &SessionMeta) -> String {
-    crate::tmux_socket::socket_name(&meta.mode, meta.tmux_version, &meta.session)
+    meta.socket_name.clone().unwrap_or_else(|| {
+        crate::tmux_socket::socket_name(&meta.mode, meta.tmux_version, &meta.session)
+    })
 }
 
 fn shell_quote(value: &str) -> String {
@@ -277,6 +279,7 @@ mod tests {
             mode: "control".into(),
             tmux_path: Some(probe.tmux_path.clone()),
             tmux_version: Some(version),
+            socket_name: None,
             title: Some("recovery".into()),
             order: 0,
             attach_ok: true,
@@ -289,6 +292,7 @@ mod tests {
             detached: false,
             recovery_tabs: vec![],
             restore_pending: false,
+            recovery_windows: vec![],
         };
         let socket = socket(&meta);
         let status = Command::new(&probe.tmux_path)

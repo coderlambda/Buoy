@@ -11,6 +11,7 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system, MasterPty};
 use crate::tmux_socket::socket_name;
 use crate::transport::{self, Transport};
 use crate::validation;
+use crate::session_store::RecoveryWindow;
 
 /// Events: plain mode has no window tagging — data is a single stream, window is empty.
 #[derive(Debug, Clone)]
@@ -26,6 +27,8 @@ pub struct PlainConfig {
     pub session: String,
     pub tmux_path: String,
     pub tmux_version: Option<(u32, u32)>,
+    pub socket: String,
+    pub recovery_windows: Vec<RecoveryWindow>,
     pub base_args: Vec<String>,
     /// ssh to `host`, or tmux on THIS machine (kind:'local'). See transport.rs.
     pub transport: Transport,
@@ -35,7 +38,8 @@ impl Default for PlainConfig {
     fn default() -> Self {
         PlainConfig {
             host: String::new(), session: String::new(), tmux_path: "tmux".into(),
-            tmux_version: None, base_args: vec![], transport: Transport::Ssh,
+            tmux_version: None, socket: String::new(), recovery_windows: vec![],
+            base_args: vec![], transport: Transport::Ssh,
         }
     }
 }
@@ -50,11 +54,15 @@ impl PlainBackend {
     pub fn spawn(cfg: PlainConfig, sink: PlainSink, cols: u16, rows: u16)
         -> Result<Self, validation::ValidationError>
     {
-        let socket = socket_name("plain", cfg.tmux_version, &cfg.session);
+        let socket = if cfg.socket.is_empty() {
+            socket_name("plain", cfg.tmux_version, &cfg.session)
+        } else {
+            cfg.socket.clone()
+        };
         let (lc_all, lang) = transport::current_locale();
-        let spec = transport::spawn_spec(
+        let spec = transport::spawn_spec_with_recovery(
             cfg.transport, false, &cfg.host, &cfg.session, &cfg.tmux_path, &socket,
-            &cfg.base_args, lc_all.as_deref(), lang.as_deref(),
+            &cfg.base_args, lc_all.as_deref(), lang.as_deref(), &cfg.recovery_windows,
         )?;
 
         let pty = native_pty_system();

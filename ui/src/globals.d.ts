@@ -1,4 +1,5 @@
 interface XtermBufferLine {
+  readonly isWrapped: boolean;
   translateToString(trimRight?: boolean): string;
   getCell(index: number): {
     getChars(): string;
@@ -113,6 +114,18 @@ interface Window {
   __testDispose(id: string): void;
   __testReadBuffer(): string;
   __testTextIsUnderlined(text: string): boolean | null;
+  __testFindText(text: string): {
+    x: number;
+    y: number;
+    isWrapped: boolean;
+    underlined: boolean;
+  } | null;
+  __testTabTerminalSizes(): Array<{
+    winId: string;
+    cols: number;
+    rows: number;
+    active: boolean;
+  }>;
   __testLinkPath(text: string): string | null;
   __testRepaintCount(): number;
   __testRendererKind(): string | null;

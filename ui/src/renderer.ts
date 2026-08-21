@@ -16,11 +16,13 @@ import { createFileViewerTab } from './fileViewerTab.js';
 import type { FileViewerTabContext, FileViewerTabSpec } from './fileViewerTab.js';
 import type {
   CreateSessionMeta,
+  DiscoveredTmuxSession,
   OscNotificationParser,
   RecoveryTabSnapshot,
   SessionMeta,
   SessionState,
   TabContent,
+  TerminalSize,
   TuiActivityTracker,
   TunnelInfo,
 } from './types.js';
@@ -80,6 +82,8 @@ interface View {
   tabColors: Record<string, string>;
   lastTab: string | null;
   restoreTab: string | null;
+  /** Invalidates reveal/fit work queued for a tab that became hidden before the next paint. */
+  layoutGeneration: number;
   linkMap: Map<string, string>;
   pending?: string[] | null;
   renaming?: boolean;
@@ -287,6 +291,7 @@ function makeView(meta: SessionMeta): View {
     tabColors: meta.tabColors || {},        // winId -> color
     lastTab: meta.lastTab || null,          // last-active tab (persisted; updated as tabs switch)
     restoreTab: meta.lastTab || null,       // one-shot: tab to reveal on first connect (see onWindow)
+    layoutGeneration: 0,
     // §21: OSC 8 file-link map — display text (e.g. "README.md") -> absolute remote path harvested
     // from the raw output stream (xterm drops the hyperlink from scrollback, so we capture it here).
     linkMap: new Map<string, string>(),
@@ -298,6 +303,38 @@ function makeView(meta: SessionMeta): View {
   const pending = pendingData[meta.id];
   if (pending) { v.pending = (v.pending || []).concat(pending); delete pendingData[meta.id]; }
   return v;
+}
+
+function terminalGrid(tab: AppTab): TerminalSize | null {
+  const term = tab.content.term;
+  return term ? { cols: term.cols, rows: term.rows } : null;
+}
+
+function gridChanged(before: TerminalSize | null, after: TerminalSize): boolean {
+  return !!before && (before.cols !== after.cols || before.rows !== after.rows);
+}
+
+// A tmux client has one advertised size, while Buoy keeps one xterm per tmux window. Control mode
+// continues to deliver background-window output, so every mounted xterm must parse those bytes at
+// the same grid width as tmux. Resizing only the visible tab permanently bakes different physical
+// wraps/cursor positions into hidden buffers; FitAddon cannot reconstruct a TUI screen later.
+function synchronizeMountedTerminalGrids(v: View, visible: AppTab, size: TerminalSize): void {
+  for (const [, tab] of v.tabs) {
+    if (tab === visible || !tab.mounted || !tab.content.term) continue;
+    const before = terminalGrid(tab);
+    if (!gridChanged(before, size)) continue;
+    tab.content.resize(size.cols, size.rows);
+    // A resize can reflow shell scrollback but cannot reconstruct an application's addressed
+    // screen. Ask for a correctly-sized capture the next time this hidden tmux window is revealed.
+    if (isWindowTab(tab.winId)) tab.backfilled = false;
+  }
+}
+
+function currentLayout(v: View, tab: AppTab, generation: number): boolean {
+  return generation === v.layoutGeneration
+    && v.meta.id === activeId
+    && activeTab(v) === tab
+    && !!tab.mounted;
 }
 
 // Create (once) a tab for a window id, backed by a 'terminal' TabContent via the registry.
@@ -656,6 +693,7 @@ async function mount(id: string, userInitiated = false): Promise<void> {
       };
       if (v.meta.tmuxPath) createMeta.tmuxPath = v.meta.tmuxPath;
       if (v.meta.tmuxVersion) createMeta.tmuxVersion = v.meta.tmuxVersion;
+      if (v.meta.socketName) createMeta.socketName = v.meta.socketName;
       const res = await api.createSession(createMeta);
       dbg('mount->createSession returned ' + JSON.stringify(res));
       // The backend may have re-probed (unproven tmux path) or downgraded control -> plain. Adopt
@@ -664,6 +702,7 @@ async function mount(id: string, userInitiated = false): Promise<void> {
       if (res) {
         if (res.tmuxPath) v.meta.tmuxPath = res.tmuxPath;
         if (res.tmuxVersion) { v.meta.tmuxVersion = res.tmuxVersion; v.tmuxVersion = res.tmuxVersion; }
+        if (res.socketName) v.meta.socketName = res.socketName;
         if (res.mode && res.mode !== v.meta.mode) {
           dbg('mount->createSession mode changed ' + v.meta.mode + ' -> ' + res.mode);
           v.meta.mode = res.mode;
@@ -686,6 +725,7 @@ async function mount(id: string, userInitiated = false): Promise<void> {
 function showActiveTab(v: View): void {
   const tab = activeTab(v);
   if (!tab || !v.el) return;
+  const generation = ++v.layoutGeneration;
   if (!tab.mounted) {
     tab.content.mount(v.el);
     tab.mounted = true;
@@ -702,6 +742,10 @@ function showActiveTab(v: View): void {
   // VISIBILITY.
   for (const [, t] of v.tabs) { const el = t.content.element && t.content.element(); if (el) el.style.display = (t === tab) ? '' : 'none'; }
   requestAnimationFrame(() => {
+    // Window/session events can select another tab before this callback runs. Never fit a hidden
+    // xterm: FitAddon then measures a collapsed box and can advertise a tiny grid back to tmux.
+    if (!currentLayout(v, tab, generation)) return;
+    const before = terminalGrid(tab);
     const size = tab.content.fit();
     // A same-size reveal does not make FitAddon dirty any rows. Force a full-buffer repaint after
     // layout settles so a pane that received writes while display:none cannot remain blank/stale.
@@ -710,6 +754,8 @@ function showActiveTab(v: View): void {
     // keep _lastSize in sync so the debounced window-resize handler's change check stays correct.
     let resizeResult = null;
     if (size) {
+      if (gridChanged(before, size) && isWindowTab(tab.winId)) tab.backfilled = false;
+      synchronizeMountedTerminalGrids(v, tab, size);
       resizeResult = api.resize(v.meta.id, size.cols, size.rows);
       if (v.meta.id === activeId) _lastSize = size;
     }
@@ -718,7 +764,7 @@ function showActiveTab(v: View): void {
     // larger xterm put the prompt on one row and tmux's real cursor on the next. Tauri invokes
     // resolve after resize() has queued refresh-client, so the following capture is FIFO behind it.
     const captureAfterResize = () => {
-      if (isWindowTab(tab.winId)) lazyCapture(v, tab.winId);
+      if (currentLayout(v, tab, generation) && isWindowTab(tab.winId)) lazyCapture(v, tab.winId);
     };
     if (resizeResult && typeof resizeResult.then === 'function') {
       resizeResult.then(captureAfterResize, captureAfterResize);
@@ -727,7 +773,7 @@ function showActiveTab(v: View): void {
     }
     // Don't focus a broken console — it must not capture keystrokes (§22). (A control session
     // still-settling on initial connect keeps focus so early input buffers as designed.)
-    if (!shouldDropInput(v)) tab.content.focus();
+    if (currentLayout(v, tab, generation) && !shouldDropInput(v)) tab.content.focus();
   });
 }
 
@@ -1220,7 +1266,9 @@ function removeView(id: string): void {
 }
 
 // Explicit Detach: stop only Buoy's client. The tmux server and all of its processes stay alive.
-// The persisted row remains in Sessions and is marked detached until the next mount.
+// The persisted row remains in Sessions and is marked detached until the next mount. Discovery can
+// re-import a default-server session, but Buoy-owned private-socket sessions still depend on this
+// row to remain reachable.
 async function detachSession(id: string): Promise<void> {
   const v = views.get(id);
   if (!v) return;
@@ -1622,6 +1670,34 @@ window.__testTextIsUnderlined = (text: string) => {
   }
   return null;
 };
+window.__testFindText = (text: string) => {
+  const term = activeTerminalForTest();
+  const buf = term.buffer.active;
+  for (let y = 0; y < buf.length; y++) {
+    const line = buf.getLine(y);
+    if (!line) continue;
+    const x = line.translateToString(false).indexOf(text);
+    if (x < 0) continue;
+    let underlined = false;
+    for (let col = x; col < x + text.length; col++) {
+      if (line.getCell(col)?.isUnderline()) { underlined = true; break; }
+    }
+    return { x, y: y - buf.baseY, isWrapped: line.isWrapped, underlined };
+  }
+  return null;
+};
+window.__testTabTerminalSizes = () => {
+  const v = activeId ? views.get(activeId) : undefined;
+  if (!v) return [];
+  const sizes: Array<{ winId: string; cols: number; rows: number; active: boolean }> = [];
+  for (const [winId, tab] of v.tabs) {
+    const term = tab.content.term;
+    if (tab.mounted && term) sizes.push({
+      winId, cols: term.cols, rows: term.rows, active: winId === v.activeWindow,
+    });
+  }
+  return sizes;
+};
 window.__testLinkPath = (text: string) => {
   const v = activeId ? views.get(activeId) : undefined;
   return v?.linkMap.get(text) ?? null;
@@ -1951,10 +2027,28 @@ function applyResize(): void {
   if (!v) return;
   const tab = activeTab(v);
   if (!tab || !tab.mounted) return;
+  // Observe the current reveal generation instead of replacing it. A resize timer from the prior
+  // session can fire just before this tab's queued reveal; invalidating that reveal here could skip
+  // the mandatory per-session resize/capture when both sessions happen to have the same grid.
+  const generation = v.layoutGeneration;
+  const before = terminalGrid(tab);
   const size = tab.content.fit();   // fit() also resizes the local xterm grid immediately
-  if (size && (size.cols !== _lastSize.cols || size.rows !== _lastSize.rows)) {
-    _lastSize = size;
-    if (activeId) void api.resize(activeId, size.cols, size.rows);
+  if (!size) return;
+  const activeGridChanged = gridChanged(before, size);
+  if (activeGridChanged && isWindowTab(tab.winId)) tab.backfilled = false;
+  synchronizeMountedTerminalGrids(v, tab, size);
+  if (size.cols === _lastSize.cols && size.rows === _lastSize.rows) return;
+  _lastSize = size;
+  const resizeResult = api.resize(v.meta.id, size.cols, size.rows);
+  const captureAfterResize = () => {
+    if (activeGridChanged && currentLayout(v, tab, generation) && isWindowTab(tab.winId)) {
+      lazyCapture(v, tab.winId);
+    }
+  };
+  if (resizeResult && typeof resizeResult.then === 'function') {
+    resizeResult.then(captureAfterResize, captureAfterResize);
+  } else {
+    captureAfterResize();
   }
 }
 window.addEventListener('resize', () => {
@@ -1973,6 +2067,13 @@ const localHint = requiredElement<HTMLElement>('local-hint');
 const errorEl = requiredElement<HTMLElement>('f-err');
 const titleInput = requiredElement<HTMLInputElement>('f-title');
 const sessionForm = requiredElement<HTMLFormElement>('form');
+const discoverButton = requiredElement<HTMLButtonElement>('f-discover');
+const discoveryEl = requiredElement<HTMLElement>('tmux-discovery');
+const createButton = requiredElement<HTMLButtonElement>('f-ok');
+let selectedDiscovered: DiscoveredTmuxSession | null = null;
+let discoveredTmuxPath: string | undefined;
+let discoveredTmuxVersion: number[] | undefined;
+let discoveryGeneration = 0;
 
 // Native mode is a toggle; default ON. Click flips it.
 function setNative(on: boolean): void { fControl.classList.toggle('on', on); fControl.setAttribute('aria-checked', on ? 'true' : 'false'); }
@@ -1985,12 +2086,26 @@ const updateFields = () => {
   // either kind, since a local session runs a real tmux too.
   if (localHint) localHint.style.display = remote ? 'none' : 'block';
 };
-fKind.onchange = updateFields;
+
+function resetDiscovery(): void {
+  discoveryGeneration++;
+  selectedDiscovered = null;
+  discoveredTmuxPath = undefined;
+  discoveredTmuxVersion = undefined;
+  discoveryEl.className = '';
+  discoveryEl.innerHTML = '';
+  discoverButton.disabled = false;
+  discoverButton.textContent = 'Find existing tmux sessions';
+  createButton.textContent = 'Create';
+}
+
+fKind.onchange = () => { updateFields(); resetDiscovery(); };
 
 requiredElement<HTMLButtonElement>('new').addEventListener('click', () => {
   errorEl.textContent = '';
   setNative(true);                    // default to native mode each time the dialog opens
   updateFields();
+  resetDiscovery();
   hideHostHistory();
   dialog.showModal();
 });
@@ -2008,7 +2123,13 @@ async function showHostHistory(): Promise<void> {
     const li = document.createElement('li');
     li.textContent = h;
     // mousedown (not click) so it fires before the input's blur hides the list.
-    li.onmousedown = (e) => { e.preventDefault(); fHost.value = h; hideHostHistory(); fHost.focus(); };
+    li.onmousedown = (e) => {
+      e.preventDefault();
+      fHost.value = h;
+      resetDiscovery();
+      hideHostHistory();
+      fHost.focus();
+    };
     hostHistoryEl.appendChild(li);
   });
   hostHistoryEl.className = 'on';
@@ -2016,7 +2137,76 @@ async function showHostHistory(): Promise<void> {
 fHost.addEventListener('focus', showHostHistory);
 fHost.addEventListener('click', showHostHistory);
 fHost.addEventListener('input', showHostHistory);
+fHost.addEventListener('input', resetDiscovery);
 fHost.addEventListener('blur', () => setTimeout(hideHostHistory, 120));   // allow mousedown to land
+
+discoverButton.addEventListener('click', async () => {
+  const kind = fKind.value === 'local' ? 'local' : 'remote';
+  const host = kind === 'local' ? '' : fHost.value.trim();
+  if (kind === 'remote' && !host) {
+    errorEl.textContent = 'Enter a host before discovering tmux sessions.';
+    fHost.focus();
+    return;
+  }
+  errorEl.textContent = '';
+  const generation = ++discoveryGeneration;
+  selectedDiscovered = null;
+  discoveryEl.className = '';
+  discoveryEl.innerHTML = '';
+  discoverButton.disabled = true;
+  discoverButton.textContent = 'Looking…';
+  createButton.textContent = 'Create';
+  try {
+    const result = await api.discoverTmuxSessions(kind, host);
+    if (generation !== discoveryGeneration) return;
+    discoveredTmuxPath = result.tmuxPath;
+    discoveredTmuxVersion = result.tmuxVersion;
+    discoveryEl.className = 'on';
+    const importable = result.sessions.filter((session) => !Array.from(views.values()).some((view) =>
+      view.meta.session === session.name
+        && view.meta.host === host
+        && (view.meta.kind || (view.meta.host ? 'remote' : 'local')) === kind
+        && view.meta.socketName === 'default'));
+    if (!importable.length) {
+      discoveryEl.textContent = result.sessions.length
+        ? 'No new sessions to import. All discovered sessions are already open.'
+        : 'No sessions found on the default tmux server.';
+      return;
+    }
+    for (const session of importable) {
+      const option = document.createElement('button');
+      option.type = 'button';
+      option.className = 'discovered-session';
+      option.setAttribute('role', 'option');
+      const name = document.createElement('span');
+      name.className = 'session-name';
+      name.textContent = session.name;
+      const details = document.createElement('span');
+      details.className = 'session-meta';
+      details.textContent = `${session.windows} window${session.windows === 1 ? '' : 's'}${session.attached ? ` · ${session.attached} attached` : ''}`;
+      option.append(name, details);
+      option.onclick = () => {
+        for (const node of discoveryEl.querySelectorAll('.discovered-session')) {
+          node.classList.remove('selected');
+          node.setAttribute('aria-selected', 'false');
+        }
+        option.classList.add('selected');
+        option.setAttribute('aria-selected', 'true');
+        selectedDiscovered = session;
+        if (!titleInput.value.trim()) titleInput.value = session.name;
+        createButton.textContent = 'Import';
+      };
+      discoveryEl.appendChild(option);
+    }
+  } catch (err) {
+    if (generation !== discoveryGeneration) return;
+    errorEl.textContent = 'Could not discover tmux sessions: ' + (errorMessage(err) || 'unknown error');
+  } finally {
+    if (generation !== discoveryGeneration) return;
+    discoverButton.disabled = false;
+    discoverButton.textContent = 'Refresh existing sessions';
+  }
+});
 
 sessionForm.addEventListener('submit', async (event) => {
   const e = event as SubmitEvent;
@@ -2039,12 +2229,18 @@ sessionForm.addEventListener('submit', async (event) => {
     // ssh is the only REMOTE transport; a local session's tmux is exec'd directly (no ssh).
     transport: kind === 'local' ? 'local' : 'ssh',
     mode: fControl.classList.contains('on') ? 'control' : 'plain',
-    title: titleInput.value.trim() || (kind === 'local' ? 'local' : host),
+    title: titleInput.value.trim() || selectedDiscovered?.name || (kind === 'local' ? 'local' : host),
     // The hidden Host input can retain a previous remote value after switching Type. Never persist
     // that stale value onto a local session or the sidebar will mislabel it as remote.
     host: kind === 'local' ? '' : host,
     // NOTE: no session name from the user — main.js generates & owns it.
   };
+  if (selectedDiscovered) {
+    meta.session = selectedDiscovered.name;
+    meta.socketName = 'default';
+    if (discoveredTmuxPath) meta.tmuxPath = discoveredTmuxPath;
+    if (discoveredTmuxVersion) meta.tmuxVersion = discoveredTmuxVersion;
+  }
   let res;
   try {
     res = await api.createSession(meta);
@@ -2061,6 +2257,7 @@ sessionForm.addEventListener('submit', async (event) => {
   if (res.mode) viewMeta.mode = res.mode;
   if (res.tmuxPath) viewMeta.tmuxPath = res.tmuxPath;
   if (res.tmuxVersion) viewMeta.tmuxVersion = res.tmuxVersion;
+  if (res.socketName) viewMeta.socketName = res.socketName;
   dialog.close('ok');
   const v = makeView(viewMeta);
   v.started = true;         // createSession already ran; mount() must not start it again
@@ -2080,6 +2277,7 @@ async function init(reset = false): Promise<void> {
     sessionForm.reset();
     errorEl.textContent = '';
     setNative(true);
+    resetDiscovery();
     updateFields();
     _hostHistory = [];
     hideHostHistory();
